@@ -1,0 +1,23 @@
+/.autodl
+/models
+
+# Ignore large data files
+paper/data/processed/*.csv
+paper/data/processed/*.parquet
+
+# Ignore model files
+*.pkl
+*.h5
+*.pt
+*.pth
+*.onnx
+
+# Ignore Python cache
+__pycache__/
+*.pyc
+
+# Ignore system/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
