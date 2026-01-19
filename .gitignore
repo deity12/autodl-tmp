@@ -1,23 +1,21 @@
+# 忽略所有大文件
 /.autodl
 /models
-
-# Ignore large data files
 paper/data/processed/*.csv
 paper/data/processed/*.parquet
-
-# Ignore model files
+paper/data/processed/*.npy
 *.pkl
 *.h5
 *.pt
 *.pth
 *.onnx
 
-# Ignore Python cache
+# 忽略缓存和临时文件
 __pycache__/
 *.pyc
-
-# Ignore system/editor files
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
+logs/
+*.log
