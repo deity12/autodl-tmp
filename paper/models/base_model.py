@@ -206,24 +206,42 @@ class Classical_ChannelMixing(nn.Module):
         return self.layer_norm(x + self.ffn(x))
 
 
-# ================= 3. 量子-经典混合通道 (优化版) =================
+# ================= 3. 量子-经典混合通道 (优化版 V2) =================
 class Quantum_ChannelMixing(nn.Module):
-    def __init__(self, n_embd, n_qubits=4, q_threshold=0.0):
+    """
+    量子-经典混合通道，核心改进：
+    1. q_threshold 默认使用波动率 70% 分位数（约 0.5~1.0），而非 0.0
+    2. 量子输出缩放：添加可学习的缩放因子，稳定训练
+    3. 残差连接：量子分支也使用残差，防止梯度消失
+    4. 梯度裁剪兼容：使用 clamp 防止数值溢出
+    """
+    def __init__(self, n_embd, n_qubits=4, q_threshold=0.5):
         super().__init__()
         self.n_embd = n_embd
         self.n_qubits = n_qubits
+        # 【关键修复】阈值默认 0.5，对应标准化后波动率的约 60-70% 分位数
+        # 这样只有真正高波动的样本才进入量子通道
         self.q_threshold = q_threshold
         
+        # 经典 FFN 分支
         self.ffn = nn.Sequential(
             nn.Linear(n_embd, n_embd * 4),
             nn.GELU(),
             nn.Linear(n_embd * 4, n_embd)
         )
         
+        # 量子分支
         self.proj_down = nn.Linear(n_embd, n_qubits)
         self.vqc = VQC_Block(n_qubits=n_qubits)
         self.proj_up = nn.Linear(n_qubits, n_embd)
+        
+        # 【新增】量子输出缩放因子，初始化为较小的值，稳定早期训练
+        self.quantum_scale = nn.Parameter(torch.tensor(0.1))
+        
         self.layer_norm = nn.LayerNorm(n_embd)
+        
+        # 【新增】Dropout 正则化
+        self.dropout = nn.Dropout(0.1)
 
     def forward(self, x, vol):
         # 错误处理：Batch一致性检查
@@ -232,30 +250,41 @@ class Quantum_ChannelMixing(nn.Module):
         batch_size = x.shape[0]
         out = torch.zeros_like(x)
         
-        # 广播判断高风险样本
-        is_high_risk = (vol > self.q_threshold).reshape(-1) # 展平为 (B,)
+        # 广播判断高风险样本（波动率超过阈值）
+        # vol 已经过标准化，阈值 0.5 约对应 60-70% 分位数
+        is_high_risk = (vol > self.q_threshold).reshape(-1)
         
         high_risk_idx = torch.where(is_high_risk)[0]
         normal_idx = torch.where(~is_high_risk)[0]
         
-        # --- 量子分支 ---
+        # --- 量子分支（高波动样本）---
         if len(high_risk_idx) > 0:
             x_q = x[high_risk_idx]
             Bq, T, C = x_q.shape
             x_q_flat = x_q.view(-1, C)
             
-            # 【优化点3：归一化】映射到 [0, pi]
-            # tanh -> [-1, 1], +1 -> [0, 2], /2 -> [0, 1], *pi -> [0, pi]
-            q_in = (torch.tanh(self.proj_down(x_q_flat)) + 1) / 2 * np.pi
+            # 【改进】更稳定的归一化：使用 sigmoid 映射到 [0, pi]
+            # sigmoid 输出在 [0, 1]，比 tanh 更平滑，梯度更稳定
+            proj_out = self.proj_down(x_q_flat)
+            # Clamp 防止数值过大导致 sigmoid 饱和
+            proj_out = proj_out.clamp(-10, 10)
+            q_in = torch.sigmoid(proj_out) * np.pi
             
-            q_out = self.vqc(q_in) # (Bq*T, 4)
+            # VQC 前向
+            q_out = self.vqc(q_in)  # (Bq*T, n_qubits), 输出范围 [-1, 1]
+            
+            # 投影回高维 + 缩放
             x_q_out = self.proj_up(q_out).view(Bq, T, C)
-            out[high_risk_idx] = x_q + x_q_out
+            # 【关键】使用可学习的缩放因子，初始时量子贡献较小
+            x_q_out = x_q_out * torch.abs(self.quantum_scale)
             
-        # --- 经典分支 ---
+            # 残差连接 + Dropout
+            out[high_risk_idx] = x_q + self.dropout(x_q_out)
+            
+        # --- 经典分支（正常样本）---
         if len(normal_idx) > 0:
             x_c = x[normal_idx]
-            out[normal_idx] = x_c + self.ffn(x_c)
+            out[normal_idx] = x_c + self.dropout(self.ffn(x_c))
             
         return self.layer_norm(out)
 
@@ -265,6 +294,12 @@ MARKET_IDX = (5, 7)
 
 # ================= 4. 整体模型（支持 MATCC / 市场引导 / 量子 消融）=================
 class QL_MATCC_Model(nn.Module):
+    """
+    QL-MATCC 模型，改进点：
+    1. q_threshold 默认改为 0.5（对应标准化后的中高波动率分位数）
+    2. 添加 Dropout 正则化防止过拟合
+    3. 改进特征融合方式
+    """
     def __init__(
         self,
         input_dim=8,
@@ -275,7 +310,8 @@ class QL_MATCC_Model(nn.Module):
         use_market_guidance=True,
         use_quantum=True,
         ma_window=5,
-        q_threshold=0.0,
+        q_threshold=0.5,  # 【关键修改】默认阈值从 0.0 改为 0.5
+        dropout=0.1,
     ):
         super().__init__()
         self.use_matcc = use_matcc
@@ -307,6 +343,9 @@ class QL_MATCC_Model(nn.Module):
                     'layer_norm2': nn.LayerNorm(n_embd),
                 })
             )
+        
+        # 【新增】输出头前的 Dropout 正则化
+        self.pre_head_dropout = nn.Dropout(dropout)
         self.head = nn.Linear(n_embd, 1)
 
     def forward(self, x: torch.Tensor, vol: torch.Tensor) -> torch.Tensor:
@@ -328,7 +367,8 @@ class QL_MATCC_Model(nn.Module):
             h = h + layer['time_mix'](layer['layer_norm1'](h))
             h = layer['channel_mix'](layer['layer_norm2'](h), vol)
 
-        return self.head(h[:, -1, :])
+        # 取最后一个时间步 + Dropout + 线性头
+        return self.head(self.pre_head_dropout(h[:, -1, :]))
 
 # ================= 测试入口 =================
 if __name__ == "__main__":

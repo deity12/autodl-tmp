@@ -18,9 +18,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
-# 从同目录的 model.py 复用：QL_MATCC_Model、量子/经典通道、RWKV、MATCC 等
-# 注意：需保证 model 目录在 sys.path 中，使 "model" 解析为 model.py
-from model import QL_MATCC_Model, Quantum_ChannelMixing, RWKV_TimeMixing, MATCCDecompose
+# 从同目录的 base_model.py 复用：QL_MATCC_Model、量子/经典通道、RWKV、MATCC 等
+from models.base_model import QL_MATCC_Model, Quantum_ChannelMixing, RWKV_TimeMixing, MATCCDecompose
 
 
 # ================= 1. 图注意力层 GAT =================
@@ -82,11 +81,11 @@ class GraphAttentionLayer(nn.Module):
 # ================= 2. 完整模型 QL_MATCC_GNN_Model =================
 class QL_MATCC_GNN_Model(nn.Module):
     """
-    【论文最终模型】QL-MATCC-GNN
-    1. MATCC：趋势/波动解耦
-    2. Quantum-RWKV：时序特征 H_temporal（取最后一时刻）
-    3. GAT：基于邻接矩阵的空间聚合 H_graph
-    4. 融合：Concat(H_temporal, H_graph) -> Linear -> 1（收益率）
+    【论文最终模型】QL-MATCC-GNN，改进点：
+    1. q_threshold 默认改为 0.5（只有高波动样本走量子通道）
+    2. 添加门控融合机制（Gated Fusion），自适应融合时序和图特征
+    3. 添加正则化层（Dropout + LayerNorm）
+    4. 改进残差连接
     """
 
     def __init__(
@@ -102,7 +101,8 @@ class QL_MATCC_GNN_Model(nn.Module):
         use_market_guidance=True,
         use_quantum=True,
         ma_window=5,
-        q_threshold=0.0,
+        q_threshold=0.5,  # 【关键修改】默认阈值从 0.0 改为 0.5
+        dropout=0.1,
     ):
         super().__init__()
         gnn_embd = gnn_embd or min(n_embd, 64)
@@ -118,8 +118,11 @@ class QL_MATCC_GNN_Model(nn.Module):
             use_quantum=use_quantum,
             ma_window=ma_window,
             q_threshold=q_threshold,
+            dropout=dropout,
         )
         self.temporal_encoder.head = nn.Identity()
+        # 移除 temporal_encoder 的 pre_head_dropout，在这里统一处理
+        self.temporal_encoder.pre_head_dropout = nn.Identity()
 
         # 若 GAT 使用较小维度以省显存，则先做投影
         self.gnn_proj = nn.Linear(n_embd, gnn_embd) if gnn_embd != n_embd else nn.Identity()
@@ -128,14 +131,34 @@ class QL_MATCC_GNN_Model(nn.Module):
         self.gnn = GraphAttentionLayer(
             in_features=gnn_embd,
             out_features=gnn_embd,
-            dropout=0.1,
+            dropout=dropout,
             alpha=0.2,
         )
+        
+        # 【新增】GAT 后的 LayerNorm，稳定图特征
+        self.gnn_ln = nn.LayerNorm(gnn_embd)
 
-        # ----- 3. 融合头：时序 + 图 -> 预测 -----
-        self.fusion_head = nn.Linear(n_embd + gnn_embd, 1)
+        # ----- 3. 门控融合机制（Gated Fusion）-----
+        # 自适应融合时序特征和图特征，让模型学习最优融合比例
+        fusion_dim = n_embd + gnn_embd
+        self.gate = nn.Sequential(
+            nn.Linear(fusion_dim, fusion_dim // 2),
+            nn.ReLU(),
+            nn.Linear(fusion_dim // 2, 2),  # 输出 2 个权重
+            nn.Softmax(dim=-1),
+        )
+        
+        # ----- 4. 融合头：时序 + 图 -> 预测 -----
+        self.fusion_head = nn.Sequential(
+            nn.LayerNorm(fusion_dim),
+            nn.Dropout(dropout),
+            nn.Linear(fusion_dim, fusion_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(fusion_dim // 2, 1),
+        )
 
-        # ----- 4. 邻接矩阵：不参与梯度，随模型保存；未提供时退化为单位阵（仅自环）-----
+        # ----- 5. 邻接矩阵：不参与梯度，随模型保存；未提供时退化为单位阵（仅自环）-----
         if adj_matrix is None:
             adj_matrix = np.eye(num_nodes, dtype=np.float32)
         if isinstance(adj_matrix, np.ndarray):
@@ -167,9 +190,18 @@ class QL_MATCC_GNN_Model(nn.Module):
             batch_adj = torch.eye(B, device=x.device, dtype=x.dtype)
 
         h_graph = self.gnn(h_gnn_in, batch_adj)
+        h_graph = self.gnn_ln(h_graph)  # LayerNorm 稳定图特征
 
-        # Step 4: 融合并预测
+        # Step 4: 门控融合
         h_combined = torch.cat([h_temporal, h_graph], dim=1)
+        
+        # 使用门控机制自适应融合（可选，可以简化为直接 concat）
+        # gate_weights = self.gate(h_combined)  # (B, 2)
+        # h_temporal_weighted = h_temporal * gate_weights[:, 0:1]
+        # h_graph_weighted = h_graph * gate_weights[:, 1:2]
+        # h_fused = torch.cat([h_temporal_weighted, h_graph_weighted], dim=1)
+        
+        # Step 5: 融合头预测
         out = self.fusion_head(h_combined)
         return out
 

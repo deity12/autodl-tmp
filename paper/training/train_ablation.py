@@ -52,72 +52,108 @@ from datetime import datetime
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from scipy.stats import pearsonr, spearmanr
 
+
+# ================= 改进 Loss 函数：方向性 Loss =================
+class HybridLoss(nn.Module):
+    """
+    混合损失函数：结合 MSE 和 Sign Loss
+    - MSE Loss: 数值精准度
+    - Sign Loss: 方向准确度（强迫模型关注涨跌方向）
+    
+    参数:
+        alpha: Sign Loss 的权重（默认 0.1，可调）
+    """
+    def __init__(self, alpha=0.1):
+        super().__init__()
+        self.mse = nn.MSELoss()
+        self.alpha = alpha
+
+    def forward(self, pred, target):
+        # 1. MSE Loss (数值精准)
+        loss_mse = self.mse(pred, target)
+        
+        # 2. Sign Loss (方向精准)
+        # 如果符号相反，pred*target < 0，损失变大
+        # 使用 ReLU(-pred*target) 作为一个软惩罚
+        loss_sign = torch.mean(torch.relu(-pred * target))
+        
+        return loss_mse + self.alpha * loss_sign
+
 # ================= 1. 环境与路径配置 =================
-# 确保能导入上级目录的模块
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
-sys.path.append(os.path.join(parent_dir, 'dataProcessed'))
-sys.path.append(current_dir)
+sys.path.insert(0, parent_dir)  # 添加项目根目录到路径
 
-# 数据路径（兼容不同可能的路径）
-possible_graph_paths = [
-    os.path.join(parent_dir, 'data', 'processed', 'Graph_Adjacency.npy'),
-    os.path.join(parent_dir, 'dataProcessed', 'Graph_Adjacency.npy'),
-]
-possible_csv_paths = [
-    os.path.join(parent_dir, 'data', 'processed', 'Final_Model_Data.csv'),
-    os.path.join(parent_dir, 'dataProcessed', 'Final_Model_Data.csv'),
-]
+# 路径配置
+GRAPH_PATH = os.path.join(parent_dir, 'data', 'processed', 'Graph_Adjacency.npy')
+CSV_PATH = os.path.join(parent_dir, 'data', 'processed', 'Final_Model_Data.csv')
+OUTPUT_DIR = os.path.join(parent_dir, 'outputs')
+CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, 'checkpoints')
+LOG_DIR = os.path.join(OUTPUT_DIR, 'logs')
+FIGURE_DIR = os.path.join(OUTPUT_DIR, 'figures')
 
-GRAPH_PATH = None
-CSV_PATH = None
-for path in possible_graph_paths:
-    if os.path.exists(path):
-        GRAPH_PATH = path
-        break
-for path in possible_csv_paths:
-    if os.path.exists(path):
-        CSV_PATH = path
-        break
-
-if CSV_PATH is None:
-    print("❌ 错误: 找不到 Final_Model_Data.csv")
-    print("   已尝试路径:")
-    for path in possible_csv_paths:
-        print(f"     - {path}")
+# 检查数据文件
+if not os.path.exists(CSV_PATH):
+    print(f"❌ 错误: 找不到 {CSV_PATH}")
     exit(1)
 
 try:
-    from dataset import FinancialDataset
-    from model_gnn import QL_MATCC_GNN_Model
+    from dataProcessed.dataset import FinancialDataset
+    from models.gnn_model import QL_MATCC_GNN_Model
     print("✅ 成功导入基础模块")
 except ImportError as e:
     print(f"❌ 导入失败: {e}")
     exit(1)
 
-# ================= 2. 统一超参数 (保持与 Full Model 一致) =================
+# ================= 2. 统一超参数 (与 Full Model 完全一致，确保公平对比) =================
+# 【关键】消融实验必须与 Full Model 使用相同的超参数，否则对比无意义
 BASE_CONFIG = {
     'input_dim': 8,
-    'n_embd': 512,
-    'n_layers': 4,
+    
+    # 【模型维度】与 train_full.py 完全一致（48GB显存优化版）
+    'n_embd': 384,       # 48GB显存优化
+    'n_layers': 4,       # 48GB显存优化
     'n_qubits': 4,
-    'gnn_embd': 128,
+    'gnn_embd': 96,      # 48GB显存优化
     'seq_len': 30,
-    'batch_size': 3072,  # 保持与原训练脚本一致
-    'epochs': 6,        # 消融实验可以适当减少，但为了公平对比，建议保持相同
-    'lr': 1e-4,
-    'early_stop_patience': 3,
+    
+    # 【Batch Size】与 train_full.py 一致
+    'batch_size': 1024,  # 48GB显存优化
+    
+    # 【Epoch】
+    'epochs': 15,        # 48GB显存优化，更充分的训练
+    
+    # 【学习率】与 train_full.py 一致
+    'lr': 3e-4,
+    'quantum_lr_ratio': 0.1,
+    'use_differential_lr': True,
+    
+    # 【量子阈值】将在运行时从数据获取
+    'q_threshold': None,
+    
+    # 【正则化】与 train_full.py 一致
+    'dropout': 0.15,
+    'weight_decay': 1e-5,
+    
+    'use_hybrid_loss': False,
+    'hybrid_loss_alpha': 0.1,
+    'early_stop_patience': 5,  # 增加patience
+    
+    # 【硬件优化】48GB显存 + 12核CPU + 90GB内存
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-    'num_workers': 12,
-    'prefetch_factor': 8,
+    'num_workers': 10,
+    'prefetch_factor': 6,
     'use_amp': True,
+    'pin_memory': True,
+    'persistent_workers': True,
 }
 
 # ================= 3. 结果存储目录 =================
-# 创建 ablation 目录用于存放所有消融实验结果
-ABLATION_DIR = os.path.join(current_dir, 'ablation')
-os.makedirs(ABLATION_DIR, exist_ok=True)
-print(f"📁 消融实验结果将保存到: {ABLATION_DIR}")
+# 消融实验结果统一保存到 outputs 目录
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(FIGURE_DIR, exist_ok=True)
+print(f"📁 消融实验结果将保存到: {OUTPUT_DIR}")
 
 RESULTS = []  # 存储所有实验的结果
 
@@ -252,7 +288,17 @@ def run_experiment(exp_name, use_quantum=True, use_graph=True, use_matcc=True, u
     # ---------------- B. 准备数据 ----------------
     # 每次重新加载数据，防止内存泄漏
     train_dataset = FinancialDataset(CSV_PATH, seq_len=BASE_CONFIG['seq_len'], mode='train')
-    test_dataset = FinancialDataset(CSV_PATH, seq_len=BASE_CONFIG['seq_len'], mode='test', scaler=train_dataset.scaler)
+    test_dataset = FinancialDataset(
+        CSV_PATH, seq_len=BASE_CONFIG['seq_len'], mode='test', 
+        scaler=train_dataset.scaler,
+        vol_stats=train_dataset.vol_stats  # 【新增】传入波动率统计
+    )
+    
+    # 【关键】从训练数据获取量子阈值
+    q_threshold = BASE_CONFIG['q_threshold']
+    if q_threshold is None:
+        q_threshold = train_dataset.vol_stats.get('p70', 0.5)
+        print(f"   >>> 从数据获取量子阈值: q_threshold = {q_threshold:.4f}")
     
     train_loader = DataLoader(train_dataset, batch_size=BASE_CONFIG['batch_size'], shuffle=True, 
                               num_workers=BASE_CONFIG['num_workers'], pin_memory=True, 
@@ -276,10 +322,47 @@ def run_experiment(exp_name, use_quantum=True, use_graph=True, use_matcc=True, u
         use_quantum=use_quantum,
         use_matcc=use_matcc,
         use_market_guidance=use_market_guidance,
+        # 【新增】传入动态量子阈值和 dropout
+        q_threshold=q_threshold,
+        dropout=BASE_CONFIG.get('dropout', 0.1),
     ).to(BASE_CONFIG['device'])
 
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=BASE_CONFIG['lr'], betas=(0.9, 0.999), eps=1e-8)
+    # 选择损失函数
+    if BASE_CONFIG.get('use_hybrid_loss', False):
+        criterion = HybridLoss(alpha=BASE_CONFIG.get('hybrid_loss_alpha', 0.1))
+        print(f"   ✅ 使用混合Loss (MSE + Sign Loss, alpha={BASE_CONFIG.get('hybrid_loss_alpha', 0.1)})")
+    else:
+        criterion = nn.MSELoss()
+        print(f"   ✅ 使用标准MSE Loss")
+    
+    # 分层学习率：区分量子层和经典层
+    quantum_params = []
+    classic_params = []
+    for name, param in model.named_parameters():
+        # 量子层参数通常包含 'vqc' 或 'weights'（来自 PennyLane 的 TorchLayer）
+        if 'vqc' in name.lower() or 'weights' in name.lower():
+            quantum_params.append(param)
+        else:
+            classic_params.append(param)
+    
+    if BASE_CONFIG.get('use_differential_lr', True) and len(quantum_params) > 0 and use_quantum:
+        quantum_lr = BASE_CONFIG['lr'] * BASE_CONFIG.get('quantum_lr_ratio', 0.1)
+        optimizer = optim.AdamW([
+            {'params': classic_params, 'lr': BASE_CONFIG['lr']},
+            {'params': quantum_params, 'lr': quantum_lr}
+        ], betas=(0.9, 0.999), eps=1e-8, weight_decay=BASE_CONFIG.get('weight_decay', 1e-5))
+        print(f"   ✅ 使用分层学习率: 经典层={BASE_CONFIG['lr']:.2e}, 量子层={quantum_lr:.2e}")
+    else:
+        optimizer = optim.AdamW(
+            model.parameters(), lr=BASE_CONFIG['lr'], 
+            betas=(0.9, 0.999), eps=1e-8,
+            weight_decay=BASE_CONFIG.get('weight_decay', 1e-5)
+        )
+        if BASE_CONFIG.get('use_differential_lr', True) and len(quantum_params) == 0 and use_quantum:
+            print(f"   ⚠️ 未检测到量子层参数，使用统一学习率")
+        elif not BASE_CONFIG.get('use_differential_lr', True):
+            print(f"   ✅ 使用统一学习率={BASE_CONFIG['lr']:.2e}")
+    
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, min_lr=1e-6)
     scaler = torch.cuda.amp.GradScaler() if BASE_CONFIG['use_amp'] else None
 
@@ -379,7 +462,7 @@ def run_experiment(exp_name, use_quantum=True, use_graph=True, use_matcc=True, u
             best_metrics = metrics  # 保存最佳epoch的指标
             counter = 0
             # 保存消融实验的最佳模型到 ablation 目录
-            model_save_path = os.path.join(ABLATION_DIR, f'best_model_{exp_name}.pth')
+            model_save_path = os.path.join(CHECKPOINT_DIR, f'best_model_{exp_name}.pth')
             torch.save(model.state_dict(), model_save_path)
             
             # 打印关键指标
@@ -413,7 +496,7 @@ def run_experiment(exp_name, use_quantum=True, use_graph=True, use_matcc=True, u
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     
-    save_path = os.path.join(ABLATION_DIR, f'curve_{exp_name}.png')
+    save_path = os.path.join(FIGURE_DIR, f'curve_{exp_name}.png')
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
     print(f"✅ 结果已保存: {save_path}")
@@ -422,7 +505,7 @@ def run_experiment(exp_name, use_quantum=True, use_graph=True, use_matcc=True, u
     # 重新加载最佳模型并计算完整指标
     if best_metrics is None:
         print("   ⚠️ 重新计算最终评估指标...")
-        model.load_state_dict(torch.load(os.path.join(ABLATION_DIR, f'best_model_{exp_name}.pth')))
+        model.load_state_dict(torch.load(os.path.join(CHECKPOINT_DIR, f'best_model_{exp_name}.pth')))
         model.eval()
         all_preds_final = []
         all_targets_final = []
@@ -460,7 +543,7 @@ def run_experiment(exp_name, use_quantum=True, use_graph=True, use_matcc=True, u
             print()
     
     # ---------------- G. 保存 Loss 数值列表和评估指标 ----------------
-    loss_data_path = os.path.join(ABLATION_DIR, f'losses_{exp_name}.json')
+    loss_data_path = os.path.join(LOG_DIR, f'losses_{exp_name}.json')
     loss_data = {
         'experiment': exp_name,
         'train_losses': train_losses,
@@ -553,7 +636,8 @@ def save_summary_results():
     column_order = [col for col in column_order if col in df_results.columns]
     df_results = df_results[column_order]
     
-    csv_path = os.path.join(ABLATION_DIR, 'ablation_results_summary.csv')
+    csv_path = os.path.join(OUTPUT_DIR, 'results', 'ablation_results_summary.csv')
+    os.makedirs(os.path.join(OUTPUT_DIR, 'results'), exist_ok=True)
     df_results.to_csv(csv_path, index=False, float_format='%.6f')
     print(f"\n✅ 汇总结果已保存: {csv_path}")
     
@@ -627,7 +711,7 @@ def save_summary_results():
     axes[1].grid(True, alpha=0.3)
     
     plt.tight_layout()
-    comparison_path = os.path.join(ABLATION_DIR, 'ablation_results_comparison.png')
+    comparison_path = os.path.join(FIGURE_DIR, 'ablation_results_comparison.png')
     plt.savefig(comparison_path, dpi=300, bbox_inches='tight')
     plt.close()
     print(f"✅ 对比图表已保存: {comparison_path}")
@@ -642,23 +726,20 @@ def save_summary_results():
 
 # ================= 4. 主程序入口 =================
 if __name__ == "__main__":
-    print("🚀 启动全自动消融实验流程...")
+    print("🚀 启动消融实验流程...")
     print(f"📁 工作目录: {current_dir}")
-    print(f"📁 结果目录: {ABLATION_DIR}")
+    print(f"📁 结果目录: {OUTPUT_DIR}")
     print(f"📊 数据文件: {CSV_PATH}")
     print(f"🔗 图谱文件: {GRAPH_PATH if GRAPH_PATH else '未找到（将使用单位阵）'}")
     print(f"💻 设备: {BASE_CONFIG['device']}")
     
-    start_time = datetime.now()
-    
-    # 实验 0: 完整模型基准 (Full Model / Baseline)
-    # 所有开关全部打开，作为对比的"天花板"，确保在相同实验条件下公平对比
     print("\n" + "="*70)
-    print("📌 重要提示：首先运行 Full Model 作为基准线")
-    print("   这样可以确保所有实验在完全相同的条件下（epochs、batch_size、随机种子等）进行对比")
+    print("📌 说明：Full Model 由 train_gnn.py 独立训练")
+    print("   本脚本仅运行 4 组消融实验，验证各模块的有效性")
+    print("   评估对比请使用 evaluate_all.py")
     print("="*70)
-    run_experiment(exp_name="full_model", 
-                   use_quantum=True, use_graph=True, use_matcc=True, use_market_guidance=True)
+    
+    start_time = datetime.now()
     
     # 实验 1: 无量子模块 (w/o Quantum)
     run_experiment(exp_name="no_quantum", 
@@ -672,7 +753,7 @@ if __name__ == "__main__":
     run_experiment(exp_name="no_matcc", 
                    use_quantum=True, use_graph=True, use_matcc=False, use_market_guidance=True)
     
-    # 实验 4: 无市场引导 (w/o Market Guidance) - 【新增】
+    # 实验 4: 无市场引导 (w/o Market Guidance)
     run_experiment(exp_name="no_market_guidance", 
                    use_quantum=True, use_graph=True, use_matcc=True, use_market_guidance=False)
     
@@ -683,16 +764,16 @@ if __name__ == "__main__":
     duration = (end_time - start_time).total_seconds() / 60  # 分钟
     
     print("\n" + "="*70)
-    print("🎉 所有实验已完成！（1个基准 + 4个消融实验）")
+    print("🎉 消融实验已完成！（共 4 组消融实验）")
     print(f"⏱️  总耗时: {duration:.1f} 分钟")
     print("\n📁 生成的文件:")
-    print("   - ablation/curve_full_model.png (完整模型基准)")
     print("   - ablation/curve_no_quantum.png")
     print("   - ablation/curve_no_graph.png")
     print("   - ablation/curve_no_matcc.png")
     print("   - ablation/curve_no_market_guidance.png")
-    print("   - ablation/losses_*.json (每个实验的 Loss 数值列表，共5个)")
+    print("   - ablation/losses_*.json (每个实验的 Loss 数值列表，共4个)")
     print("   - ablation/ablation_results_summary.csv")
-    print("   - ablation/ablation_results_comparison.png (包含5条曲线对比)")
-    print("   - ablation/best_model_*.pth (每个实验的最佳模型，共5个)")
+    print("   - ablation/ablation_results_comparison.png")
+    print("   - ablation/best_model_*.pth (每个实验的最佳模型，共4个)")
+    print("\n📌 下一步：运行 evaluate_all.py 进行统一评估对比")
     print("="*70)

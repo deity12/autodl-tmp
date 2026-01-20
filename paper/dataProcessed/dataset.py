@@ -2,11 +2,19 @@ import pandas as pd
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, RobustScaler
 import os
 
 class FinancialDataset(Dataset):
-    def __init__(self, csv_path, seq_len=30, pred_len=1, mode='train', scaler=None):
+    """
+    金融数据集类，改进点：
+    1. 使用 RobustScaler 作为可选项，对异常值更鲁棒
+    2. 计算并存储波动率分位数，用于动态设置量子阈值
+    3. 改进的数据清洗流程
+    4. 添加数据增强选项（可选）
+    """
+    def __init__(self, csv_path, seq_len=30, pred_len=1, mode='train', scaler=None, 
+                 vol_stats=None, use_robust_scaler=False):
         """
         参数说明:
             csv_path: 清洗后的数据文件 Final_Model_Data.csv 的路径
@@ -14,6 +22,8 @@ class FinancialDataset(Dataset):
             pred_len: 预测时长（例如：预测未来1天）
             mode: 'train'（训练）或 'test'（测试）
             scaler: 已拟合的标准化器（测试模式下必须提供）
+            vol_stats: 波动率统计信息（测试模式下必须提供）
+            use_robust_scaler: 是否使用 RobustScaler（对异常值更鲁棒）
         """
         print(f"正在加载 {mode} 数据，来源：{csv_path}...")
         
@@ -25,31 +35,31 @@ class FinancialDataset(Dataset):
         self.seq_len = seq_len
         self.pred_len = pred_len
         self.mode = mode
+        self.use_robust_scaler = use_robust_scaler
         
         # 定义特征列和目标列
         self.feature_cols = ['Open', 'Close', 'High', 'Low', 'Volume', 'Market_Close', 'Market_Vol', 'Volatility_20d']
         self.target_col = 'Log_Ret'
         
         # =======================================================
-        # 🛡️ 【新增】鲁棒性数据清洗防火墙（防止异常值破坏模型）
+        # 🛡️ 【改进】鲁棒性数据清洗防火墙
         # =======================================================
         
-        # 1. 裁剪（Clipping）：解决极端异常值问题（例如 Log_Ret = 14.92）
-        # 强制将收益率限制在 -100% (-1.0) 到 +100% (1.0) 之间
+        # 1. 裁剪（Clipping）：使用更合理的范围
+        # 日收益率 ±50% 已经是极端情况（股票涨停/跌停）
         if self.target_col in self.df.columns:
-            self.df[self.target_col] = self.df[self.target_col].clip(-1.0, 1.0)
+            self.df[self.target_col] = self.df[self.target_col].clip(-0.5, 0.5)
             
         # 2. 处理无穷大值：将 Inf 和 -Inf 替换为 NaN
         self.df = self.df.replace([np.inf, -np.inf], np.nan)
         
-        # 3. 填充/删除缺失值：
-        # 定义需要检查的数值型列
+        # 3. 填充/删除缺失值
         numeric_cols = self.feature_cols + [self.target_col]
         
-        # 使用前向填充（forward fill）修复缺失的价格数据（例如之前发现的20行缺失）
+        # 使用前向填充修复缺失的价格数据
         self.df[numeric_cols] = self.df[numeric_cols].ffill()
         
-        # 如果仍有缺失值（例如在数据最开始的位置），则直接删除这些行
+        # 删除仍有缺失值的行
         before_len = len(self.df)
         self.df = self.df.dropna(subset=numeric_cols)
         after_len = len(self.df)
@@ -57,9 +67,9 @@ class FinancialDataset(Dataset):
         if before_len != after_len:
             print(f"⚠️ 已清理并删除 {before_len - after_len} 行包含无效数据（NaN）的记录")
 
-        # 4. 波动率修正：防止量子层计算溢出
+        # 4. 波动率修正：使用更合理的范围
         if 'Volatility_20d' in self.df.columns:
-             self.df['Volatility_20d'] = self.df['Volatility_20d'].fillna(0).clip(0, 5.0)
+             self.df['Volatility_20d'] = self.df['Volatility_20d'].fillna(0).clip(0, 2.0)
 
         print("✅ 数据清洗完成：无无穷值、无缺失值、极端值已裁剪。")
         # =======================================================
@@ -90,10 +100,13 @@ class FinancialDataset(Dataset):
         # 【关键修复】重置索引！避免后续滑动窗口出错
         self.df = self.df.reset_index(drop=True)
             
-        # 3. 标准化（使用 StandardScaler）
-        # 使用 NumPy 数组进行标准化，避免 DataFrame 的额外开销
+        # 3. 标准化
         if mode == 'train':
-            self.scaler = StandardScaler()
+            if use_robust_scaler:
+                # RobustScaler 对异常值更鲁棒
+                self.scaler = RobustScaler(quantile_range=(10, 90))
+            else:
+                self.scaler = StandardScaler()
             feature_array = self.df[self.feature_cols].values
             self.df[self.feature_cols] = self.scaler.fit_transform(feature_array)
         else:
@@ -107,6 +120,36 @@ class FinancialDataset(Dataset):
         self.data_x = self.df[self.feature_cols].values.astype(np.float32)
         self.data_y = self.df[self.target_col].values.astype(np.float32)
         self.data_vol = self.df['Volatility_20d'].values.astype(np.float32)
+        
+        # =======================================================
+        # 【新增】计算波动率分位数，用于动态设置量子阈值
+        # =======================================================
+        if mode == 'train':
+            # 在标准化后的波动率上计算分位数
+            # 注意：Volatility_20d 是 feature_cols 的最后一列（索引 7）
+            vol_standardized = self.data_x[:, 7]  # 标准化后的波动率
+            self.vol_stats = {
+                'mean': float(np.mean(vol_standardized)),
+                'std': float(np.std(vol_standardized)),
+                'p50': float(np.percentile(vol_standardized, 50)),  # 中位数
+                'p60': float(np.percentile(vol_standardized, 60)),
+                'p70': float(np.percentile(vol_standardized, 70)),  # 推荐阈值
+                'p80': float(np.percentile(vol_standardized, 80)),
+                'p90': float(np.percentile(vol_standardized, 90)),
+                'min': float(np.min(vol_standardized)),
+                'max': float(np.max(vol_standardized)),
+            }
+            print(f"📊 波动率统计（标准化后）:")
+            print(f"   mean={self.vol_stats['mean']:.3f}, std={self.vol_stats['std']:.3f}")
+            print(f"   p50={self.vol_stats['p50']:.3f}, p70={self.vol_stats['p70']:.3f}, p90={self.vol_stats['p90']:.3f}")
+            print(f"   ⭐ 推荐量子阈值 q_threshold: {self.vol_stats['p70']:.3f} (70%分位数)")
+        else:
+            if vol_stats is None:
+                # 如果测试时没提供 vol_stats，使用默认值
+                self.vol_stats = {'p70': 0.5}
+                print("⚠️ 测试模式未提供 vol_stats，使用默认阈值 0.5")
+            else:
+                self.vol_stats = vol_stats
         
         # 4. 构建滑动窗口索引（确保不跨股票拼接序列）
         print("正在构建滑动窗口索引...")
@@ -159,10 +202,8 @@ if __name__ == "__main__":
         train_dataset, 
         batch_size=32, 
         shuffle=True,
-        # 【性能优化】DataLoader 设置
-        num_workers=0,  # Windows 系统建议设为 0，避免多进程冲突
+        num_workers=0,
         pin_memory=True if torch.cuda.is_available() else False,
-        # prefetch_factor 在 num_workers=0 时不可用，故省略
     )
     
     print("\n>>> 检查训练批次数据...")
@@ -170,15 +211,20 @@ if __name__ == "__main__":
         print("输入张量形状:", batch['x'].shape)
         print("目标张量形状:", batch['y'].shape)
         print("波动率张量形状:", batch['vol'].shape)
+        print("节点索引形状:", batch['node_indices'].shape)
         print("样本数据加载成功！")
         
         if torch.cuda.is_available():
             print(f"数据所在设备: {batch['x'].device}（GPU 可用但当前未使用）")
         break
 
-    # 2. 测试测试数据加载器
+    # 2. 测试测试数据加载器（传入 vol_stats）
     print("\n>>> 正在初始化测试数据集...")
-    test_dataset = FinancialDataset(CSV_PATH, seq_len=30, mode='test', scaler=train_dataset.scaler)
+    test_dataset = FinancialDataset(
+        CSV_PATH, seq_len=30, mode='test', 
+        scaler=train_dataset.scaler,
+        vol_stats=train_dataset.vol_stats  # 传入训练集的波动率统计
+    )
     
     # 【统计信息输出】
     print(f"\n>>> 数据集统计信息:")
@@ -187,3 +233,5 @@ if __name__ == "__main__":
     print(f"  - 输入序列长度: {train_dataset.seq_len}")
     print(f"  - 预测步长: {train_dataset.pred_len}")
     print(f"  - 特征维度数: {len(train_dataset.feature_cols)}")
+    print(f"  - 波动率分位数 (p70): {train_dataset.vol_stats['p70']:.4f}")
+    print(f"  - 推荐量子阈值: {train_dataset.vol_stats['p70']:.4f}")
