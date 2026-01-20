@@ -15,6 +15,7 @@ QL-MATCC-GNN 模型训练脚本（对应论文完整架构：LLM 图谱 + Quantu
 
 import sys
 import os
+import json
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -23,6 +24,8 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from scipy.stats import pearsonr, spearmanr
 
 # ================= 1. 环境与路径 =================
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -178,6 +181,7 @@ def main():
     # ================= 6. 训练循环 =================
     train_losses, val_losses = [], []
     best_val_loss = float('inf')
+    best_metrics_epoch = None
     early_stop_counter = 0
     early_stop_patience = CONFIG['early_stop_patience']
 
@@ -234,9 +238,12 @@ def main():
         avg_train = epoch_train_loss / len(train_loader)
         train_losses.append(avg_train)
 
-        # ---------- 验证 ----------
+        # ---------- 验证（收集预测值和真实值用于计算指标）----------
         model.eval()
         epoch_val = 0.0
+        all_preds = []
+        all_targets = []
+        
         with torch.no_grad():
             for batch in test_loader:
                 x = batch['x'].to(CONFIG['device'], non_blocking=True)
@@ -250,12 +257,91 @@ def main():
                 if use_amp:
                     with torch.cuda.amp.autocast():
                         preds = model(x, vol, node_indices=node_indices)
-                        epoch_val += criterion(preds, y).item()
                 else:
                     preds = model(x, vol, node_indices=node_indices)
-                    epoch_val += criterion(preds, y).item()
+                
+                epoch_val += criterion(preds, y).item()
+                
+                # 收集预测值和真实值（用于计算完整指标）
+                all_preds.append(preds.cpu().numpy())
+                all_targets.append(y.cpu().numpy())
+        
         avg_val = epoch_val / len(test_loader)
         val_losses.append(avg_val)
+        
+        # 计算完整评估指标（仅在最佳epoch时计算，节省时间）
+        if avg_val < best_val_loss:
+            all_preds_np = np.concatenate(all_preds, axis=0)
+            all_targets_np = np.concatenate(all_targets, axis=0)
+            
+            # 计算指标
+            y_true = all_targets_np.flatten()
+            y_pred = all_preds_np.flatten()
+            
+            # ========== 1. 统计误差类 ==========
+            mse = mean_squared_error(y_true, y_pred)
+            mae = mean_absolute_error(y_true, y_pred)
+            rmse = np.sqrt(mse)
+            r2 = r2_score(y_true, y_pred)
+            
+            # MAPE
+            mask = np.abs(y_true) > 1e-8
+            if np.sum(mask) > 0:
+                mape = np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100
+            else:
+                mape = None
+            
+            # ========== 2. 方向预测类 ==========
+            true_direction = np.sign(y_true)
+            pred_direction = np.sign(y_pred)
+            directional_accuracy = np.mean(true_direction == pred_direction)
+            
+            # ========== 3. 量化投资类 ==========
+            # IC (Information Coefficient) - Pearson 相关系数
+            try:
+                ic, ic_pvalue = pearsonr(y_pred, y_true)
+                ic = float(ic)
+            except:
+                ic = None
+                ic_pvalue = None
+            
+            # RankIC (Rank Information Coefficient) - Spearman 秩相关系数
+            try:
+                rank_ic, rank_ic_pvalue = spearmanr(y_pred, y_true)
+                rank_ic = float(rank_ic)
+            except:
+                rank_ic = None
+                rank_ic_pvalue = None
+            
+            # 传统相关系数（兼容性）
+            try:
+                correlation = np.corrcoef(y_true, y_pred)[0, 1]
+                correlation = float(correlation)
+            except:
+                correlation = None
+            
+            best_metrics = {
+                # 统计误差类
+                'mse': float(mse),
+                'mae': float(mae),
+                'rmse': float(rmse),
+                'r2': float(r2),
+                'mape': float(mape) if mape is not None else None,
+                
+                # 方向预测类
+                'directional_accuracy': float(directional_accuracy),
+                
+                # 量化投资类
+                'ic': ic,
+                'ic_pvalue': float(ic_pvalue) if ic_pvalue is not None else None,
+                'rank_ic': rank_ic,
+                'rank_ic_pvalue': float(rank_ic_pvalue) if rank_ic_pvalue is not None else None,
+                
+                # 兼容性指标
+                'correlation': correlation,
+            }
+        else:
+            best_metrics = None
 
         old_lr = optimizer.param_groups[0]['lr']
         scheduler.step(avg_val)
@@ -265,9 +351,15 @@ def main():
 
         if avg_val < best_val_loss:
             best_val_loss = avg_val
+            best_metrics_epoch = best_metrics  # 保存最佳epoch的指标
             save_path = os.path.join(current_dir, 'best_model_gnn.pth')
             torch.save(model.state_dict(), save_path)
-            print(f"  🌟 Best model saved: {save_path}")
+            if best_metrics:
+                print(f"  🌟 Best model saved: {save_path}")
+                print(f"     Metrics: R²={best_metrics['r2']:.4f}, MAE={best_metrics['mae']:.6f}, "
+                      f"DirAcc={best_metrics['directional_accuracy']:.2%}, Corr={best_metrics['correlation']:.4f}")
+            else:
+                print(f"  🌟 Best model saved: {save_path}")
             early_stop_counter = 0
         else:
             early_stop_counter += 1
@@ -294,11 +386,142 @@ def main():
     plt.savefig(curve_path, dpi=300, bbox_inches='tight')
     plt.close()
     print(f">>> 训练曲线已保存: {curve_path}")
+    
+    # ================= 8. 最终评估（在最佳模型上计算完整指标）=================
+    # 如果最佳epoch时没有计算指标，现在重新计算
+    if best_metrics_epoch is None:
+        print(">>> 重新计算最终评估指标...")
+        model.load_state_dict(torch.load(os.path.join(current_dir, 'best_model_gnn.pth')))
+        model.eval()
+        all_preds_final = []
+        all_targets_final = []
+        
+        with torch.no_grad():
+            for batch in test_loader:
+                x = batch['x'].to(CONFIG['device'], non_blocking=True)
+                y = batch['y'].to(CONFIG['device'], non_blocking=True)
+                vol = batch['vol'].to(CONFIG['device'], non_blocking=True)
+                node_indices = batch.get('node_indices')
+                if node_indices is not None:
+                    node_indices = node_indices.to(CONFIG['device'], non_blocking=True)
+                
+                if use_amp:
+                    with torch.cuda.amp.autocast():
+                        preds = model(x, vol, node_indices=node_indices)
+                else:
+                    preds = model(x, vol, node_indices=node_indices)
+                
+                all_preds_final.append(preds.cpu().numpy())
+                all_targets_final.append(y.cpu().numpy())
+        
+        all_preds_final_np = np.concatenate(all_preds_final, axis=0)
+        all_targets_final_np = np.concatenate(all_targets_final, axis=0)
+        
+        y_true = all_targets_final_np.flatten()
+        y_pred = all_preds_final_np.flatten()
+        
+        # ========== 1. 统计误差类 ==========
+        mse = mean_squared_error(y_true, y_pred)
+        mae = mean_absolute_error(y_true, y_pred)
+        rmse = np.sqrt(mse)
+        r2 = r2_score(y_true, y_pred)
+        
+        mask = np.abs(y_true) > 1e-8
+        if np.sum(mask) > 0:
+            mape = np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100
+        else:
+            mape = None
+        
+        # ========== 2. 方向预测类 ==========
+        true_direction = np.sign(y_true)
+        pred_direction = np.sign(y_pred)
+        directional_accuracy = np.mean(true_direction == pred_direction)
+        
+        # ========== 3. 量化投资类 ==========
+        # IC (Information Coefficient)
+        try:
+            ic, ic_pvalue = pearsonr(y_pred, y_true)
+            ic = float(ic)
+        except:
+            ic = None
+            ic_pvalue = None
+        
+        # RankIC (Rank Information Coefficient)
+        try:
+            rank_ic, rank_ic_pvalue = spearmanr(y_pred, y_true)
+            rank_ic = float(rank_ic)
+        except:
+            rank_ic = None
+            rank_ic_pvalue = None
+        
+        # 传统相关系数（兼容性）
+        try:
+            correlation = np.corrcoef(y_true, y_pred)[0, 1]
+            correlation = float(correlation)
+        except:
+            correlation = None
+        
+        best_metrics_epoch = {
+            # 统计误差类
+            'mse': float(mse),
+            'mae': float(mae),
+            'rmse': float(rmse),
+            'r2': float(r2),
+            'mape': float(mape) if mape is not None else None,
+            
+            # 方向预测类
+            'directional_accuracy': float(directional_accuracy),
+            
+            # 量化投资类
+            'ic': ic,
+            'ic_pvalue': float(ic_pvalue) if ic_pvalue is not None else None,
+            'rank_ic': rank_ic,
+            'rank_ic_pvalue': float(rank_ic_pvalue) if rank_ic_pvalue is not None else None,
+            
+            # 兼容性指标
+            'correlation': correlation,
+        }
+    
+    # ================= 9. 保存 Loss 数值列表和评估指标 =================
+    loss_data_path = os.path.join(current_dir, 'training_losses_gnn.json')
+    loss_data = {
+        'experiment_name': 'full_model_gnn',
+        'train_losses': train_losses,
+        'val_losses': val_losses,
+        'best_val_loss': best_val_loss,
+        'best_epoch': val_losses.index(best_val_loss) + 1 if val_losses else 0,
+        'total_epochs': len(train_losses),
+        'metrics': best_metrics_epoch,  # 添加完整评估指标
+        'config': {
+            'batch_size': CONFIG['batch_size'],
+            'lr': CONFIG['lr'],
+            'epochs': CONFIG['epochs'],
+            'n_embd': CONFIG['n_embd'],
+            'n_layers': CONFIG['n_layers'],
+        }
+    }
+    with open(loss_data_path, 'w') as f:
+        json.dump(loss_data, f, indent=2)
+    print(f">>> Loss 数值列表和评估指标已保存: {loss_data_path}")
 
     print("\n" + "=" * 60)
     print(">>> QL-MATCC-GNN 训练结束")
     print(f"    Best Val Loss: {best_val_loss:.6f}")
-    print(f"    Model: best_model_gnn.pth")
+    if best_metrics_epoch:
+        print("\n    📊 评估指标:")
+        print(f"    【统计误差类】")
+        print(f"      R² Score: {best_metrics_epoch['r2']:.4f}")
+        print(f"      MAE: {best_metrics_epoch['mae']:.6f}")
+        print(f"      RMSE: {best_metrics_epoch['rmse']:.6f}")
+        print(f"    【方向预测类】")
+        print(f"      Directional Accuracy: {best_metrics_epoch['directional_accuracy']:.2%}")
+        print(f"    【量化投资类】")
+        if best_metrics_epoch.get('ic') is not None:
+            print(f"      IC (Information Coefficient): {best_metrics_epoch['ic']:.4f}")
+        if best_metrics_epoch.get('rank_ic') is not None:
+            print(f"      RankIC (Rank Information Coefficient): {best_metrics_epoch['rank_ic']:.4f}")
+    print(f"\n    Model: best_model_gnn.pth")
+    print(f"    Loss Data: training_losses_gnn.json")
     print("=" * 60)
 
 
