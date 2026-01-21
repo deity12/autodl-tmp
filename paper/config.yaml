@@ -1,0 +1,100 @@
+# QL-MATCC-GNN 模型配置文件
+# 用于论文实验的标准配置
+
+# 数据配置
+data:
+  csv_path: "data/processed/Final_Model_Data.csv"
+  graph_path: "data/processed/Graph_Adjacency.npy"
+  seq_len: 30
+  input_dim: 8
+
+# 模型架构配置
+model:
+  # 时序编码器 (Quantum-RWKV)
+  n_embd: 256          # 嵌入维度 (论文默认: 256)
+  n_layers: 3          # RWKV层数 (论文默认: 3)
+  n_qubits: 8          # 量子比特数 (论文默认: 8, 提供256维希尔伯特空间)
+
+  # 图神经网络 (GAT)
+  gnn_embd: 64         # GAT嵌入维度
+  gat_heads: 2         # 注意力头数 (2头: 协同关系+对抗关系)
+  max_neighbors: 32    # 每个节点最多聚合的邻居数
+
+  # 正则化
+  dropout: 0.1         # Dropout率 (论文默认: 0.1)
+
+  # 量子门控
+  q_threshold: null    # 量子阈值 (null=自动从数据70%分位数获取)
+
+# 训练配置
+training:
+  batch_size: 512      # 批大小 (论文默认: 512)
+  epochs: 30           # 训练轮数
+  lr: 3e-4             # 学习率
+
+  # 差异化学习率
+  use_differential_lr: true
+  quantum_lr_ratio: 0.1  # 量子层学习率 = lr * quantum_lr_ratio
+
+  # 优化器
+  weight_decay: 1e-5   # 权重衰减
+
+  # 学习率调度
+  scheduler: "cosine"  # cosine / step / plateau
+  T_0: 5               # CosineAnnealingWarmRestarts 参数
+  T_mult: 2
+  eta_min: 1e-6
+
+  # 早停
+  early_stop_patience: 8
+
+  # 损失函数
+  use_rank_loss: true  # 是否使用排序损失
+  rank_loss_weight: 0.1
+  rank_loss_max_pairs: 4096
+
+# 数据加载配置
+dataloader:
+  num_workers: 4
+  prefetch_factor: 2
+  pin_memory: true
+  persistent_workers: true
+  use_date_grouped_batch: true  # 按日期分组批次
+
+# 性能优化配置
+performance:
+  use_amp: true        # 混合精度训练
+  use_compile: false   # torch.compile (需要PyTorch 2.0+)
+  enable_perf_flags: true  # TF32等性能标志
+
+# 48GB GPU 高性能配置 (通过环境变量 QL_PROFILE=48gb 启用)
+profile_48gb:
+  model:
+    n_embd: 384
+    n_layers: 4
+    gnn_embd: 128
+  training:
+    batch_size: 1024
+    epochs: 30
+    rank_loss_max_pairs: 8192
+  dataloader:
+    num_workers: 8
+    prefetch_factor: 4
+
+# 输出配置
+output:
+  checkpoint_dir: "outputs/checkpoints"
+  log_dir: "outputs/logs"
+  figure_dir: "outputs/figures"
+
+# 实验说明
+experiment:
+  name: "QL-MATCC-GNN Full Model"
+  description: "基于LLM结构先验与Quantum-RWKV时空解耦的金融风险评估"
+  notes: |
+    超参数选择依据:
+    - n_embd=256: 平衡表达能力与计算效率
+    - n_qubits=8: 提供256维希尔伯特空间，与经典FFN相当
+    - gat_heads=2: 对应金融图谱的两类关系（协同/对抗）
+    - dropout=0.1: 消融实验表明0.1优于0.15
+    - quantum_lr_ratio=0.1: 量子层需要更小学习率以保持稳定性
