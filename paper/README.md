@@ -176,14 +176,14 @@ python -m dataProcessed.build_graph --all_stocks
 ```python
 # build_graph.py 配置
 USE_LLM_DEFAULT = True        # ✅ 48GB显存默认启用LLM
-MAX_NEWS_PER_TICKER = 100     # ✅ 增加采样量
+MAX_NEWS_PER_TICKER = 200     # ✅ 增加采样量
 MAX_TOTAL_NEWS = 100000       # ✅ 增加总量
 
 # 手动运行
 python -m dataProcessed.build_graph --use_llm
 
 # 如果显存不足，可临时使用规则模式
-python -m dataProcessed.build_graph --max_per_ticker 50 --max_total 25000
+python -m dataProcessed.build_graph --no_llm
 ```
 
 **LLM优势**:
