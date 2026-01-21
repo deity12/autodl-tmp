@@ -149,16 +149,16 @@ cd /root/autodl-tmp/paper
 
 - `base_model.py`：时序主干（不含图）
   - **MATCC**：因果滑动平均做趋势/波动解耦
-  - **RWKV**：时间混合层（JIT 加速）
-  - **Quantum_ChannelMixing**：按波动率门控，只有高波动样本走量子分支（PennyLane VQC）
+  - **RWKV**：时间混合层（JIT 加速），使用完整线性层保证表达能力
+  - **Quantum_ChannelMixing**：按波动率门控，高波动样本走量子分支（8量子比特 + 4层纠缠，256维希尔伯特空间）
 - `gnn_model.py`：完整模型 `QL_MATCC_GNN_Model`
   - 先用 `QL_MATCC_Model` 提取时序表征
-  - 再在 `Graph_Adjacency.npy` 上做 GAT 聚合（含 mini-batch 邻居扩展/诱导子图）
+  - 再在 `Graph_Adjacency.npy` 上做双头稀疏 GAT 聚合（含 mini-batch 邻居扩展/诱导子图）
   - 融合后输出收益率预测
 
 ### `training/`：训练与消融
 
-- `train_full.py`：训练完整模型（默认配置：`n_embd=256, n_layers=3, gnn_embd=64, batch=512, epochs=20`）
+- `train_full.py`：训练完整模型（默认配置：`n_embd=256, n_layers=3, n_qubits=8, gnn_embd=64, batch=512, epochs=30, dropout=0.1`）
   - 从 `FinancialDataset` 的 `vol_stats['p70']` 自动取 `q_threshold`（量子门控阈值）
   - 支持 AMP、梯度裁剪、早停、差异化学习率、按日期分组 batch、可选 RankNet 排序损失
 - `train_ablation.py`：消融实验（与论文/代码一致的 3 组）

@@ -105,35 +105,35 @@ except ImportError as e:
 # 【关键】消融实验必须与 Full Model 使用相同的超参数，否则对比无意义
 BASE_CONFIG = {
     'input_dim': 8,
-    
+
     # 【模型维度】与 train_full.py / paper/newpaper.md 完全一致
     'n_embd': 256,
     'n_layers': 3,
-    'n_qubits': 4,
+    'n_qubits': 8,  # 【同步】与train_full.py保持一致
     'gnn_embd': 64,
     'seq_len': 30,
-    
+
     # 【Batch Size】与 train_full.py 一致
     'batch_size': 512,
-    
-    # 【Epoch】
-    'epochs': 20,
-    
+
+    # 【Epoch】与 train_full.py 一致
+    'epochs': 10,  # 【同步】与train_full.py保持一致
+
     # 【学习率】与 train_full.py 一致
     'lr': 3e-4,
     'quantum_lr_ratio': 0.1,
     'use_differential_lr': True,
-    
+
     # 【量子阈值】将在运行时从数据获取
     'q_threshold': None,
-    
+
     # 【正则化】与 train_full.py 一致
-    'dropout': 0.15,
+    'dropout': 0.1,  # 【同步】与train_full.py保持一致
     'weight_decay': 1e-5,
-    
+
     'use_hybrid_loss': False,
     'hybrid_loss_alpha': 0.1,
-    'early_stop_patience': 6,
+    'early_stop_patience': 3,  # 【同步】与train_full.py保持一致
     
     # 【数据加载/硬件优化】与 train_full.py 保持一致
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',

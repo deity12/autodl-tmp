@@ -100,8 +100,10 @@ class VQC_Block(nn.Module):
 
     说明：本实现使用 `default.qubit` 作为模拟器（CPU），稳定性最好；
     如需 GPU 加速量子模拟，可研究 `pennylane-lightning-gpu`（需额外安装）。
+
+    【优化】增强量子容量：8量子比特（256维希尔伯特空间）+ 4层纠缠
     """
-    def __init__(self, n_qubits=4, n_layers=2):
+    def __init__(self, n_qubits=8, n_layers=4):
         super().__init__()
         self.n_qubits = n_qubits
         
@@ -132,14 +134,18 @@ class RWKV_TimeMixing(nn.Module):
 
     作用：在时间维度上做线性注意力式的序列聚合，兼具类似 Transformer 的表达能力与更低的推理复杂度。
     本工程使用 JIT 编译的 `rwkv_linear_attention_cpu` 提升循环部分性能。
+
+    【修复】恢复完整RWKV容量，移除GQA优化以确保全量模型性能
     """
     def __init__(self, n_embd):
         super().__init__()
         self.n_embd = n_embd
+
         # 优化：使用 Parameter 定义 decay，且初始化为负值确保衰减
         self.time_decay = nn.Parameter(torch.ones(n_embd) * -1.0)
         self.time_first = nn.Parameter(torch.ones(n_embd) * 0.5)
-        
+
+        # 【修复】使用完整线性层，恢复全部表达能力
         self.key = nn.Linear(n_embd, n_embd, bias=False)
         self.value = nn.Linear(n_embd, n_embd, bias=False)
         self.receptance = nn.Linear(n_embd, n_embd, bias=False)
@@ -148,14 +154,17 @@ class RWKV_TimeMixing(nn.Module):
     def forward(self, x):
         # 错误处理：输入检查
         assert x.dim() == 3, f"Expected 3D tensor (Batch, Seq, Dim), got {x.dim()}D"
-        
-        k = self.key(x)
-        v = self.value(x)
-        r = torch.sigmoid(self.receptance(x))
-        
+
+        B, T, C = x.shape
+
+        # 【修复】使用完整维度计算
+        k = self.key(x)  # (B, T, C)
+        v = self.value(x)  # (B, T, C)
+        r = torch.sigmoid(self.receptance(x))  # (B, T, C)
+
         # 调用 JIT 编译的算子
         wkv = rwkv_linear_attention_cpu(self.time_decay, self.time_first, k, v)
-        
+
         return self.output(r * wkv)
 
 # ================= 2.5 因果滑动平均 (Causal Moving Average) =================
@@ -253,8 +262,10 @@ class Quantum_ChannelMixing(nn.Module):
     2. 量子输出缩放：添加可学习的缩放因子，稳定训练
     3. 残差连接：量子分支也使用残差，防止梯度消失
     4. 梯度裁剪兼容：使用 clamp 防止数值溢出
+
+    【优化】增强量子容量：8量子比特 + 4层纠缠
     """
-    def __init__(self, n_embd, n_qubits=4, q_threshold=0.5, dropout: float = 0.1):
+    def __init__(self, n_embd, n_qubits=8, q_threshold=0.5, dropout: float = 0.1):
         super().__init__()
         self.n_embd = n_embd
         self.n_qubits = n_qubits
@@ -274,8 +285,8 @@ class Quantum_ChannelMixing(nn.Module):
         self.vqc = VQC_Block(n_qubits=n_qubits)
         self.proj_up = nn.Linear(n_qubits, n_embd)
         
-        # 【新增】量子输出缩放因子，初始化为较小的值，稳定早期训练
-        self.quantum_scale = nn.Parameter(torch.tensor(0.1))
+        # 【优化】量子输出缩放因子，增大初始值以充分利用量子容量
+        self.quantum_scale = nn.Parameter(torch.tensor(0.5))
         
         self.layer_norm = nn.LayerNorm(n_embd)
         
@@ -344,7 +355,7 @@ class QL_MATCC_Model(nn.Module):
         input_dim=8,
         n_embd=32,
         n_layers=2,
-        n_qubits=4,
+        n_qubits=8,  # 【优化】默认8量子比特
         use_matcc=True,
         use_market_guidance=True,
         use_quantum=True,

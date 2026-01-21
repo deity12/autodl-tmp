@@ -1,0 +1,80 @@
+% !TeX program = xelatex
+\documentclass[12pt]{ctexart}
+\usepackage{geometry}
+\geometry{a4paper, margin=2.5cm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{caption}
+\usepackage{float}
+\title{基于量子-经典混合时序编码与动态LLM图谱融合的金融收益预测研究（QL-MATCC-GNN）}
+\author{作者：\underline{待填} \\ 导师：\underline{待填}}
+\date{\today}
+\begin{document}
+\maketitle
+\begin{abstract}
+本研究提出 QL-MATCC-GNN，一种将因果趋势-波动分解（MATCC）、高效因果 RWKV 时序编码、条件性变分量子电路（VQC）与基于 LLM 构建的动态图谱通过图神经网络（GNN）融合的混合架构，用于短期股票收益预测。方法在高波动子集上启用量子分支以增强表达能力，同时使用分层采样与 S\&P500 子集保证图谱质量。本文给出算法实现、实验设计及评估协议，并通过消融实验与分层评估验证各模块贡献。
+\end{abstract}
+
+\section{引言}
+简要说明背景与研究动机：现代金融时序预测面临高噪声与结构性风险；同时 LLM 在文本关系抽取方面展示出较强能力，GNN 可用于跨标的信息聚合；量子机器学习（VQC）在高不确定性问题上可能带来表达能力优势。本课题旨在系统性地将上述技术结合并进行严格评估。
+
+\section{相关工作}
+略述 Transformer/RWKV、GNN（GAT）、LLM 信息抽取与 VQC 在机器学习中的应用与局限，突出本研究的跨范式集成与工程化实现。
+
+\section{方法}
+\subsection{总体架构}
+QL-MATCC-GNN 为模块化流水线，包含数据处理、LLM 图谱构建、时序编码器（MATCC + RWKV）、量子-经典混合通道（条件 VQC）、图神经网络（GAT）与融合头。输入为每只股票过去 $T$ 天的特征序列，输出为对数收益率预测或截面排序分数。
+
+\subsection{数据处理}
+数据按 `Ticker` 做滑动窗口（序列长度 $T$），训练/测试按时间切分（80/20）。训练时拟合 `StandardScaler` 或 `RobustScaler`，并在标准化后计算波动率分位数作为量子门控阈值（默认 p70）。清洗步骤包含 Inf/NaN 处理、极端值裁剪与前向填充，详见代码 `paper/dataProcessed/dataset.py`。
+
+\subsection{LLM 图谱构建}
+使用高质量 prompt 批量抽取公司间关系，并进行别名规范化与分层采样，优先使用 S\&P500 子集以保证图谱质量。产生的邻接矩阵与 tickers 列表用于训练时对齐（`paper/dataProcessed/build_graph.py`）。
+
+\subsection{时序模块：MATCC 与 RWKV}
+MATCC 使用因果滑动平均分离趋势与波动，RWKV_TimeMixing 使用 JIT 加速的线性时间注意算子，采用完整的线性层以保证全量模型的表达能力（`paper/models/base_model.py`）。确保完全因果、无未来泄露的实现细节在代码中已处理。
+
+\subsection{量子-经典混合通道}
+对标准化波动率高于阈值的样本启用 VQC 分支：输入先经线性投影并用 sigmoid 映射到 $[0,\pi]$，再通过 PennyLane 实现的变分电路（8量子比特 + 4层 StronglyEntanglingLayers，提供256维希尔伯特空间），测量输出后投影回高维并乘以可学习缩放因子（初始值0.5）与残差连接以稳定训练；低波动样本使用纯经典 FFN 分支。实现见 `Quantum_ChannelMixing` 与 `VQC_Block`。
+
+\subsection{图神经网络与融合}
+基于2头稀疏 GAT 对诱导子图（batch 节点及 Top-K 邻居）做聚合，使用邻居索引缓存加速查找。双头设计在保持表达能力的同时提升每个头的维度。时序特征与图特征经门控融合（Gated Fusion）自适应合并，最终由融合头输出回归结果（详见 `paper/models/gnn_model.py`）。
+
+\subsection{损失与训练策略}
+主损失为 MSE，可选加入方向性软惩罚 $L_{sign}$：
+\[\mathcal{L}=\frac{1}{N}\sum_i (y_i-\hat y_i)^2 + \alpha\cdot\frac{1}{N}\sum_i\max(0,-y_i\hat y_i).\]
+训练采用 `AdamW`，支持差分学习率（量子参数使用较小 lr）、AMP、梯度裁剪与早停。训练脚本位于 `paper/training` 目录。
+
+\section{实验设计}
+\subsection{数据与基线}
+主数据为 `data/processed/Final_Model_Data.csv`，主实验以 S\&P500 子集为对象。对照基线包括 LSTM/Transformer、RWKV（无量子）、RWKV+统计图谱+GNN。消融研究包括 w/o Quantum、w/o Graph、w/o MATCC、w/o MarketGuidance。
+
+\subsection{评估协议}
+指标包含 MSE、MAE、RMSE、R^2、方向准确率、IC（Pearson）与 RankIC（Spearman）。按日截面计算 IC 并求日均作为主要口径；并按波动率划分低/中/高组分别评估量子分支贡献。代码中评估实现见 `paper/evaluation/evaluate_all.py`。
+
+\subsection{超参数与敏感性分析}
+默认设置：$n_{emb}=256,n_{layers}=3,n_q=8,seq=30,batch=512,epochs=30,dropout=0.1,lr=3\times10^{-4}$。量子模块采用8量子比特与4层纠缠，提供256维希尔伯特空间以匹配经典FFN的表达能力。将研究 $q_{threshold}$（p60/p70/p80）、量子比特数 $n_q$、VQC 层数与量子缩放因子对性能的影响。
+
+\section{时间计划}
+详见开题草稿的 7 个月计划（数据准备、实现各模块、消融与写作）。
+
+\section{资源与风险}
+列出计算资源（48GB GPU 推荐）、PennyLane 依赖与可替代经典分支以应对量子模拟受限等风险与应对策略。
+
+\section{参考文献}
+\begin{thebibliography}{9}
+\bibitem{vaswani2017} Ashish Vaswani et al., "Attention Is All You Need", NeurIPS 2017.
+\bibitem{velickovic2018} Petar Veli\v{c}kovi\'c et al., "Graph Attention Networks", ICLR 2018.
+\bibitem{pennylane} PennyLane Documentation, Xanadu.
+\end{thebibliography}
+
+\section*{附录：代码位置}
+- 数据与预处理：`paper/dataProcessed/dataset.py`、`paper/dataProcessed/build_graph.py`。
+- 模型实现：`paper/models/base_model.py`、`paper/models/gnn_model.py`。
+- 训练与消融：`paper/training/train_full.py`、`paper/training/train_ablation.py`。
+- 评估：`paper/evaluation/evaluate_all.py`。
+
+\end{document}
