@@ -96,12 +96,12 @@ class GraphAttentionLayer(nn.Module):
             return h_prime
 
     def _prepare_attentional_mechanism_input(self, Wh):
-        """ 构造 (i,j) 对的 [Wh_i || Wh_j]，输出 (N, N, 2*out_features)。 """
+        """ 构造 (i,j) 对的 [Wh_i || Wh_j]，输出 (N, N, 2*head_dim)。 """
         N = Wh.size()[0]
         Wh_repeated_in_chunks = Wh.repeat_interleave(N, dim=0)
         Wh_repeated_alternating = Wh.repeat(N, 1)
         all_combinations_matrix = torch.cat([Wh_repeated_in_chunks, Wh_repeated_alternating], dim=1)
-        return all_combinations_matrix.view(N, N, 2 * self.out_features)
+        return all_combinations_matrix.view(N, N, 2 * self.head_dim)
 
 
 # ================= 2. 完整模型 QL_MATCC_GNN_Model =================
@@ -166,22 +166,12 @@ class QL_MATCC_GNN_Model(nn.Module):
         # 【新增】GAT 后的 LayerNorm，稳定图特征
         self.gnn_ln = nn.LayerNorm(gnn_embd)
 
-        # 许多顶会工作在 mini-batch 场景会给“未出现在 batch 的邻居节点”提供一个可学习的静态表示，
+        # 许多顶会工作在 mini-batch 场景会给"未出现在 batch 的邻居节点"提供一个可学习的静态表示，
         # 避免图消息传递完全依赖 batch 采样（否则邻居不在 batch 时无法聚合）。
         self.node_embedding = nn.Embedding(num_nodes, gnn_embd)
         nn.init.normal_(self.node_embedding.weight, mean=0.0, std=0.02)
 
-        # ----- 3. 门控融合机制（Gated Fusion）-----
-        # 自适应融合时序特征和图特征，让模型学习最优融合比例
-        fusion_dim = n_embd + gnn_embd
-        self.gate = nn.Sequential(
-            nn.Linear(fusion_dim, fusion_dim // 2),
-            nn.ReLU(),
-            nn.Linear(fusion_dim // 2, 2),  # 输出 2 个权重
-            nn.Softmax(dim=-1),
-        )
-        
-        # ----- 4. 融合头：时序 + 图 -> 预测 -----
+        # ----- 3. 融合头：时序 + 图 -> 预测 -----
         self.fusion_head = nn.Sequential(
             nn.LayerNorm(fusion_dim),
             nn.Dropout(dropout),
@@ -305,16 +295,8 @@ class QL_MATCC_GNN_Model(nn.Module):
             uniq_graph = sub_out[uniq_pos_in_sub]  # (U, gnn_embd) 顺序与 uniq_nodes 对齐
             h_graph = uniq_graph[inv]              # (B, gnn_embd) 映射回每条样本
 
-        # Step 4: 门控融合
+        # Step 4: 融合头预测
         h_combined = torch.cat([h_temporal, h_graph], dim=1)
-        
-        # 使用门控机制自适应融合（可选，可以简化为直接 concat）
-        # gate_weights = self.gate(h_combined)  # (B, 2)
-        # h_temporal_weighted = h_temporal * gate_weights[:, 0:1]
-        # h_graph_weighted = h_graph * gate_weights[:, 1:2]
-        # h_fused = torch.cat([h_temporal_weighted, h_graph_weighted], dim=1)
-        
-        # Step 5: 融合头预测
         out = self.fusion_head(h_combined)
         return out
 

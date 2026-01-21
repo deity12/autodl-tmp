@@ -195,10 +195,13 @@ class FinancialDataset(Dataset):
                 # 高效地添加所有有效的起始位置索引
                 for i in range(group_len - seq_len - pred_len + 1):
                     s = start_row + i
-                    self.indices.append(s)
-                    # 目标对齐：y 来自 target_row，因此用于排序/RankIC 的“截面日期”应以 target_date 分组
                     end_row = s + self.seq_len
                     target_row = end_row + self.pred_len - 1
+                    # 边界检查：确保 target_row 不超出 group 范围
+                    if target_row >= start_row + group_len:
+                        continue
+                    self.indices.append(s)
+                    # 目标对齐：y 来自 target_row，因此用于排序/RankIC 的"截面日期"应以 target_date 分组
                     self.target_dates.append(self.df['Date'].iloc[target_row])
                     
         print(f"{mode} 数据集共生成样本数: {len(self.indices)}")

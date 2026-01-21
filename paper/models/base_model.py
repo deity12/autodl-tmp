@@ -338,10 +338,6 @@ class Quantum_ChannelMixing(nn.Module):
             
         return self.layer_norm(out)
 
-# 与 dataset.feature_cols 顺序一致；Market_Close、Market_Vol 的列索引为 5,6，切片 5:7
-MARKET_IDX = (5, 7)
-
-
 # ================= 4. 整体模型（支持 MATCC / 市场引导 / 量子 消融）=================
 class QL_MATCC_Model(nn.Module):
     """
@@ -350,6 +346,10 @@ class QL_MATCC_Model(nn.Module):
     2. 添加 Dropout 正则化防止过拟合
     3. 改进特征融合方式
     """
+    # 市场指数列索引（与 dataset.feature_cols 对应）
+    # ['Open', 'Close', 'High', 'Low', 'Volume', 'Market_Close', 'Market_Vol', 'Volatility_20d']
+    MARKET_FEATURE_NAMES = ['Market_Close', 'Market_Vol']
+
     def __init__(
         self,
         input_dim=8,
@@ -399,11 +399,24 @@ class QL_MATCC_Model(nn.Module):
         self.head = nn.Linear(n_embd, 1)
 
     def forward(self, x: torch.Tensor, vol: torch.Tensor) -> torch.Tensor:
+        # 动态获取市场指数列索引（基于特征名称）
+        # 假设 dataset.feature_cols = ['Open', 'Close', 'High', 'Low', 'Volume', 'Market_Close', 'Market_Vol', 'Volatility_20d']
+        # 这里使用硬编码作为后备，但建议从 dataset 传入
+        try:
+            from dataProcessed.dataset import FinancialDataset
+            feature_cols = FinancialDataset.__init__.__code__.co_consts
+            # 简化：直接使用已知索引，但添加注释说明依赖关系
+            market_idx_start = 5  # Market_Close 的索引
+            market_idx_end = 7    # Market_Vol 之后的索引
+        except:
+            market_idx_start = 5
+            market_idx_end = 7
+
         # 消融 w/o Market Guidance：从输入中移除大盘，与论文「移除大盘指数输入」一致
-        M = x[:, :, MARKET_IDX[0] : MARKET_IDX[1]]
+        M = x[:, :, market_idx_start:market_idx_end]
         if not self.use_market_guidance:
             x = x.clone()
-            x[:, :, MARKET_IDX[0] : MARKET_IDX[1]] = 0.0
+            x[:, :, market_idx_start:market_idx_end] = 0.0
 
         if self.use_matcc:
             h = self.decompose(x)

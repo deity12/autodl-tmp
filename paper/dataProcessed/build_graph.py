@@ -304,8 +304,21 @@ def _load_checkpoint_npz(path: str):
         adj = data["adj"]
         meta_raw = data["meta"].item() if hasattr(data["meta"], "item") else data["meta"]
         meta = json.loads(meta_raw) if isinstance(meta_raw, (str, bytes)) else {}
+
+        # 完整性验证：检查邻接矩阵的基本属性
+        if not isinstance(adj, np.ndarray):
+            print(f"[WARN] Checkpoint 损坏：adj 不是 ndarray")
+            return None, None
+        if adj.ndim != 2 or adj.shape[0] != adj.shape[1]:
+            print(f"[WARN] Checkpoint 损坏：adj 不是方阵，shape={adj.shape}")
+            return None, None
+        if not np.all(np.isfinite(adj)):
+            print(f"[WARN] Checkpoint 损坏：adj 包含 NaN/Inf")
+            return None, None
+
         return adj, meta
-    except Exception:
+    except Exception as e:
+        print(f"[WARN] 加载 checkpoint 失败: {e}")
         return None, None
 
 
