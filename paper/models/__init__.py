@@ -5,7 +5,7 @@
 - gnn_model: GNN模型 QL_MATCC_GNN_Model（加入图注意力网络）
 """
 
-from models.base_model import (
+from .base_model import (
     QL_MATCC_Model,
     Quantum_ChannelMixing,
     Classical_ChannelMixing,
@@ -14,7 +14,7 @@ from models.base_model import (
     VQC_Block,
 )
 
-from models.gnn_model import (
+from .gnn_model import (
     QL_MATCC_GNN_Model,
     GraphAttentionLayer,
 )

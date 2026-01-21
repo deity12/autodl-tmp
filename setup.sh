@@ -26,7 +26,7 @@ echo ">>> [5/5] 安装图神经网络 (PyG) [关键步骤]..."
 # !!! 注意：这里我专门为你改成了 cu118 (匹配你的 CUDA 11.8) !!!
 # 如果装错版本，这一步会直接报错
 pip install torch_geometric
-pip install pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv -f https://data.pyg.org/whl/torch-2.1.0+cu118.html
+pip install pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv -f https://data.pyg.org/whl/torch-2.1.2+cu118.html
 
 echo ">>> [6/6] 安装其他项目依赖..."
 pip install einops ninja

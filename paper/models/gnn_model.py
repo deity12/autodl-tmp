@@ -19,7 +19,7 @@ import torch.nn.functional as F
 import numpy as np
 
 # 从同目录的 base_model.py 复用：QL_MATCC_Model、量子/经典通道、RWKV、MATCC 等
-from models.base_model import QL_MATCC_Model, Quantum_ChannelMixing, RWKV_TimeMixing, MATCCDecompose
+from .base_model import QL_MATCC_Model, Quantum_ChannelMixing, RWKV_TimeMixing, MATCCDecompose
 
 
 # ================= 1. 图注意力层 GAT (优化版) =================

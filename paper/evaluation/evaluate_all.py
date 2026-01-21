@@ -41,6 +41,7 @@ CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, 'checkpoints')
 RESULTS_DIR = os.path.join(OUTPUT_DIR, 'results')
 FIGURE_DIR = os.path.join(OUTPUT_DIR, 'figures')
 os.makedirs(RESULTS_DIR, exist_ok=True)
+os.makedirs(FIGURE_DIR, exist_ok=True)
 
 # 检查数据文件
 if not os.path.exists(CSV_PATH):

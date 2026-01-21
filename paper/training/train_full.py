@@ -471,7 +471,7 @@ def main():
             progress_bar.set_postfix(loss=f'{loss.item():.6f}', avg=f'{epoch_train_loss/num_batches:.6f}')
 
         scheduler.step()
-        avg_train = epoch_train_loss / len(train_loader)
+        avg_train = epoch_train_loss / num_batches
         train_losses.append(avg_train)
 
         # ---------- 验证 ----------

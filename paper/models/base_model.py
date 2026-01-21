@@ -403,12 +403,10 @@ class QL_MATCC_Model(nn.Module):
         # 假设 dataset.feature_cols = ['Open', 'Close', 'High', 'Low', 'Volume', 'Market_Close', 'Market_Vol', 'Volatility_20d']
         # 这里使用硬编码作为后备，但建议从 dataset 传入
         try:
-            from dataProcessed.dataset import FinancialDataset
-            feature_cols = FinancialDataset.__init__.__code__.co_consts
             # 简化：直接使用已知索引，但添加注释说明依赖关系
             market_idx_start = 5  # Market_Close 的索引
             market_idx_end = 7    # Market_Vol 之后的索引
-        except:
+        except (AttributeError, TypeError):
             market_idx_start = 5
             market_idx_end = 7
 

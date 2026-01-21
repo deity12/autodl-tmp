@@ -156,8 +156,8 @@ class FinancialDataset(Dataset):
         # =======================================================
         if mode == 'train':
             # 在标准化后的波动率上计算分位数
-            # 注意：Volatility_20d 是 feature_cols 的最后一列（索引 7）
-            vol_standardized = self.data_x[:, 7]  # 标准化后的波动率
+            vol_col_idx = self.feature_cols.index('Volatility_20d')
+            vol_standardized = self.data_x[:, vol_col_idx]  # 标准化后的波动率
             self.vol_stats = {
                 'mean': float(np.mean(vol_standardized)),
                 'std': float(np.std(vol_standardized)),

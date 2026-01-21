@@ -68,7 +68,7 @@ echo ""
 
 # 检查GPU显存
 GPU_MEMORY=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits)
-if [ "$GPU_MEMORY" -lt 40000 ]; then
+if [ "$GPU_MEMORY" -lt 48000 ]; then
     echo "⚠️  警告：检测到显存 ${GPU_MEMORY}MB < 48GB"
     echo "   LLM模式可能会遇到显存不足问题"
     read -p "是否继续？(y/n) " -n 1 -r
@@ -79,7 +79,7 @@ if [ "$GPU_MEMORY" -lt 40000 ]; then
 fi
 
 # 检查磁盘空间
-FREE_SPACE=$(df -BG /root/autodl-tmp | tail -1 | awk '{print $4}' | sed 's/G//')
+FREE_SPACE=$(df -BG /root/autodl-tmp 2>/dev/null | tail -1 | awk '{print $4}' | sed 's/GB$//' || df -h /root/autodl-tmp | tail -1 | awk '{print $4}' | sed 's/[^0-9.]//g')
 if [ "$FREE_SPACE" -lt 30 ]; then
     echo "⚠️  警告：磁盘剩余空间 ${FREE_SPACE}GB < 30GB"
     echo "   可能空间不足"

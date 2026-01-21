@@ -476,7 +476,7 @@ def run_experiment(exp_name, use_quantum=True, use_graph=True, use_matcc=True, u
             steps += 1
             pbar.set_postfix(loss=f"{loss.item():.6f}")
 
-        avg_train = train_loss / len(train_loader)
+        avg_train = train_loss / steps
         train_losses.append(avg_train)
 
         # 验证（收集所有预测值和真实值用于计算指标）
@@ -484,6 +484,7 @@ def run_experiment(exp_name, use_quantum=True, use_graph=True, use_matcc=True, u
         val_loss = 0.0
         all_preds = []
         all_targets = []
+        all_dates = []
         
         with torch.no_grad():
             for batch in test_loader:
@@ -509,9 +510,7 @@ def run_experiment(exp_name, use_quantum=True, use_graph=True, use_matcc=True, u
                 if dates is not None:
                     # DataLoader 会把 str collate 成 list[str]
                     if isinstance(dates, list):
-                        all_dates = locals().get("all_dates", [])
                         all_dates.extend(dates)
-                        locals()["all_dates"] = all_dates
         
         avg_val = val_loss / len(test_loader)
         val_losses.append(avg_val)
@@ -523,8 +522,8 @@ def run_experiment(exp_name, use_quantum=True, use_graph=True, use_matcc=True, u
             all_targets_np = np.concatenate(all_targets, axis=0)
             metrics = calculate_metrics(all_targets_np, all_preds_np)
             # 覆盖 ic/rank_ic 为“按日截面均值”口径（更符合股票排序类论文）
-            if "all_dates" in locals() and locals()["all_dates"]:
-                ic_d, ric_d = calculate_daily_ic_rankic(all_targets_np, all_preds_np, locals()["all_dates"])
+            if all_dates:
+                ic_d, ric_d = calculate_daily_ic_rankic(all_targets_np, all_preds_np, all_dates)
                 metrics["ic"] = ic_d
                 metrics["rank_ic"] = ric_d
         
@@ -589,6 +588,7 @@ def run_experiment(exp_name, use_quantum=True, use_graph=True, use_matcc=True, u
         model.eval()
         all_preds_final = []
         all_targets_final = []
+        all_dates_final = []
         
         with torch.no_grad():
             for batch in test_loader:
@@ -609,15 +609,13 @@ def run_experiment(exp_name, use_quantum=True, use_graph=True, use_matcc=True, u
                 all_preds_final.append(preds.cpu().numpy())
                 all_targets_final.append(y.cpu().numpy())
                 if dates is not None and isinstance(dates, list):
-                    all_dates_final = locals().get("all_dates_final", [])
                     all_dates_final.extend(dates)
-                    locals()["all_dates_final"] = all_dates_final
         
         all_preds_final_np = np.concatenate(all_preds_final, axis=0)
         all_targets_final_np = np.concatenate(all_targets_final, axis=0)
         best_metrics = calculate_metrics(all_targets_final_np, all_preds_final_np)
-        if "all_dates_final" in locals() and locals()["all_dates_final"]:
-            ic_d, ric_d = calculate_daily_ic_rankic(all_targets_final_np, all_preds_final_np, locals()["all_dates_final"])
+        if all_dates_final:
+            ic_d, ric_d = calculate_daily_ic_rankic(all_targets_final_np, all_preds_final_np, all_dates_final)
             best_metrics["ic"] = ic_d
             best_metrics["rank_ic"] = ric_d
         
