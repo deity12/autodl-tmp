@@ -2,39 +2,14 @@
 """
 全自动消融实验脚本 (Run Ablation Studies)
 ========================================================================
-功能：
-    依次运行 5 组实验（1个完整模型基准 + 4组消融实验），验证各模块的有效性。
-    不修改原有的 train_gnn.py，独立运行。
-    
-    实验列表：
-    1. Full Model：完整模型基准线（所有模块开启）
-    2. w/o Quantum：移除量子模块
-    3. w/o Graph：移除图神经网络
-    4. w/o MATCC：移除趋势解耦
-    5. w/o Market Guidance：移除市场引导
+与 paper/newpaper.md 对齐的消融定义：
+    1) w/o Quantum：移除 VQC 量子模块
+    2) w/o Decomposition：移除 MATCC 趋势解耦
+    3) w/o Graph：移除图注意力聚合
 
-输出：
-    - model/ablation/curve_full_model.png (完整模型基准线)
-    - model/ablation/curve_no_quantum.png
-    - model/ablation/curve_no_graph.png
-    - model/ablation/curve_no_matcc.png
-    - model/ablation/curve_no_market_guidance.png
-    - model/ablation/losses_full_model.json (完整模型的 Loss 数值列表)
-    - model/ablation/losses_no_quantum.json (各消融实验的 Loss 数值列表)
-    - model/ablation/losses_*.json (所有实验的 Loss 数值列表，用于后续对比分析)
-    - model/ablation/ablation_results_summary.csv (汇总表格)
-    - model/ablation/ablation_results_comparison.png (对比图表，包含5条曲线)
-    - model/ablation/best_model_*.pth (各实验的最佳模型)
-
-改进点：
-    1. ✅ 添加 Full Model 基准实验（确保公平对比）
-    2. ✅ 添加 w/o Market Guidance 实验（论文中第4组消融）
-    3. ✅ 保存每个实验的最佳模型
-    4. ✅ **保存每个实验的 Loss 数值列表（JSON格式）**，避免重复运行
-    5. ✅ 生成汇总对比表格和图表（Full Model 用金色突出显示）
-    6. ✅ 记录更详细的指标（最佳epoch、最终loss等）
-    7. ✅ 路径检查和错误处理更完善
-    8. ✅ 所有结果保存在独立的 ablation/ 目录，避免混淆
+说明：
+    - Full Model 基准请直接运行 `training/train_full.py`（保持同一套超参，确保公平对比）
+    - 本脚本只跑论文中列出的 3 组消融，避免“论文没写但代码多跑”的不一致
 """
 
 import sys
@@ -51,6 +26,26 @@ import json
 from datetime import datetime
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from scipy.stats import pearsonr, spearmanr
+from collections import defaultdict
+
+def _apply_perf_settings(enable: bool = True) -> None:
+    """同 train_full.py：启用 TF32 / benchmark 等以提升吞吐。"""
+    if not enable:
+        return
+    if torch.cuda.is_available():
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        except Exception:
+            pass
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+        try:
+            torch.backends.cudnn.benchmark = True
+        except Exception:
+            pass
 
 
 # ================= 改进 Loss 函数：方向性 Loss =================
@@ -86,6 +81,7 @@ sys.path.insert(0, parent_dir)  # 添加项目根目录到路径
 
 # 路径配置
 GRAPH_PATH = os.path.join(parent_dir, 'data', 'processed', 'Graph_Adjacency.npy')
+GRAPH_TICKERS_PATH = os.path.join(parent_dir, 'data', 'processed', 'Graph_Adjacency_tickers.json')
 CSV_PATH = os.path.join(parent_dir, 'data', 'processed', 'Final_Model_Data.csv')
 OUTPUT_DIR = os.path.join(parent_dir, 'outputs')
 CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, 'checkpoints')
@@ -110,18 +106,18 @@ except ImportError as e:
 BASE_CONFIG = {
     'input_dim': 8,
     
-    # 【模型维度】与 train_full.py 完全一致（48GB显存优化版）
-    'n_embd': 384,       # 48GB显存优化
-    'n_layers': 4,       # 48GB显存优化
+    # 【模型维度】与 train_full.py / paper/newpaper.md 完全一致
+    'n_embd': 256,
+    'n_layers': 3,
     'n_qubits': 4,
-    'gnn_embd': 96,      # 48GB显存优化
+    'gnn_embd': 64,
     'seq_len': 30,
     
     # 【Batch Size】与 train_full.py 一致
-    'batch_size': 1024,  # 48GB显存优化
+    'batch_size': 512,
     
     # 【Epoch】
-    'epochs': 15,        # 48GB显存优化，更充分的训练
+    'epochs': 20,
     
     # 【学习率】与 train_full.py 一致
     'lr': 3e-4,
@@ -137,16 +133,33 @@ BASE_CONFIG = {
     
     'use_hybrid_loss': False,
     'hybrid_loss_alpha': 0.1,
-    'early_stop_patience': 5,  # 增加patience
+    'early_stop_patience': 6,
     
-    # 【硬件优化】48GB显存 + 12核CPU + 90GB内存
+    # 【数据加载/硬件优化】与 train_full.py 保持一致
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-    'num_workers': 10,
-    'prefetch_factor': 6,
+    'num_workers': 4,
+    'prefetch_factor': 2,
     'use_amp': True,
     'pin_memory': True,
     'persistent_workers': True,
 }
+
+# 允许用环境变量把 DataLoader 并行与 batch/模型维度切到“吞吐优先”
+# （消融实验建议与 Full Model 使用同一 profile，保证公平对比）
+_profile = os.environ.get("QL_PROFILE", "paper").strip().lower()
+if _profile in ("48gb", "max", "server"):
+    BASE_CONFIG.update({
+        'n_embd': 384,
+        'n_layers': 4,
+        'gnn_embd': 128,
+        'batch_size': 1024,
+        'epochs': 30,
+        'num_workers': min(8, max(2, (os.cpu_count() or 12) - 2)),
+        'prefetch_factor': 4,
+    })
+    print(f"⚡ 已启用 QL_PROFILE={_profile}（48GB 吞吐配置；消融将与 Full Model 保持一致）")
+else:
+    print(f"ℹ️ 使用 QL_PROFILE={_profile}（论文默认配置）")
 
 # ================= 3. 结果存储目录 =================
 # 消融实验结果统一保存到 outputs 目录
@@ -249,6 +262,33 @@ def calculate_metrics(y_true, y_pred):
     }
 
 
+def calculate_daily_ic_rankic(y_true, y_pred, dates):
+    """按日期截面计算 IC/RankIC，再对天取平均（顶会/量化常用口径）。"""
+    buckets_true = defaultdict(list)
+    buckets_pred = defaultdict(list)
+    for t, p, d in zip(np.array(y_true).flatten(), np.array(y_pred).flatten(), dates):
+        buckets_true[str(d)].append(float(t))
+        buckets_pred[str(d)].append(float(p))
+    ic_list = []
+    rankic_list = []
+    for d in buckets_true.keys():
+        yt = np.asarray(buckets_true[d], dtype=np.float64)
+        yp = np.asarray(buckets_pred[d], dtype=np.float64)
+        if yt.size < 2:
+            continue
+        try:
+            ic, _ = pearsonr(yp, yt)
+            ic_list.append(float(ic))
+        except Exception:
+            pass
+        try:
+            ric, _ = spearmanr(yp, yt)
+            rankic_list.append(float(ric))
+        except Exception:
+            pass
+    return (float(np.mean(ic_list)) if ic_list else None), (float(np.mean(rankic_list)) if rankic_list else None)
+
+
 def run_experiment(exp_name, use_quantum=True, use_graph=True, use_matcc=True, use_market_guidance=True):
     """
     运行单个实验的核心函数
@@ -265,34 +305,62 @@ def run_experiment(exp_name, use_quantum=True, use_graph=True, use_matcc=True, u
     print(f"   配置: Quantum={use_quantum}, Graph={use_graph}, MATCC={use_matcc}, MarketGuidance={use_market_guidance}")
     print("="*70)
 
-    # ---------------- A. 准备图谱 ----------------
-    # 如果是 w/o Graph 实验，强制使用单位阵（切断图连接）
-    if not use_graph:
-        print("   ⚠️ [消融设置] 禁用图神经网络 (使用单位阵)")
-        df_t = pd.read_csv(CSV_PATH, usecols=['Ticker'])
-        num_nodes = int(df_t['Ticker'].nunique())
-        adj_matrix = np.eye(num_nodes, dtype=np.float32)
-    else:
-        if GRAPH_PATH and os.path.exists(GRAPH_PATH):
-            adj_matrix = np.load(GRAPH_PATH)
-            print(f"   ✅ 加载图谱: {GRAPH_PATH}, 形状: {adj_matrix.shape}")
-        else:
-            # 兜底：使用单位阵
-            print(f"   ⚠️ 未找到图谱文件，使用单位阵")
-            df_t = pd.read_csv(CSV_PATH, usecols=['Ticker'])
-            num_nodes = int(df_t['Ticker'].nunique())
-            adj_matrix = np.eye(num_nodes, dtype=np.float32)
-    
-    num_nodes = adj_matrix.shape[0]
-
-    # ---------------- B. 准备数据 ----------------
-    # 每次重新加载数据，防止内存泄漏
+    # ---------------- A. 准备数据 ----------------
+    # 每次重新加载数据，防止内存泄漏；以 dataset 的 ticker2idx 作为“唯一真相”
     train_dataset = FinancialDataset(CSV_PATH, seq_len=BASE_CONFIG['seq_len'], mode='train')
     test_dataset = FinancialDataset(
         CSV_PATH, seq_len=BASE_CONFIG['seq_len'], mode='test', 
         scaler=train_dataset.scaler,
         vol_stats=train_dataset.vol_stats  # 【新增】传入波动率统计
     )
+    dataset_tickers_in_order = list(train_dataset.ticker2idx.keys())
+    dataset_num_nodes = len(dataset_tickers_in_order)
+
+    # ---------------- B. 准备图谱（并做对齐校验）----------------
+    if not use_graph:
+        print("   ⚠️ [消融设置] 禁用图神经网络 (使用单位阵)")
+        adj_matrix = np.eye(dataset_num_nodes, dtype=np.float32)
+    else:
+        if GRAPH_PATH and os.path.exists(GRAPH_PATH):
+            adj_matrix = np.load(GRAPH_PATH)
+            print(f"   ✅ 加载图谱: {GRAPH_PATH}, 形状: {adj_matrix.shape}")
+        else:
+            print(f"   ⚠️ 未找到图谱文件，使用单位阵")
+            adj_matrix = np.eye(dataset_num_nodes, dtype=np.float32)
+
+        # 形状硬校验
+        if adj_matrix.ndim != 2 or adj_matrix.shape[0] != adj_matrix.shape[1]:
+            raise ValueError(f"图谱邻接矩阵必须为方阵，但得到 shape={adj_matrix.shape}")
+        if adj_matrix.shape[0] != dataset_num_nodes:
+            raise ValueError(
+                "图谱节点数与数据集 ticker2idx 不一致，消融实验将发生索引错位/越界。\n"
+                f"- Graph_Adjacency.npy nodes={adj_matrix.shape[0]}\n"
+                f"- Dataset nodes={dataset_num_nodes}\n"
+                "解决：用同一份 Final_Model_Data.csv 重新运行 build_graph.py 生成图谱。"
+            )
+
+        # 节点顺序校验（强烈推荐）
+        if os.path.exists(GRAPH_TICKERS_PATH):
+            with open(GRAPH_TICKERS_PATH, "r", encoding="utf-8") as f:
+                graph_tickers = json.load(f).get("tickers", [])
+            if graph_tickers != dataset_tickers_in_order:
+                diffs = []
+                for i, (a, b) in enumerate(zip(graph_tickers, dataset_tickers_in_order)):
+                    if a != b:
+                        diffs.append((i, a, b))
+                        if len(diffs) >= 5:
+                            break
+                raise ValueError(
+                    "图谱 tickers 顺序与训练数据 tickers 顺序不一致：会导致 GNN 聚合到错误股票上。\n"
+                    f"示例差异(最多5条): {diffs}\n"
+                    "解决：重新生成图谱并确保 Ticker 标准化一致（建议全大写）。"
+                )
+            else:
+                print("   ✅ 图谱 tickers 顺序校验通过（与 dataset.ticker2idx 对齐）")
+        else:
+            print("   ⚠️ 未找到 Graph_Adjacency_tickers.json，无法校验节点顺序（建议保留该文件）")
+
+    num_nodes = dataset_num_nodes
     
     # 【关键】从训练数据获取量子阈值
     q_threshold = BASE_CONFIG['q_threshold']
@@ -422,6 +490,7 @@ def run_experiment(exp_name, use_quantum=True, use_graph=True, use_matcc=True, u
                 x = batch['x'].to(BASE_CONFIG['device'], non_blocking=True)
                 y = batch['y'].to(BASE_CONFIG['device'], non_blocking=True)
                 vol = batch['vol'].to(BASE_CONFIG['device'], non_blocking=True)
+                dates = batch.get('target_date')
                 node_indices = batch.get('node_indices')
                 if node_indices is not None:
                     node_indices = node_indices.to(BASE_CONFIG['device'], non_blocking=True)
@@ -437,6 +506,12 @@ def run_experiment(exp_name, use_quantum=True, use_graph=True, use_matcc=True, u
                 # 收集预测值和真实值（用于计算完整指标）
                 all_preds.append(preds.cpu().numpy())
                 all_targets.append(y.cpu().numpy())
+                if dates is not None:
+                    # DataLoader 会把 str collate 成 list[str]
+                    if isinstance(dates, list):
+                        all_dates = locals().get("all_dates", [])
+                        all_dates.extend(dates)
+                        locals()["all_dates"] = all_dates
         
         avg_val = val_loss / len(test_loader)
         val_losses.append(avg_val)
@@ -447,6 +522,11 @@ def run_experiment(exp_name, use_quantum=True, use_graph=True, use_matcc=True, u
             all_preds_np = np.concatenate(all_preds, axis=0)
             all_targets_np = np.concatenate(all_targets, axis=0)
             metrics = calculate_metrics(all_targets_np, all_preds_np)
+            # 覆盖 ic/rank_ic 为“按日截面均值”口径（更符合股票排序类论文）
+            if "all_dates" in locals() and locals()["all_dates"]:
+                ic_d, ric_d = calculate_daily_ic_rankic(all_targets_np, all_preds_np, locals()["all_dates"])
+                metrics["ic"] = ic_d
+                metrics["rank_ic"] = ric_d
         
         # 学习率调度
         scheduler.step(avg_val)
@@ -515,6 +595,7 @@ def run_experiment(exp_name, use_quantum=True, use_graph=True, use_matcc=True, u
                 x = batch['x'].to(BASE_CONFIG['device'], non_blocking=True)
                 y = batch['y'].to(BASE_CONFIG['device'], non_blocking=True)
                 vol = batch['vol'].to(BASE_CONFIG['device'], non_blocking=True)
+                dates = batch.get('target_date')
                 node_indices = batch.get('node_indices')
                 if node_indices is not None:
                     node_indices = node_indices.to(BASE_CONFIG['device'], non_blocking=True)
@@ -527,10 +608,18 @@ def run_experiment(exp_name, use_quantum=True, use_graph=True, use_matcc=True, u
                 
                 all_preds_final.append(preds.cpu().numpy())
                 all_targets_final.append(y.cpu().numpy())
+                if dates is not None and isinstance(dates, list):
+                    all_dates_final = locals().get("all_dates_final", [])
+                    all_dates_final.extend(dates)
+                    locals()["all_dates_final"] = all_dates_final
         
         all_preds_final_np = np.concatenate(all_preds_final, axis=0)
         all_targets_final_np = np.concatenate(all_targets_final, axis=0)
         best_metrics = calculate_metrics(all_targets_final_np, all_preds_final_np)
+        if "all_dates_final" in locals() and locals()["all_dates_final"]:
+            ic_d, ric_d = calculate_daily_ic_rankic(all_targets_final_np, all_preds_final_np, locals()["all_dates_final"])
+            best_metrics["ic"] = ic_d
+            best_metrics["rank_ic"] = ric_d
         
         # 打印关键指标
         if best_metrics:
@@ -705,10 +794,8 @@ def save_summary_results():
     for i, v in enumerate(sorted_vals):
         axes[1].text(v, i, f' {v:.6f}', va='center', fontsize=9)
     
-    axes[1].set_xlabel('Epochs', fontsize=12)
-    axes[1].set_ylabel('Loss (MSE)', fontsize=12)
-    axes[1].legend(fontsize=9)
-    axes[1].grid(True, alpha=0.3)
+    axes[1].set_ylabel('Experiment', fontsize=12)
+    # 这里不需要 legend（bar 没有 label，会导致空 legend/警告）
     
     plt.tight_layout()
     comparison_path = os.path.join(FIGURE_DIR, 'ablation_results_comparison.png')
@@ -726,6 +813,7 @@ def save_summary_results():
 
 # ================= 4. 主程序入口 =================
 if __name__ == "__main__":
+    _apply_perf_settings(True)
     print("🚀 启动消融实验流程...")
     print(f"📁 工作目录: {current_dir}")
     print(f"📁 结果目录: {OUTPUT_DIR}")
@@ -734,28 +822,23 @@ if __name__ == "__main__":
     print(f"💻 设备: {BASE_CONFIG['device']}")
     
     print("\n" + "="*70)
-    print("📌 说明：Full Model 由 train_gnn.py 独立训练")
-    print("   本脚本仅运行 4 组消融实验，验证各模块的有效性")
-    print("   评估对比请使用 evaluate_all.py")
+    print("📌 说明：Full Model 基准请运行 training/train_full.py")
+    print("   本脚本仅运行 3 组消融实验（与 paper/newpaper.md 对齐）")
     print("="*70)
     
     start_time = datetime.now()
     
-    # 实验 1: 无量子模块 (w/o Quantum)
+    # 实验 1: w/o Quantum
     run_experiment(exp_name="no_quantum", 
                    use_quantum=False, use_graph=True, use_matcc=True, use_market_guidance=True)
     
-    # 实验 2: 无图神经网络 (w/o Graph)
-    run_experiment(exp_name="no_graph", 
-                   use_quantum=True, use_graph=False, use_matcc=True, use_market_guidance=True)
-    
-    # 实验 3: 无趋势解耦 (w/o MATCC)
+    # 实验 2: w/o Decomposition (MATCC)
     run_experiment(exp_name="no_matcc", 
                    use_quantum=True, use_graph=True, use_matcc=False, use_market_guidance=True)
     
-    # 实验 4: 无市场引导 (w/o Market Guidance)
-    run_experiment(exp_name="no_market_guidance", 
-                   use_quantum=True, use_graph=True, use_matcc=True, use_market_guidance=False)
+    # 实验 3: w/o Graph
+    run_experiment(exp_name="no_graph", 
+                   use_quantum=True, use_graph=False, use_matcc=True, use_market_guidance=True)
     
     # 保存汇总结果
     save_summary_results()
@@ -764,16 +847,15 @@ if __name__ == "__main__":
     duration = (end_time - start_time).total_seconds() / 60  # 分钟
     
     print("\n" + "="*70)
-    print("🎉 消融实验已完成！（共 4 组消融实验）")
+    print("🎉 消融实验已完成！（共 3 组消融实验）")
     print(f"⏱️  总耗时: {duration:.1f} 分钟")
     print("\n📁 生成的文件:")
     print("   - ablation/curve_no_quantum.png")
-    print("   - ablation/curve_no_graph.png")
     print("   - ablation/curve_no_matcc.png")
-    print("   - ablation/curve_no_market_guidance.png")
-    print("   - ablation/losses_*.json (每个实验的 Loss 数值列表，共4个)")
+    print("   - ablation/curve_no_graph.png")
+    print("   - ablation/losses_*.json (每个实验的 Loss 数值列表，共3个)")
     print("   - ablation/ablation_results_summary.csv")
     print("   - ablation/ablation_results_comparison.png")
-    print("   - ablation/best_model_*.pth (每个实验的最佳模型，共4个)")
-    print("\n📌 下一步：运行 evaluate_all.py 进行统一评估对比")
+    print("   - ablation/best_model_*.pth (每个实验的最佳模型，共3个)")
+    print("\n📌 下一步：对比 Full Model 请查看 outputs/logs 与 outputs/results")
     print("="*70)

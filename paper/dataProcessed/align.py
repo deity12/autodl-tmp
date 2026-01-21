@@ -1,3 +1,29 @@
+"""
+数据对齐与特征工程脚本（Step 2）
+==========================
+
+目标：
+  将 ETL 阶段生成的个股行情与新闻数据，与 S&P 500 指数数据按日期对齐，
+  生成训练/测试通用的模型输入表 `Final_Model_Data.csv`。
+
+输入：
+  - `data/processed/Stock_Prices.csv`（来自 `dataProcessed/etl.py`）
+  - `data/processed/Stock_News.csv`（来自 `dataProcessed/etl.py`，可选）
+  - `data/raw/FNSPID/SP500_Index.csv`（来自 `dataProcessed/download_market_index.py` 或手动准备）
+
+输出：
+  - `data/processed/Final_Model_Data.csv`
+
+关键产物字段：
+  - `Log_Ret`：对数收益率（预测目标）
+  - `Volatility_20d`：20 日滚动波动率（用于量子门控/分组评估）
+  - `News_Text`：同一股票同一天的新闻标题聚合（用 `|` 拼接）
+
+注意：
+  - 对新闻数据做“同日同股聚合”，避免一日多条新闻导致行重复。
+  - 合并前会做时区统一（tz-aware -> tz-naive），避免 pandas merge 报错。
+"""
+
 import pandas as pd
 import numpy as np
 import os
@@ -16,6 +42,17 @@ OUTPUT_FILE = './data/processed/Final_Model_Data.csv'
 
 # ================= 主逻辑：数据对齐 =================
 def align_all_data():
+    """
+    主流程：读取 ETL 产物并对齐生成 `Final_Model_Data.csv`。
+
+    步骤概览：
+      1) 读取个股行情（按 Ticker+Date 排序）
+      2) 读取大盘指数（按 Date 排序）
+      3) 读取并聚合新闻（同日同股拼接为 `News_Text`，可选）
+      4) 合并：prices LEFT JOIN market（Date）再 LEFT JOIN news（Date+Ticker）
+      5) 生成标签/特征：`Log_Ret` 与 `Volatility_20d`
+      6) 保存到 `OUTPUT_FILE`
+    """
     print(">>> [Step 1/3] 读取预处理后的数据...")
     
     # Check paths

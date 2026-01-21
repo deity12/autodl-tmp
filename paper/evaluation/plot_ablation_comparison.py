@@ -245,8 +245,11 @@ def calculate_improvements(results):
     full_metrics = full_model_result.get('metrics', {})
     if not full_metrics:
         # 尝试从顶层获取
-        full_metrics = {k: v for k in ['mse', 'mae', 'rmse', 'r2', 'correlation', 'directional_accuracy', 'ic', 'rank_ic'] 
-                       if (k := k) in full_model_result and full_model_result[k] is not None}
+        full_metrics = {
+            k: full_model_result[k]
+            for k in ['mse', 'mae', 'rmse', 'r2', 'correlation', 'directional_accuracy', 'ic', 'rank_ic']
+            if k in full_model_result and full_model_result[k] is not None
+        }
     
     print("\n" + "="*70)
     print("📉 各模块贡献分析（相比 Full Model）:")
@@ -297,6 +300,13 @@ def calculate_improvements(results):
 
 
 def main():
+    """
+    命令行入口：从消融实验目录读取 `losses_*.json`，生成对比图与汇总表。
+
+    典型用法：
+      - `python -m evaluation.plot_ablation_comparison`
+      - `python plot_ablation_comparison.py --ablation_dir <dir> --output_dir <dir>`
+    """
     parser = argparse.ArgumentParser(description='生成消融实验对比图表')
     parser.add_argument('--ablation_dir', type=str, 
                        default=os.path.join(os.path.dirname(__file__), 'ablation'),

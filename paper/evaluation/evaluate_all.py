@@ -58,15 +58,68 @@ except ImportError as e:
 # 配置
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# 模型配置（与训练时保持一致）
+def _load_train_config(parent_dir_: str) -> dict:
+    """
+    尝试读取训练日志中的配置（避免评估时模型维度不匹配）。
+
+    优先级：
+      1) outputs/logs/training_losses_full.json（train_full.py 输出）
+      2) 环境变量 QL_PROFILE（paper / 48gb）
+      3) 兜底默认（256/3/64）
+    """
+    cfg = {}
+    path = os.path.join(parent_dir_, "outputs", "logs", "training_losses_full.json")
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            # train_full.py 的结构：loss_data["config"] 是一个 dict
+            cfg = data.get("config", {}) if isinstance(data, dict) else {}
+        except Exception:
+            cfg = {}
+
+    profile = os.environ.get("QL_PROFILE", (cfg.get("profile") if isinstance(cfg, dict) else None) or "paper").strip().lower()
+    # 兜底：profile 推断
+    if not isinstance(cfg, dict):
+        cfg = {}
+
+    if profile in ("48gb", "max", "server"):
+        defaults = dict(n_embd=384, n_layers=4, gnn_embd=128, n_qubits=4, seq_len=30)
+    else:
+        defaults = dict(n_embd=256, n_layers=3, gnn_embd=64, n_qubits=4, seq_len=30)
+
+    # 合并：log > profile 默认
+    merged = dict(defaults)
+    for k in ("n_embd", "n_layers", "gnn_embd", "n_qubits", "seq_len"):
+        if k in cfg and cfg[k] is not None:
+            merged[k] = int(cfg[k]) if k != "seq_len" else int(cfg[k])
+    merged["profile"] = profile
+    return merged
+
+
+def _eval_batch_size(profile: str) -> int:
+    """评估阶段 batch_size：可用环境变量 EVAL_BATCH_SIZE 覆盖。"""
+    env = os.environ.get("EVAL_BATCH_SIZE")
+    if env:
+        try:
+            return int(env)
+        except Exception:
+            pass
+    # 评估只做前向，通常 batch 可以大一些；但大模型仍可能 OOM，后续会自动降级
+    return 4096 if profile in ("48gb", "max", "server") else 2048
+
+
+TRAIN_CFG = _load_train_config(parent_dir)
+
+# 模型配置（尽量与训练时保持一致）
 MODEL_CONFIG = {
     'input_dim': 8,
-    'n_embd': 512,
-    'n_layers': 4,
-    'n_qubits': 4,
-    'gnn_embd': 128,
-    'seq_len': 30,
-    'batch_size': 2048,
+    'n_embd': int(TRAIN_CFG['n_embd']),
+    'n_layers': int(TRAIN_CFG['n_layers']),
+    'n_qubits': int(TRAIN_CFG['n_qubits']),
+    'gnn_embd': int(TRAIN_CFG['gnn_embd']),
+    'seq_len': int(TRAIN_CFG['seq_len']),
+    'batch_size': _eval_batch_size(TRAIN_CFG['profile']),
 }
 
 # 所有模型的配置
@@ -121,7 +174,14 @@ MODELS_TO_EVALUATE = [
 
 # ================= 2. 辅助函数 =================
 def calculate_metrics(y_true, y_pred):
-    """计算完整评估指标"""
+    """
+    计算回归任务的常用评估指标（用于整体对比与分组对比）。
+
+    指标：
+      - mse / mae / rmse / r2：回归误差与拟合优度
+      - dir_acc：方向准确率（sign(pred) 与 sign(true) 一致的比例）
+      - ic / rank_ic：信息系数（Pearson）与秩信息系数（Spearman）
+    """
     y_true = np.array(y_true).flatten()
     y_pred = np.array(y_pred).flatten()
     
@@ -174,7 +234,7 @@ def load_model_and_predict(model_config, test_loader, adj_matrix, num_nodes):
     else:
         adj = adj_matrix
     
-    # 初始化模型
+    # 初始化模型（必须与保存权重的维度一致，否则 load_state_dict 会报 size mismatch）
     model = QL_MATCC_GNN_Model(
         input_dim=MODEL_CONFIG['input_dim'],
         n_embd=MODEL_CONFIG['n_embd'],
@@ -197,14 +257,14 @@ def load_model_and_predict(model_config, test_loader, adj_matrix, num_nodes):
     all_labels = []
     all_vols = []
     
-    with torch.no_grad():
+    with torch.inference_mode():
         for batch in test_loader:
-            x = batch['x'].to(DEVICE)
-            y = batch['y'].to(DEVICE)
-            vol = batch['vol'].to(DEVICE)
+            x = batch['x'].to(DEVICE, non_blocking=True)
+            y = batch['y'].to(DEVICE, non_blocking=True)
+            vol = batch['vol'].to(DEVICE, non_blocking=True)
             node_idx = batch.get('node_indices')
             if node_idx is not None:
-                node_idx = node_idx.to(DEVICE)
+                node_idx = node_idx.to(DEVICE, non_blocking=True)
             
             preds = model(x, vol, node_indices=node_idx)
             all_preds.append(preds.cpu().numpy())
@@ -220,6 +280,13 @@ def load_model_and_predict(model_config, test_loader, adj_matrix, num_nodes):
 
 # ================= 3. 主程序 =================
 def main():
+    """
+    统一评估入口：
+      1) 加载测试集
+      2) 依次加载可用模型并预测
+      3) 计算整体指标 + 按波动率分组指标
+      4) 保存 CSV/PNG/JSON 到 outputs/results 与 outputs/figures
+    """
     print("="*70)
     print("📊 统一评估：Full Model vs 消融模型")
     print("="*70)
@@ -242,11 +309,35 @@ def main():
         print("\n❌ 没有可用的模型文件，请先运行训练脚本")
         return
     
+    print(f">>> 评估将使用模型配置: n_embd={MODEL_CONFIG['n_embd']}, n_layers={MODEL_CONFIG['n_layers']}, gnn_embd={MODEL_CONFIG['gnn_embd']}, batch={MODEL_CONFIG['batch_size']} (profile={TRAIN_CFG['profile']})")
+
     # 加载数据
     print("\n>>> 加载测试数据...")
     train_dataset = FinancialDataset(CSV_PATH, seq_len=MODEL_CONFIG['seq_len'], mode='train')
-    test_dataset = FinancialDataset(CSV_PATH, seq_len=MODEL_CONFIG['seq_len'], mode='test', scaler=train_dataset.scaler)
-    test_loader = DataLoader(test_dataset, batch_size=MODEL_CONFIG['batch_size'], shuffle=False, num_workers=4)
+    test_dataset = FinancialDataset(
+        CSV_PATH,
+        seq_len=MODEL_CONFIG['seq_len'],
+        mode='test',
+        scaler=train_dataset.scaler,
+        vol_stats=train_dataset.vol_stats,
+    )
+    # 更贴近服务器：用更多 worker + pin_memory（若 CUDA）
+    num_workers = min(8, max(2, (os.cpu_count() or 12) - 2))
+    pin_memory = torch.cuda.is_available()
+
+    # 评估 batch 可能 OOM：发生时自动减半重试
+    bs = int(MODEL_CONFIG['batch_size'])
+    while True:
+        try:
+            test_loader = DataLoader(test_dataset, batch_size=bs, shuffle=False, num_workers=num_workers, pin_memory=pin_memory, persistent_workers=num_workers > 0, prefetch_factor=4 if num_workers > 0 else None)
+            break
+        except Exception:
+            # DataLoader 构建失败较少见，继续兜底
+            bs = max(256, bs // 2)
+            if bs <= 256:
+                test_loader = DataLoader(test_dataset, batch_size=bs, shuffle=False, num_workers=0)
+                break
+    MODEL_CONFIG['batch_size'] = bs
     print(f"   测试集样本数: {len(test_dataset)}")
     
     # 加载图

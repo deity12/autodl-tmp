@@ -1,3 +1,26 @@
+"""
+PyTorch Dataset：将 `Final_Model_Data.csv` 转换为可训练样本（Step 4）
+====================================================
+
+本模块提供 `FinancialDataset`，用于：
+  - 数据清洗（裁剪极端值、处理 NaN/Inf）
+  - 按时间 80/20 切分 train/test（避免未来信息泄露）
+  - 特征标准化（训练集 fit，测试集 transform）
+  - 以“同一股票”为单位构造滑动窗口序列样本
+  - 计算训练集波动率分位数 `vol_stats`（常用 p70 作为量子门控阈值）
+  - 构建 `ticker2idx`，并在 `__getitem__` 返回 `node_indices` 供 GNN 使用
+
+输入：
+  - `data/processed/Final_Model_Data.csv`（来自 `dataProcessed/align.py`）
+
+输出（每条样本，dict）：
+  - `x`: (seq_len, input_dim) 过去若干天特征
+  - `y`: (1,) 目标日对数收益率
+  - `vol`: (1,) 波动率（最后一日）
+  - `node_indices`: (,) 股票节点索引（用于图聚合）
+  - `target_date`: str 目标日期（用于按日期截面 IC/RankIC 或按日分组 batch）
+"""
+
 import pandas as pd
 import numpy as np
 import torch
@@ -36,6 +59,13 @@ class FinancialDataset(Dataset):
         self.pred_len = pred_len
         self.mode = mode
         self.use_robust_scaler = use_robust_scaler
+
+        # 【关键对齐】统一股票代码格式为大写，确保与 build_graph.py 输出的 Graph_Adjacency_tickers.json 一致
+        # 避免出现因大小写差异导致的“图谱索引错位”（最危险：不一定报错，但会让训练结果失真）
+        if 'Ticker' in self.df.columns:
+            self.df['Ticker'] = self.df['Ticker'].astype(str).str.upper()
+            # 清理异常 ticker（极少数情况下会出现 NaN -> "NAN"）
+            self.df = self.df[self.df['Ticker'] != 'NAN'].copy()
         
         # 定义特征列和目标列
         self.feature_cols = ['Open', 'Close', 'High', 'Low', 'Volume', 'Market_Close', 'Market_Vol', 'Volatility_20d']
@@ -154,6 +184,7 @@ class FinancialDataset(Dataset):
         # 4. 构建滑动窗口索引（确保不跨股票拼接序列）
         print("正在构建滑动窗口索引...")
         self.indices = []
+        self.target_dates = []  # 用于“按日期分组”的rank/ranking训练（顶会常见做法）
         
         # 按股票代码（Ticker）分组，保证每个序列只来自同一只股票
         groups = self.df.groupby('Ticker')
@@ -163,9 +194,16 @@ class FinancialDataset(Dataset):
                 start_row = group.index[0]
                 # 高效地添加所有有效的起始位置索引
                 for i in range(group_len - seq_len - pred_len + 1):
-                    self.indices.append(start_row + i)
+                    s = start_row + i
+                    self.indices.append(s)
+                    # 目标对齐：y 来自 target_row，因此用于排序/RankIC 的“截面日期”应以 target_date 分组
+                    end_row = s + self.seq_len
+                    target_row = end_row + self.pred_len - 1
+                    self.target_dates.append(self.df['Date'].iloc[target_row])
                     
         print(f"{mode} 数据集共生成样本数: {len(self.indices)}")
+        # 统一为字符串，便于 sampler/groupby（DataLoader 对 Timestamp 的默认 collate 行为不稳定）
+        self.target_dates = [pd.Timestamp(d).strftime("%Y-%m-%d") for d in self.target_dates]
 
     def __len__(self):
         return len(self.indices)
@@ -188,6 +226,7 @@ class FinancialDataset(Dataset):
             'y': torch.tensor([y], dtype=torch.float32),
             'vol': torch.tensor([vol], dtype=torch.float32),
             'node_indices': torch.tensor(node_idx, dtype=torch.long),
+            'target_date': self.target_dates[idx],      # 用于按日期做截面排序/RankIC loss
         }
 
 # ================= 测试代码 =================

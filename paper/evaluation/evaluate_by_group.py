@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 import os
 import sys
+import json
 from torch.utils.data import DataLoader
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 
@@ -49,6 +50,33 @@ except ImportError as e:
 
 # 配置
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+def _load_train_config(parent_dir_: str) -> dict:
+    """同 evaluate_all.py：从训练日志或 QL_PROFILE 推断模型维度，避免 size mismatch。"""
+    cfg = {}
+    path = os.path.join(parent_dir_, "outputs", "logs", "training_losses_full.json")
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            cfg = data.get("config", {}) if isinstance(data, dict) else {}
+        except Exception:
+            cfg = {}
+    profile = os.environ.get("QL_PROFILE", (cfg.get("profile") if isinstance(cfg, dict) else None) or "paper").strip().lower()
+    if profile in ("48gb", "max", "server"):
+        defaults = dict(n_embd=384, n_layers=4, gnn_embd=128, n_qubits=4, seq_len=30)
+    else:
+        defaults = dict(n_embd=256, n_layers=3, gnn_embd=64, n_qubits=4, seq_len=30)
+    merged = dict(defaults)
+    if isinstance(cfg, dict):
+        for k in ("n_embd", "n_layers", "gnn_embd", "n_qubits", "seq_len"):
+            if k in cfg and cfg[k] is not None:
+                merged[k] = int(cfg[k])
+    merged["profile"] = profile
+    return merged
+
+
+TRAIN_CFG = _load_train_config(parent_dir)
 
 # ================= 2. 辅助函数：加载模型并获取预测结果 =================
 def get_predictions(model_name, use_quantum=True, use_matcc=True, use_market_guidance=True):
@@ -86,9 +114,19 @@ def get_predictions(model_name, use_quantum=True, use_matcc=True, use_market_gui
     print(f"📂 加载模型: {model_path}")
     
     # 加载数据
-    train_dataset = FinancialDataset(CSV_PATH, seq_len=30, mode='train')
-    test_dataset = FinancialDataset(CSV_PATH, seq_len=30, mode='test', scaler=train_dataset.scaler)
-    test_loader = DataLoader(test_dataset, batch_size=2048, shuffle=False, num_workers=4)
+    train_dataset = FinancialDataset(CSV_PATH, seq_len=int(TRAIN_CFG["seq_len"]), mode='train')
+    test_dataset = FinancialDataset(
+        CSV_PATH,
+        seq_len=int(TRAIN_CFG["seq_len"]),
+        mode='test',
+        scaler=train_dataset.scaler,
+        vol_stats=train_dataset.vol_stats,
+    )
+    # 评估 batch 可用环境变量 EVAL_BATCH_SIZE 覆盖；默认根据 profile 给一个较大的值
+    bs = int(os.environ.get("EVAL_BATCH_SIZE", "4096" if TRAIN_CFG["profile"] in ("48gb", "max", "server") else "2048"))
+    num_workers = min(8, max(2, (os.cpu_count() or 12) - 2))
+    pin_memory = torch.cuda.is_available()
+    test_loader = DataLoader(test_dataset, batch_size=bs, shuffle=False, num_workers=num_workers, pin_memory=pin_memory, persistent_workers=num_workers > 0, prefetch_factor=4 if num_workers > 0 else None)
     
     # 加载图
     if GRAPH_PATH and os.path.exists(GRAPH_PATH):
@@ -103,15 +141,15 @@ def get_predictions(model_name, use_quantum=True, use_matcc=True, use_market_gui
     
     num_nodes = adj.shape[0]
     
-    # 初始化模型（需要与训练时完全一致的配置）
+    # 初始化模型（需要与训练时完全一致的配置，否则 load_state_dict 会报 size mismatch）
     model = QL_MATCC_GNN_Model(
         input_dim=8,
-        n_embd=512,
-        n_layers=4,
-        n_qubits=4,
+        n_embd=int(TRAIN_CFG["n_embd"]),
+        n_layers=int(TRAIN_CFG["n_layers"]),
+        n_qubits=int(TRAIN_CFG["n_qubits"]),
         num_nodes=num_nodes,
         adj_matrix=adj,
-        gnn_embd=128,
+        gnn_embd=int(TRAIN_CFG["gnn_embd"]),
         use_quantum=use_quantum,
         use_matcc=use_matcc,
         use_market_guidance=use_market_guidance,
@@ -127,14 +165,14 @@ def get_predictions(model_name, use_quantum=True, use_matcc=True, use_market_gui
     all_vols = []
     
     print(f"🔄 正在计算 {model_name} 的预测结果...")
-    with torch.no_grad():
+    with torch.inference_mode():
         for batch in test_loader:
-            x = batch['x'].to(DEVICE)
-            y = batch['y'].to(DEVICE)
-            vol = batch['vol'].to(DEVICE)
+            x = batch['x'].to(DEVICE, non_blocking=True)
+            y = batch['y'].to(DEVICE, non_blocking=True)
+            vol = batch['vol'].to(DEVICE, non_blocking=True)
             node_idx = batch.get('node_indices')
             if node_idx is not None:
-                node_idx = node_idx.to(DEVICE)
+                node_idx = node_idx.to(DEVICE, non_blocking=True)
             
             preds = model(x, vol, node_indices=node_idx)
             all_preds.append(preds.cpu().numpy())
@@ -200,6 +238,13 @@ def calculate_group_metrics(y_true, y_pred):
 
 # ================= 3. 主程序 =================
 def main():
+    """
+    主流程：
+      1) 加载 Full Model 与 no_quantum 的预测结果
+      2) 根据波动率分位数把测试集分为 Low/Mid/High 三组
+      3) 对每组分别计算指标并输出结论
+      4) 保存分组评估结果到 outputs/results/
+    """
     print("="*70)
     print("📊 分组评估：Full Model vs No Quantum (按波动率分组)")
     print("="*70)

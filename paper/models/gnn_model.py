@@ -103,9 +103,11 @@ class QL_MATCC_GNN_Model(nn.Module):
         ma_window=5,
         q_threshold=0.5,  # 【关键修改】默认阈值从 0.0 改为 0.5
         dropout=0.1,
+        max_neighbors: int = 32,
     ):
         super().__init__()
         gnn_embd = gnn_embd or min(n_embd, 64)
+        self.max_neighbors = int(max_neighbors)
 
         # ----- 1. 时序编码器：复用 QL_MATCC_Model，去掉 head，只做特征提取 -----
         self.temporal_encoder = QL_MATCC_Model(
@@ -138,6 +140,11 @@ class QL_MATCC_GNN_Model(nn.Module):
         # 【新增】GAT 后的 LayerNorm，稳定图特征
         self.gnn_ln = nn.LayerNorm(gnn_embd)
 
+        # 许多顶会工作在 mini-batch 场景会给“未出现在 batch 的邻居节点”提供一个可学习的静态表示，
+        # 避免图消息传递完全依赖 batch 采样（否则邻居不在 batch 时无法聚合）。
+        self.node_embedding = nn.Embedding(num_nodes, gnn_embd)
+        nn.init.normal_(self.node_embedding.weight, mean=0.0, std=0.02)
+
         # ----- 3. 门控融合机制（Gated Fusion）-----
         # 自适应融合时序特征和图特征，让模型学习最优融合比例
         fusion_dim = n_embd + gnn_embd
@@ -165,8 +172,50 @@ class QL_MATCC_GNN_Model(nn.Module):
             adj_matrix = torch.tensor(adj_matrix, dtype=torch.float32)
         self.register_buffer("adj", adj_matrix)
 
+        # ----- 6. 邻居缓存（性能优化）-----
+        # 说明：
+        # - 旧实现：每次 forward 都对 dense 邻接做 row.nonzero()，并且 self.adj.to(device) 会产生隐形拷贝
+        # - 新实现：初始化时预计算每个节点的 Top-K 邻居索引（不足用 -1 padding），forward 只做索引与去重
+        # - 对于大量“孤立节点”（度=0）的场景，缓存能显著降低开销
+        self.register_buffer(
+            "neighbor_index",
+            self._build_neighbor_index(self.adj, max_k=self.max_neighbors),
+        )
+
         self.n_embd = n_embd
         self.gnn_embd = gnn_embd
+
+    @staticmethod
+    def _build_neighbor_index(adj: torch.Tensor, max_k: int) -> torch.Tensor:
+        """
+        预计算每个节点的邻居列表（Top-K），用于 forward 的快速邻居扩展。
+
+        Args:
+            adj: (N, N) 邻接矩阵（float/bool 均可，>0 视为有边；通常包含自环）
+            max_k: 每个节点最多保留多少个邻居（不含自环）。<=0 则返回空矩阵。
+
+        Returns:
+            neighbor_index: (N, K) 的 long Tensor，缺省位置用 -1 填充。
+        """
+        if adj is None:
+            return torch.empty((0, 0), dtype=torch.long)
+        N = int(adj.shape[0])
+        K = int(max(0, max_k))
+        if K == 0 or N == 0:
+            return torch.empty((N, 0), dtype=torch.long)
+
+        # 在 CPU 上构建更稳（一次性成本），随后作为 buffer 随模型迁移到 GPU
+        adj_cpu = adj.detach().cpu()
+        neigh = torch.full((N, K), -1, dtype=torch.long)
+        for i in range(N):
+            idx = torch.nonzero(adj_cpu[i] > 0, as_tuple=False).view(-1)
+            # 去掉自环
+            idx = idx[idx != i]
+            if idx.numel() > K:
+                idx = idx[:K]
+            if idx.numel() > 0:
+                neigh[i, : idx.numel()] = idx
+        return neigh
 
     def forward(self, x, vol, node_indices=None):
         """
@@ -179,18 +228,56 @@ class QL_MATCC_GNN_Model(nn.Module):
         h_temporal = self.temporal_encoder(x, vol)
 
         # Step 2: 投影到 GAT 维度（若 gnn_embd != n_embd）
-        h_gnn_in = self.gnn_proj(h_temporal)
+        h_gnn_in = self.gnn_proj(h_temporal)  # (B, gnn_embd)
 
-        # Step 3: 构造当前 batch 的邻接子矩阵
-        if node_indices is not None and self.adj is not None:
-            batch_adj = self.adj[node_indices][:, node_indices]
+        # Step 3: 图聚合（mini-batch + 邻居扩展）
+        # 关键修复：不要把 batch 的每条样本都当作“不同节点”直接做 GAT，
+        # 否则当 batch 里出现同一 ticker 的多个样本时，会被当成多个节点，语义错误。
+        if node_indices is None or self.adj is None:
+            h_graph = h_gnn_in
         else:
-            # 退化：无图信息时仅自环，GAT 输出 ≈ 恒等
-            B = x.size(0)
-            batch_adj = torch.eye(B, device=x.device, dtype=x.dtype)
+            device = x.device
+            node_indices = node_indices.view(-1)
 
-        h_graph = self.gnn(h_gnn_in, batch_adj)
-        h_graph = self.gnn_ln(h_graph)  # LayerNorm 稳定图特征
+            # 3.1 去重：unique tickers in batch
+            uniq_nodes, inv = torch.unique(node_indices, sorted=False, return_inverse=True)
+
+            # 3.2 聚合重复 ticker 的特征（mean pooling）
+            uniq_feats = torch.zeros((uniq_nodes.numel(), h_gnn_in.size(1)), device=device, dtype=h_gnn_in.dtype)
+            uniq_counts = torch.zeros((uniq_nodes.numel(), 1), device=device, dtype=h_gnn_in.dtype)
+            uniq_feats.index_add_(0, inv, h_gnn_in)
+            uniq_counts.index_add_(0, inv, torch.ones((h_gnn_in.size(0), 1), device=device, dtype=h_gnn_in.dtype))
+            uniq_feats = uniq_feats / uniq_counts.clamp(min=1.0)
+
+            # 3.3 邻居扩展：使用预计算 neighbor_index（避免 forward 里反复 nonzero 扫描邻接矩阵）
+            K = int(max(0, self.max_neighbors))
+            adj = self.adj  # buffer 会随 model.to(device) 自动迁移，避免每步 .to() 的隐形拷贝
+            neigh_nodes = torch.empty(0, dtype=torch.long, device=device)
+            if K > 0 and getattr(self, "neighbor_index", None) is not None and self.neighbor_index.numel() > 0:
+                nb = self.neighbor_index[uniq_nodes]  # (U, K)
+                nb = nb.reshape(-1)
+                nb = nb[nb >= 0]
+                if nb.numel() > 0:
+                    neigh_nodes = torch.unique(nb)
+
+            # torch.unique 默认会排序输出（sorted=True），便于后续 searchsorted 做稳定映射
+            sub_nodes = torch.unique(torch.cat([uniq_nodes, neigh_nodes], dim=0))
+
+            # 3.4 子图初始节点特征：默认用可学习 node embedding；batch 节点用时序特征覆盖
+            sub_feats = self.node_embedding(sub_nodes)  # (Ns, gnn_embd)
+
+            # 将 uniq_nodes 映射到 sub_nodes 的位置（sub_nodes 已排序，映射稳定且更快）
+            uniq_pos_in_sub = torch.searchsorted(sub_nodes, uniq_nodes)
+            sub_feats[uniq_pos_in_sub] = uniq_feats
+
+            # 注意：这里构造的是诱导子图的 dense 邻接；当图节点规模在几百（S&P500）时非常快
+            sub_adj = adj.index_select(0, sub_nodes).index_select(1, sub_nodes)
+            sub_out = self.gnn(sub_feats, sub_adj)
+            sub_out = self.gnn_ln(sub_out)
+
+            # 取回 batch 节点的图特征，并映射回每条样本
+            uniq_graph = sub_out[uniq_pos_in_sub]  # (U, gnn_embd) 顺序与 uniq_nodes 对齐
+            h_graph = uniq_graph[inv]              # (B, gnn_embd) 映射回每条样本
 
         # Step 4: 门控融合
         h_combined = torch.cat([h_temporal, h_graph], dim=1)

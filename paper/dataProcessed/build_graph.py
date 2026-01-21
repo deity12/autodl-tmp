@@ -19,6 +19,10 @@ import os
 from tqdm import tqdm
 import torch
 import warnings
+import json
+import time
+import traceback
+from collections import Counter, defaultdict
 
 # 关闭与本项目无关/不美观的环境警告（不影响LLM建图结果）
 os.environ.setdefault("TRANSFORMERS_NO_TORCHVISION", "1")
@@ -205,6 +209,153 @@ def _normalize_llm_relations(parsed):
     return norm
 
 
+def _extract_json_from_text(raw: str):
+    """
+    尽可能从模型输出中提取 JSON（通常是 list/dict）。
+    兼容：
+    - ```json ... ``` 包裹
+    - 前后夹杂解释文字
+    - 只输出 [] 或 {} 的子串
+    """
+    if raw is None:
+        return None
+    raw = str(raw).strip()
+    if not raw:
+        return None
+
+    # 去掉 markdown code fence
+    if "```" in raw:
+        # 取第一个 fence 内的内容优先（常见：```json ... ```）
+        parts = raw.split("```")
+        if len(parts) >= 3:
+            cand = parts[1]
+            cand = cand.strip()
+            if cand.lower().startswith("json"):
+                cand = cand[4:].strip()
+            raw = cand
+        else:
+            raw = raw.replace("```", "").strip()
+
+    # 直接尝试整体解析
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+
+    # 尝试截取最外层 [] 或 {}
+    def _try_span(lch, rch):
+        l = raw.find(lch)
+        r = raw.rfind(rch)
+        if l != -1 and r != -1 and r > l:
+            s = raw[l : r + 1].strip()
+            try:
+                return json.loads(s)
+            except Exception:
+                return None
+        return None
+
+    parsed = _try_span("[", "]")
+    if parsed is not None:
+        return parsed
+    parsed = _try_span("{", "}")
+    if parsed is not None:
+        return parsed
+
+    return None
+
+
+def _atomic_save_npy(path: str, arr: np.ndarray):
+    """原子写入 .npy，避免中途中断留下损坏文件。"""
+    tmp = path + ".tmp"
+    np.save(tmp, arr)
+    # np.save 会自动补 .npy（如果 tmp 不以 .npy 结尾），这里统一处理
+    if not tmp.endswith(".npy"):
+        tmp = tmp + ".npy"
+    os.replace(tmp, path)
+
+
+def _atomic_save_json(path: str, obj):
+    """原子写入 JSON（避免中途中断留下损坏/半写文件）。"""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def _atomic_save_checkpoint_npz(path: str, adj: np.ndarray, meta: dict):
+    """原子写入 checkpoint（npz），同时保存 meta（json字符串）。"""
+    tmp = path + ".tmp"
+    np.savez_compressed(tmp, adj=adj, meta=json.dumps(meta, ensure_ascii=False))
+    if not tmp.endswith(".npz"):
+        tmp = tmp + ".npz"
+    os.replace(tmp, path)
+
+
+def _load_checkpoint_npz(path: str):
+    """
+    读取断点续跑 checkpoint（npz）。
+
+    Returns:
+        (adj, meta): adj 为邻接矩阵 np.ndarray；meta 为 dict。
+        失败时返回 (None, None)。
+    """
+    try:
+        data = np.load(path, allow_pickle=True)
+        adj = data["adj"]
+        meta_raw = data["meta"].item() if hasattr(data["meta"], "item") else data["meta"]
+        meta = json.loads(meta_raw) if isinstance(meta_raw, (str, bytes)) else {}
+        return adj, meta
+    except Exception:
+        return None, None
+
+
+def _build_ticker_alias_map(tickers):
+    """
+    构建 ticker 别名映射，解决 BRK.B vs BRK-B 这类常见写法差异。
+    返回：alias2canonical: dict[normalized]->canonical（canonical 为 tickers 中原始值）
+    """
+    alias2canonical = {}
+    for t in tickers:
+        if t is None or (isinstance(t, float) and pd.isna(t)):
+            continue
+        t0 = str(t).strip().upper()
+        if not t0:
+            continue
+        # 规范化：把 '-' 视作 '.' 的同义（很多数据源写法不同）
+        norm = t0.replace("-", ".")
+        alias2canonical[norm] = t0
+        alias2canonical[t0] = t0
+    return alias2canonical
+
+
+def _canonicalize_ticker(t, alias2canonical, ticker2idx=None):
+    """
+    将 LLM/新闻中提取到的 ticker 规范化为“图节点”的 canonical 表示。
+
+    处理：
+      - 大小写统一
+      - '$AAPL' / '(AAPL)' 等噪声清理
+      - '-' 与 '.' 的写法兼容（例如 BRK-B vs BRK.B）
+      - 若提供 ticker2idx，则过滤掉图中不存在的 ticker（避免越界/错位）
+    """
+    if t is None or (isinstance(t, float) and pd.isna(t)):
+        return None
+    s = str(t).strip().upper()
+    if not s:
+        return None
+    # 常见噪声：$AAPL、(AAPL)
+    s = s.replace("$", "").strip()
+    if s.startswith("(") and s.endswith(")") and len(s) > 2:
+        s = s[1:-1].strip()
+    s_norm = s.replace("-", ".")
+    c = alias2canonical.get(s_norm) or alias2canonical.get(s)
+    if c is None:
+        c = s
+    if ticker2idx is not None and c not in ticker2idx:
+        return None
+    return c
+
+
 def extract_relations_with_llm_batch(
     news_texts,
     local_model=None,
@@ -268,7 +419,8 @@ def extract_relations_with_llm_batch(
         valid_prompts = [p for p in batch_prompts if p is not None]
         if valid_prompts:
             try:
-                device = local_model.device
+                # device_map="auto" 时 local_model.device 可能不可靠，使用参数设备更稳
+                device = next(local_model.parameters()).device
                 
                 # 批量编码所有prompt
                 inputs = []
@@ -295,7 +447,7 @@ def extract_relations_with_llm_batch(
                         max_new_tokens=max_new_tokens,  # 关系抽取只需要很短输出
                         do_sample=do_sample,
                         temperature=0.0 if not do_sample else 0.1,
-                        pad_token_id=getattr(local_tokenizer, "pad_token_id", None),
+                        pad_token_id=getattr(local_tokenizer, "pad_token_id", None) or getattr(local_tokenizer, "eos_token_id", None),
                         eos_token_id=getattr(local_tokenizer, "eos_token_id", None),
                     )
                 
@@ -311,19 +463,17 @@ def extract_relations_with_llm_batch(
                         raw = local_tokenizer.decode(generated, skip_special_tokens=True)
                         
                         try:
-                            import json
-                            if "```" in raw:
-                                raw = raw.split("```")[1]
-                                if raw.startswith("json"):
-                                    raw = raw[4:]
-                            parsed = json.loads(raw)
+                            parsed = _extract_json_from_text(raw)
                             results.append(_normalize_llm_relations(parsed))
-                        except:
+                        except Exception:
                             results.append([])
                         
                         valid_idx += 1
                         
-            except Exception as e:
+            except torch.cuda.OutOfMemoryError:
+                # 关键：不要吞掉 OOM，让上层降低 batch 重试
+                raise
+            except Exception:
                 # 批处理失败时，用空结果填充
                 for prompt in batch_prompts:
                     results.append([])
@@ -400,13 +550,18 @@ def build_dynamic_graph(use_llm=USE_LLM_DEFAULT, max_per_ticker=MAX_NEWS_PER_TIC
         return
 
     df_price = pd.read_csv(INPUT_MODEL_DATA)
-    all_tickers = sorted(df_price['Ticker'].unique())
+    all_tickers = sorted(df_price['Ticker'].astype(str).str.upper().unique())
     print(f"    原始数据检测到 {len(all_tickers)} 只股票。")
     
     # =============== S&P 500 过滤（推荐用于论文）===============
+    # 重要：为了与 dataset.py / train_full.py 的 ticker2idx 对齐，图的“节点顺序”固定为 all_tickers；
+    #       S&P500 模式只影响“哪些新闻参与建边”，以及“哪些 ticker 允许出现在边上”。
     if use_sp500:
+        # 兼容常见写法差异：BRK.B vs BRK-B（以及部分数据源用 '-' 替代 '.'）
+        # 注意：这里仅用于“是否属于 S&P500”的判断，不改变图节点的 canonical 表示。
+        sp500_norm = {str(t).strip().upper().replace("-", ".") for t in SP500_TICKERS}
         # 找出数据中存在的 S&P 500 成分股
-        sp500_in_data = [t for t in all_tickers if t in SP500_TICKERS]
+        sp500_in_data = [t for t in all_tickers if str(t).strip().upper().replace("-", ".") in sp500_norm]
         print(f"\n📌 [S&P 500 模式] 只使用核心成分股")
         print(f"    S&P 500 成分股定义: {len(SP500_TICKERS)} 只")
         print(f"    数据中匹配到: {len(sp500_in_data)} 只")
@@ -415,32 +570,47 @@ def build_dynamic_graph(use_llm=USE_LLM_DEFAULT, max_per_ticker=MAX_NEWS_PER_TIC
             print(f"⚠️ 警告：匹配到的 S&P 500 成分股较少 ({len(sp500_in_data)} 只)")
             print("    可能原因：数据集中的股票代码格式不同，或数据集不包含这些股票")
             print("    将使用全量股票...")
-            tickers = all_tickers
+            active_tickers = all_tickers
         else:
-            tickers = sp500_in_data
-            # 过滤价格数据，只保留 S&P 500 成分股
-            df_price = df_price[df_price['Ticker'].isin(tickers)]
+            active_tickers = sp500_in_data
     else:
-        tickers = all_tickers
-        print(f"📌 [全量模式] 使用所有 {len(tickers)} 只股票")
+        active_tickers = all_tickers
+        print(f"📌 [全量模式] 使用所有 {len(active_tickers)} 只股票")
     
-    ticker2idx = {t: i for i, t in enumerate(tickers)}
-    num_nodes = len(tickers)
-    print(f"    最终使用 {num_nodes} 只股票构建图谱。")
+    # 图节点固定为 all_tickers（确保与训练数据 ticker2idx 对齐）
+    ticker2idx = {t: i for i, t in enumerate(all_tickers)}
+    alias2canonical = _build_ticker_alias_map(all_tickers)
+    num_nodes = len(all_tickers)
+    active_set = set(active_tickers)
+    if active_tickers != all_tickers:
+        print(f"    图节点数保持为 {num_nodes}（全量 ticker），但仅对 {len(active_tickers)} 个 ticker 的新闻建边。")
+    else:
+        print(f"    最终使用 {num_nodes} 只股票构建图谱。")
+
+    # 保存 ticker 顺序，便于论文复现与排查索引对齐问题
+    tickers_meta_path = OUTPUT_GRAPH.replace(".npy", "_tickers.json")
+    try:
+        _atomic_save_json(tickers_meta_path, {"tickers": all_tickers})
+    except Exception:
+        pass
 
     if not os.path.exists(INPUT_NEWS):
         print(f"[WARN] 未找到新闻文件 {INPUT_NEWS}，保存单位阵。")
         adj_matrix = np.eye(num_nodes, dtype=np.float32)
-        np.save(OUTPUT_GRAPH, adj_matrix)
+        _atomic_save_npy(OUTPUT_GRAPH, adj_matrix)
         return
 
     df_news = pd.read_csv(INPUT_NEWS, low_memory=False)
     print(f"    原始新闻总数: {len(df_news)}")
+
+    # 统一新闻里的 ticker 格式，避免分层采样时因大小写/写法差异导致“同一只股票被拆成多个组”
+    if 'Ticker' in df_news.columns:
+        df_news['Ticker'] = df_news['Ticker'].astype(str).str.upper()
     
     # 如果使用 S&P 500 模式，过滤新闻数据
-    if use_sp500 and len(tickers) < len(all_tickers):
+    if use_sp500 and len(active_tickers) < len(all_tickers):
         before_filter = len(df_news)
-        df_news = df_news[df_news['Ticker'].isin(tickers)].copy()
+        df_news = df_news[df_news['Ticker'].isin(active_tickers)].copy()
         print(f"    [S&P 500 过滤] 保留新闻: {before_filter} -> {len(df_news)}")
 
     # =========================== 防止"未来信息"数据泄露 ===========================
@@ -484,7 +654,7 @@ def build_dynamic_graph(use_llm=USE_LLM_DEFAULT, max_per_ticker=MAX_NEWS_PER_TIC
     
     if text_col is None:
         print("[WARN] 没找到文本列，保存单位阵。")
-        np.save(OUTPUT_GRAPH, np.eye(num_nodes, dtype=np.float32))
+        _atomic_save_npy(OUTPUT_GRAPH, np.eye(num_nodes, dtype=np.float32))
         return
 
     # 初始化邻接矩阵（单位阵 = 自环）
@@ -553,7 +723,8 @@ def build_dynamic_graph(use_llm=USE_LLM_DEFAULT, max_per_ticker=MAX_NEWS_PER_TIC
     
     # 进度保存配置
     CHECKPOINT_INTERVAL = 10000
-    checkpoint_path = OUTPUT_GRAPH.replace('.npy', '_checkpoint.npy')
+    checkpoint_path = OUTPUT_GRAPH.replace('.npy', '_checkpoint.npz')
+    sampled_path = OUTPUT_GRAPH.replace('.npy', '_news_sampled.csv')
     BATCH_SIZE = int(os.environ.get("LLM_BATCH_SIZE", str(LLM_BATCH_SIZE_DEFAULT)))
     MAX_INPUT_TOKENS = int(os.environ.get("LLM_MAX_INPUT_TOKENS", str(LLM_MAX_INPUT_TOKENS_DEFAULT)))
     MAX_NEW_TOKENS = int(os.environ.get("LLM_MAX_NEW_TOKENS", str(LLM_MAX_NEW_TOKENS_DEFAULT)))
@@ -561,6 +732,42 @@ def build_dynamic_graph(use_llm=USE_LLM_DEFAULT, max_per_ticker=MAX_NEWS_PER_TIC
     
     edge_count = 0
     matched_tickers = set()
+    relation_type_counter = Counter()
+    edge_counter = Counter()  # (src, dst) -> count
+    failures = 0
+
+    # 固化采样结果，确保可复现 & 可断点续跑
+    if os.path.exists(sampled_path):
+        try:
+            df_news_sampled = pd.read_csv(sampled_path, low_memory=False)
+            print(f"[Resume] 检测到已保存的采样新闻: {sampled_path} (n={len(df_news_sampled)})")
+        except Exception as e:
+            print(f"[WARN] 读取采样新闻失败，将重新采样: {e}")
+    else:
+        try:
+            df_news_sampled.to_csv(sampled_path, index=False)
+            print(f"[OK] 已保存采样新闻（用于断点续跑/复现）: {sampled_path}")
+        except Exception as e:
+            print(f"[WARN] 保存采样新闻失败（不影响运行，但无法稳定断点续跑）: {e}")
+
+    # 断点续跑：如果 checkpoint 存在，加载 adj + 进度
+    start_pos = 0
+    if os.path.exists(checkpoint_path):
+        ck_adj, ck_meta = _load_checkpoint_npz(checkpoint_path)
+        if ck_adj is not None and ck_meta:
+            # 简单一致性校验：节点数必须一致
+            if isinstance(ck_adj, np.ndarray) and ck_adj.shape == adj_matrix.shape:
+                adj_matrix = ck_adj.astype(np.float32, copy=False)
+                start_pos = int(ck_meta.get("next_pos", 0))
+                # 也可沿用上次已降过的 batch size
+                if "batch_size" in ck_meta:
+                    try:
+                        BATCH_SIZE = int(ck_meta["batch_size"])
+                    except Exception:
+                        pass
+                print(f"[Resume] 从 checkpoint 恢复：next_pos={start_pos}, batch_size={BATCH_SIZE}")
+            else:
+                print(f"[WARN] checkpoint 形状不匹配，忽略断点续跑（ck={getattr(ck_adj,'shape',None)} vs cur={adj_matrix.shape}）")
     
     if local_model:
         print(f"[批处理模式] batch={BATCH_SIZE}, max_input_tokens={MAX_INPUT_TOKENS}, max_new_tokens={MAX_NEW_TOKENS}, do_sample={DO_SAMPLE}")
@@ -568,106 +775,273 @@ def build_dynamic_graph(use_llm=USE_LLM_DEFAULT, max_per_ticker=MAX_NEWS_PER_TIC
         # 批处理LLM推理
         batch_news = []
         batch_tickers = []
-        
-        for idx, row in tqdm(df_news_sampled.iterrows(), total=len(df_news_sampled), desc="Building Graph"):
-            src_ticker = row.get('Ticker')
-            if src_ticker not in ticker2idx:
-                continue
-                
-            content = row.get(text_col, "")
-            if not content or pd.isna(content):
-                continue
-            
-            batch_news.append(str(content))
-            batch_tickers.append(src_ticker)
-            
-            # 达到批次大小或最后一批
-            if len(batch_news) >= BATCH_SIZE or idx == df_news_sampled.index[-1]:
-                # 批量推理（遇到OOM自动降低batch再重试）
-                while True:
+
+        t0 = time.time()
+        pbar = tqdm(total=len(df_news_sampled), desc="Building Graph", initial=start_pos)
+        cur_pos = start_pos
+
+        def _flush_batch():
+            """把当前 batch_news/batch_tickers 做一次 LLM 推理并更新图。"""
+            nonlocal BATCH_SIZE, edge_count, failures
+            nonlocal MAX_INPUT_TOKENS, MAX_NEW_TOKENS
+            nonlocal batch_news, batch_tickers
+
+            if not batch_news:
+                return
+
+            # 批量推理（遇到OOM自动降低batch再重试）
+            oom_tries = 0
+            while True:
+                try:
+                    batch_relations = extract_relations_with_llm_batch(
+                        batch_news,
+                        local_model,
+                        local_tokenizer,
+                        batch_size=BATCH_SIZE,
+                        max_input_tokens=MAX_INPUT_TOKENS,
+                        max_new_tokens=MAX_NEW_TOKENS,
+                        do_sample=DO_SAMPLE,
+                    )
+                    break
+                except torch.cuda.OutOfMemoryError:
+                    oom_tries += 1
                     try:
-                        batch_relations = extract_relations_with_llm_batch(
-                            batch_news,
-                            local_model,
-                            local_tokenizer,
-                            batch_size=BATCH_SIZE,
-                            max_input_tokens=MAX_INPUT_TOKENS,
-                            max_new_tokens=MAX_NEW_TOKENS,
-                            do_sample=DO_SAMPLE,
-                        )
-                        break
-                    except torch.cuda.OutOfMemoryError:
-                        if BATCH_SIZE <= 4:
-                            raise
                         torch.cuda.empty_cache()
-                        BATCH_SIZE = max(4, BATCH_SIZE // 2)
-                        print(f"\n[OOM] 显存不足，自动降低 batch_size -> {BATCH_SIZE} 后继续")
-                
-                # 处理结果
-                for src_ticker, relations in zip(batch_tickers, batch_relations):
-                    if relations:
-                        for r in relations:
-                            # 兼容：r 可能是 dict 或 list/tuple（LLM 输出偶发跑偏）
-                            if isinstance(r, dict):
-                                src, dst = r.get("src"), r.get("dst")
-                            elif isinstance(r, (list, tuple)) and len(r) >= 2:
-                                src, dst = r[0], r[1]
-                            else:
+                    except Exception:
+                        pass
+
+                    # 优先降 batch，其次降输入长度，再降输出长度；最后跳过该 batch 避免整任务中断
+                    if BATCH_SIZE > 1:
+                        new_bs = max(1, BATCH_SIZE // 2)
+                        if new_bs == BATCH_SIZE:
+                            new_bs = max(1, BATCH_SIZE - 1)
+                        BATCH_SIZE = new_bs
+                        print(f"\n[OOM] 显存不足，降低 batch_size -> {BATCH_SIZE} 后重试")
+                        continue
+
+                    if MAX_INPUT_TOKENS > 512:
+                        MAX_INPUT_TOKENS = max(512, int(MAX_INPUT_TOKENS * 0.75))
+                        print(f"\n[OOM] batch_size=1仍不足，降低 max_input_tokens -> {MAX_INPUT_TOKENS} 后重试")
+                        continue
+
+                    if MAX_NEW_TOKENS > 48:
+                        MAX_NEW_TOKENS = max(48, int(MAX_NEW_TOKENS * 0.75))
+                        print(f"\n[OOM] 仍不足，降低 max_new_tokens -> {MAX_NEW_TOKENS} 后重试")
+                        continue
+
+                    # 实在无法恢复：跳过该 batch（不让整次运行失败）
+                    failures += 1
+                    print(f"\n[OOM] 多次重试仍失败（oom_tries={oom_tries}），将跳过该批次以继续运行")
+                    batch_relations = [[] for _ in batch_news]
+                    break
+                except Exception:
+                    failures += 1
+                    batch_relations = [[] for _ in batch_news]
+                    break
+
+            # 处理结果
+            for src_t, relations in zip(batch_tickers, batch_relations):
+                if relations:
+                    for r in relations:
+                        # 兼容：r 可能是 dict 或 list/tuple（LLM 输出偶发跑偏）
+                        if isinstance(r, dict):
+                            src, dst = r.get("src"), r.get("dst")
+                            rel = r.get("relation")
+                        elif isinstance(r, (list, tuple)) and len(r) >= 2:
+                            src, dst = r[0], r[1]
+                            rel = r[2] if len(r) >= 3 else None
+                        else:
+                            continue
+
+                        src_c = _canonicalize_ticker(src, alias2canonical, ticker2idx)
+                        dst_c = _canonicalize_ticker(dst, alias2canonical, ticker2idx)
+                        if not src_c or not dst_c or src_c == dst_c:
+                            continue
+
+                        # S&P500 模式：限制边两端都在 active 集合内（更符合论文“核心成分股”设定）
+                        if use_sp500 and (active_set != set(all_tickers)):
+                            if src_c not in active_set or dst_c not in active_set:
                                 continue
-                            if src and dst and src in ticker2idx and dst in ticker2idx and src != dst:
-                                i, j = ticker2idx[src], ticker2idx[dst]
-                                if adj_matrix[i, j] == 0:
-                                    edge_count += 1
-                                adj_matrix[i, j] = 1.0
-                                adj_matrix[j, i] = 1.0
-                                matched_tickers.add(src)
-                                matched_tickers.add(dst)
-                
-                # 清空批次
-                batch_news = []
-                batch_tickers = []
-                
-                # 进度保存
-                if (idx + 1) % CHECKPOINT_INTERVAL == 0:
-                    np.save(checkpoint_path, adj_matrix)
-                    print(f"\n[进度保存] 已处理 {idx+1}/{len(df_news_sampled)} 条 (边数: {int((adj_matrix.sum()-num_nodes)/2)})")
-    else:
-        # 规则模式（不变）
-        for idx, row in tqdm(df_news_sampled.iterrows(), total=len(df_news_sampled), desc="Building Graph"):
-            src_ticker = row.get('Ticker')
-            if src_ticker not in ticker2idx:
-                continue
-                
-            content = row.get(text_col, "")
-            if not content or pd.isna(content):
-                continue
-            
-            content = str(content)
-            
-            # 规则匹配
-            for t in tickers:
-                if t != src_ticker and len(str(t)) >= 3 and t.upper() in content.upper():
-                    if t in ticker2idx:
-                        i, j = ticker2idx[src_ticker], ticker2idx[t]
+
+                        i, j = ticker2idx[src_c], ticker2idx[dst_c]
                         if adj_matrix[i, j] == 0:
                             edge_count += 1
                         adj_matrix[i, j] = 1.0
                         adj_matrix[j, i] = 1.0
-                        matched_tickers.add(src_ticker)
-                        matched_tickers.add(t)
+                        matched_tickers.add(src_c)
+                        matched_tickers.add(dst_c)
+
+                        # 统计（用于论文与排错）
+                        # 统计边（无向图）：用排序后的 (min,max) 作为 key，避免双向重复计数
+                        a, b = (src_c, dst_c) if src_c <= dst_c else (dst_c, src_c)
+                        edge_counter[(a, b)] += 1
+                        if rel:
+                            relation_type_counter[str(rel).strip()] += 1
+
+            # 清空批次
+            batch_news = []
+            batch_tickers = []
+
+        try:
+            for pos in range(start_pos, len(df_news_sampled)):
+                cur_pos = pos
+                row = df_news_sampled.iloc[pos]
+                src_ticker = str(row.get('Ticker', '')).strip().upper()
+                # S&P500 模式：仅处理 active 集合内的源节点
+                content = row.get(text_col, "")
+
+                # 是否把当前行纳入 batch
+                ok = True
+                if not src_ticker:
+                    ok = False
+                elif use_sp500 and (active_set != set(all_tickers)) and (src_ticker not in active_set):
+                    ok = False
+                elif src_ticker not in ticker2idx:
+                    ok = False
+                elif not content or (isinstance(content, float) and pd.isna(content)):
+                    ok = False
+
+                if ok:
+                    batch_news.append(str(content))
+                    batch_tickers.append(src_ticker)
+
+                # 达到批次大小则 flush
+                if len(batch_news) >= BATCH_SIZE:
+                    _flush_batch()
+
+                # 进度保存（按处理条数）
+                if (pos + 1) % CHECKPOINT_INTERVAL == 0:
+                    # 保存前先把 batch 刷掉，确保 checkpoint 的图是“可用的”
+                    _flush_batch()
+                    meta = {
+                        "next_pos": pos + 1,
+                        "batch_size": BATCH_SIZE,
+                        "max_input_tokens": MAX_INPUT_TOKENS,
+                        "max_new_tokens": MAX_NEW_TOKENS,
+                        "do_sample": bool(DO_SAMPLE),
+                        "use_sp500": bool(use_sp500),
+                        "num_nodes": int(num_nodes),
+                        "active_tickers": sorted(list(active_set)) if (use_sp500 and active_set != set(all_tickers)) else None,
+                        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    }
+                    _atomic_save_checkpoint_npz(checkpoint_path, adj_matrix, meta)
+                    speed = (pos + 1 - start_pos) / max(1e-6, (time.time() - t0))
+                    print(f"\n[进度保存] 已处理 {pos+1}/{len(df_news_sampled)} 条 (边数: {int((adj_matrix.sum()-num_nodes)/2)}), {speed:.2f} it/s")
+
+                # 更新进度条（按扫描行数）
+                pbar.update(1)
+
+            # 循环结束后，把残余 batch 全部 flush（避免末尾若干行被跳过导致漏刷）
+            _flush_batch()
+
+        except Exception as e:
+            failures += 1
+            # 发生异常时尽量保存 checkpoint，避免“跑一点点就白跑”
+            try:
+                meta = {
+                    "next_pos": int(cur_pos),
+                    "batch_size": BATCH_SIZE,
+                    "max_input_tokens": MAX_INPUT_TOKENS,
+                    "max_new_tokens": MAX_NEW_TOKENS,
+                    "do_sample": bool(DO_SAMPLE),
+                    "use_sp500": bool(use_sp500),
+                    "num_nodes": int(num_nodes),
+                    "active_tickers": sorted(list(active_set)) if (use_sp500 and active_set != set(all_tickers)) else None,
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "error": repr(e),
+                    "traceback": traceback.format_exc()[-8000:],  # 避免过长
+                }
+                # 异常时也尽量先 flush 一下，让 checkpoint 的图尽可能完整
+                try:
+                    _flush_batch()
+                except Exception:
+                    pass
+                _atomic_save_checkpoint_npz(checkpoint_path, adj_matrix, meta)
+                print(f"\n[ERROR] 发生异常，已保存 checkpoint（可断点续跑）: {checkpoint_path}")
+            except Exception:
+                pass
+            raise
+        finally:
+            try:
+                pbar.close()
+            except Exception:
+                pass
+    else:
+        # 规则模式（不变）
+        start_pos = 0
+        if os.path.exists(checkpoint_path):
+            ck_adj, ck_meta = _load_checkpoint_npz(checkpoint_path)
+            if ck_adj is not None and ck_meta and isinstance(ck_adj, np.ndarray) and ck_adj.shape == adj_matrix.shape:
+                adj_matrix = ck_adj.astype(np.float32, copy=False)
+                start_pos = int(ck_meta.get("next_pos", 0))
+                print(f"[Resume] (规则模式) 从 checkpoint 恢复：next_pos={start_pos}")
+
+        for pos in tqdm(range(start_pos, len(df_news_sampled)), total=len(df_news_sampled), initial=start_pos, desc="Building Graph"):
+            row = df_news_sampled.iloc[pos]
+            src_ticker = str(row.get('Ticker', '')).strip().upper()
+                
+            content = row.get(text_col, "")
+
+            ok = True
+            if not src_ticker:
+                ok = False
+            elif use_sp500 and (active_set != set(all_tickers)) and (src_ticker not in active_set):
+                ok = False
+            elif src_ticker not in ticker2idx:
+                ok = False
+            elif not content or (isinstance(content, float) and pd.isna(content)):
+                ok = False
+
+            if ok:
+                content = str(content)
+                # 规则匹配
+                for t in active_tickers:
+                    if t != src_ticker and len(str(t)) >= 3 and str(t).upper() in content.upper():
+                        if use_sp500 and (active_set != set(all_tickers)) and (t not in active_set):
+                            continue
+                        if t in ticker2idx:
+                            i, j = ticker2idx[src_ticker], ticker2idx[t]
+                            if adj_matrix[i, j] == 0:
+                                edge_count += 1
+                            adj_matrix[i, j] = 1.0
+                            adj_matrix[j, i] = 1.0
+                            matched_tickers.add(src_ticker)
+                            matched_tickers.add(t)
             
-            if (idx + 1) % CHECKPOINT_INTERVAL == 0:
-                np.save(checkpoint_path, adj_matrix)
-                print(f"\n[进度保存] 已处理 {idx+1}/{len(df_news_sampled)} 条 (边数: {int((adj_matrix.sum()-num_nodes)/2)})")
+            if (pos + 1) % CHECKPOINT_INTERVAL == 0:
+                meta = {
+                    "next_pos": pos + 1,
+                    "batch_size": None,
+                    "use_sp500": bool(use_sp500),
+                    "num_nodes": int(num_nodes),
+                    "active_tickers": sorted(list(active_set)) if (use_sp500 and active_set != set(all_tickers)) else None,
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                }
+                _atomic_save_checkpoint_npz(checkpoint_path, adj_matrix, meta)
+                print(f"\n[进度保存] 已处理 {pos+1}/{len(df_news_sampled)} 条 (边数: {int((adj_matrix.sum()-num_nodes)/2)})")
 
     # =========================== 保存最终结果 ===========================
     print("\n>>> [Step 3] 保存最终结果...")
-    np.save(OUTPUT_GRAPH, adj_matrix)
+    _atomic_save_npy(OUTPUT_GRAPH, adj_matrix)
     
     # 删除checkpoint文件
     if os.path.exists(checkpoint_path):
         os.remove(checkpoint_path)
         print(f"[清理] 已删除临时checkpoint文件")
+    # 采样文件保留（便于复现/审计）；如需节省空间可手动删除
+
+    # 保存关系类型统计（LLM模式下更有论文价值；规则模式可能为空）
+    try:
+        stats_path = OUTPUT_GRAPH.replace(".npy", "_relation_stats.json")
+        _atomic_save_json(stats_path, {
+            "relation_type_counts": dict(relation_type_counter),
+            "top_edges": [
+                {"src": k[0], "dst": k[1], "count": int(v)}
+                for k, v in edge_counter.most_common(200)
+            ],
+        })
+    except Exception:
+        pass
     
     # =========================== 输出统计信息 ===========================
     print("\n" + "=" * 70)

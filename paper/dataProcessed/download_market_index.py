@@ -1,10 +1,42 @@
-import akshare as ak
+"""
+下载并规范化 S&P 500 指数数据（可选步骤）
+====================================
+
+用途：
+  为 `dataProcessed/align.py` 提供大盘指数特征（Market_Close, Market_Vol）。
+
+输出文件：
+  - `data/raw/FNSPID/SP500_Index.csv`，列为：
+      Date, Market_Close, Market_Vol
+
+实现说明：
+  - 使用 AkShare 拉取美股指数（.INX），并做列名映射（兼容中文/英文列名）。
+  - 过滤研究时间区间（2019-01-01 ~ 2023-12-31）。
+"""
+
+try:
+    import akshare as ak
+except ImportError as e:
+    raise ImportError(
+        "[错误] 未安装 akshare，无法自动下载 S&P 500 指数。\n"
+        "请先安装依赖：\n"
+        "  pip install akshare\n"
+        "或手动准备 `data/raw/FNSPID/SP500_Index.csv`（列：Date,Market_Close,Market_Vol）。\n"
+        f"原始错误: {e}"
+    )
 import pandas as pd
 import os
 
 OUTPUT_PATH = './data/raw/FNSPID/SP500_Index.csv'
 
 def download_sp500_fixed():
+    """
+    从 AkShare 下载 S&P500 指数（.INX）并保存为标准格式 CSV。
+
+    输出：
+      - `OUTPUT_PATH`（默认：`data/raw/FNSPID/SP500_Index.csv`）
+      - 列：Date, Market_Close, Market_Vol
+    """
     print(">>> 正在尝试使用 AkShare (修正版) 获取 S&P 500 数据...")
     try:
         # 【修正点】: 函数名变了，现在用这个

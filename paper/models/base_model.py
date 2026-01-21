@@ -1,3 +1,26 @@
+"""
+QL-MATCC 基础时序模型组件（不含图）
+=================================
+
+本模块实现论文/工程中的“时序主干”，主要由三部分组成：
+
+1) **MATCC 趋势解耦**：
+   - 用严格因果的滑动平均把序列分为 trend 与 fluctuation（避免未来信息泄露）
+
+2) **RWKV 时序编码器**：
+   - 使用 RWKV 的 TimeMixing（并用 torch.jit.script 加速关键算子）
+
+3) **Quantum / Classical Channel Mixing（量子门控）**：
+   - `Quantum_ChannelMixing`：根据样本波动率 `vol` 与阈值 `q_threshold` 决定是否走量子分支
+   - 低波动：走纯经典 FFN；高波动：走 PennyLane VQC 分支，并通过可学习缩放因子稳定训练
+
+上层模型：
+  - `QL_MATCC_Model`：组合上述组件输出收益预测（供 `models/gnn_model.py` 复用）
+
+依赖：
+  - PennyLane（量子线路模拟）；如依赖版本不兼容，本文件会给出安装/修复提示。
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -69,6 +92,15 @@ def rwkv_linear_attention_cpu(time_decay: torch.Tensor,
 
 # ================= 1. 量子层定义 =================
 class VQC_Block(nn.Module):
+    """
+    变分量子线路（VQC）封装为 PyTorch 模块。
+
+    - 输入：形如 (batch, n_qubits) 的角度参数（通常已映射到 [0, π]）
+    - 输出：对每个 qubit 的 PauliZ 期望值（范围约 [-1, 1]）
+
+    说明：本实现使用 `default.qubit` 作为模拟器（CPU），稳定性最好；
+    如需 GPU 加速量子模拟，可研究 `pennylane-lightning-gpu`（需额外安装）。
+    """
     def __init__(self, n_qubits=4, n_layers=2):
         super().__init__()
         self.n_qubits = n_qubits
@@ -95,6 +127,12 @@ class VQC_Block(nn.Module):
 
 # ================= 2. RWKV 核心组件 (优化版) =================
 class RWKV_TimeMixing(nn.Module):
+    """
+    RWKV 的时间混合层（TimeMixing）。
+
+    作用：在时间维度上做线性注意力式的序列聚合，兼具类似 Transformer 的表达能力与更低的推理复杂度。
+    本工程使用 JIT 编译的 `rwkv_linear_attention_cpu` 提升循环部分性能。
+    """
     def __init__(self, n_embd):
         super().__init__()
         self.n_embd = n_embd
@@ -193,7 +231,7 @@ class Classical_ChannelMixing(nn.Module):
     放在 model.py 便于统一消融；model_classical 可复用或自实现以摆脱 PennyLane 依赖。
     """
 
-    def __init__(self, n_embd: int):
+    def __init__(self, n_embd: int, dropout: float = 0.1):
         super().__init__()
         self.ffn = nn.Sequential(
             nn.Linear(n_embd, n_embd * 4),
@@ -201,9 +239,10 @@ class Classical_ChannelMixing(nn.Module):
             nn.Linear(n_embd * 4, n_embd),
         )
         self.layer_norm = nn.LayerNorm(n_embd)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor, vol: torch.Tensor = None) -> torch.Tensor:
-        return self.layer_norm(x + self.ffn(x))
+        return self.layer_norm(x + self.dropout(self.ffn(x)))
 
 
 # ================= 3. 量子-经典混合通道 (优化版 V2) =================
@@ -215,7 +254,7 @@ class Quantum_ChannelMixing(nn.Module):
     3. 残差连接：量子分支也使用残差，防止梯度消失
     4. 梯度裁剪兼容：使用 clamp 防止数值溢出
     """
-    def __init__(self, n_embd, n_qubits=4, q_threshold=0.5):
+    def __init__(self, n_embd, n_qubits=4, q_threshold=0.5, dropout: float = 0.1):
         super().__init__()
         self.n_embd = n_embd
         self.n_qubits = n_qubits
@@ -240,8 +279,8 @@ class Quantum_ChannelMixing(nn.Module):
         
         self.layer_norm = nn.LayerNorm(n_embd)
         
-        # 【新增】Dropout 正则化
-        self.dropout = nn.Dropout(0.1)
+        # 【新增】Dropout 正则化（与论文/训练脚本保持一致）
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, vol):
         # 错误处理：Batch一致性检查
@@ -331,9 +370,9 @@ class QL_MATCC_Model(nn.Module):
         self.layers = nn.ModuleList()
         for _ in range(n_layers):
             ch = (
-                Quantum_ChannelMixing(n_embd, n_qubits=n_qubits, q_threshold=q_threshold)
+                Quantum_ChannelMixing(n_embd, n_qubits=n_qubits, q_threshold=q_threshold, dropout=dropout)
                 if use_quantum
-                else Classical_ChannelMixing(n_embd)
+                else Classical_ChannelMixing(n_embd, dropout=dropout)
             )
             self.layers.append(
                 nn.ModuleDict({
