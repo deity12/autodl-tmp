@@ -1,16 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-LLM 动态图谱构建 (修正版 V3：支持 S&P 500 核心股票过滤)
+LLM 动态图谱构建 (V4 顶会特供版：S&P 500 核心节点锁定)
 ========================================================================
-核心修正：
-1. [关键] 支持只使用 S&P 500 成分股（推荐用于论文）
-2. [关键] 使用分层采样，确保每个股票都有代表性的新闻
-3. 打乱新闻顺序，避免只处理排序靠前的股票
-4. 添加图谱统计信息输出
+核心变更：
+1. [强制] 图节点仅包含 S&P 500 成分股 (N ≈ 500)
+2. [输出] 邻接矩阵形状变为 (N, N)，解决稀疏与孤立节点问题
+3. [同步] 输出 Graph_Tickers.json 供训练脚本对齐数据
 
-论文建议：
-- 使用 S&P 500 成分股是金融/量化研究的学术惯例
-- 大公司新闻质量高，关系更明确，图谱更有意义
+论文支撑：
+- "We strictly limit the graph nodes to the S&P 500 constituents to ensure high liquidity and data quality."
+- 符合 AAAI/KDD 等顶会对数据集质量的要求
 """
 
 import pandas as pd
@@ -51,6 +50,7 @@ DATA_PROCESSED = os.path.join(PROJECT_ROOT, 'data', 'processed')
 INPUT_NEWS = os.path.join(DATA_PROCESSED, 'Stock_News.csv')
 INPUT_MODEL_DATA = os.path.join(DATA_PROCESSED, 'Final_Model_Data.csv')
 OUTPUT_GRAPH = os.path.join(DATA_PROCESSED, 'Graph_Adjacency.npy')
+OUTPUT_TICKERS = os.path.join(DATA_PROCESSED, 'Graph_Tickers.json')  # 新增：节点列表文件
 
 # LLM 配置
 USE_LOCAL_MODEL = True
@@ -576,8 +576,7 @@ def build_dynamic_graph(use_llm=USE_LLM_DEFAULT, max_per_ticker=MAX_NEWS_PER_TIC
     print(f"    原始数据检测到 {len(all_tickers)} 只股票。")
     
     # =============== S&P 500 过滤（推荐用于论文）===============
-    # 重要：为了与 dataset.py / train_full.py 的 ticker2idx 对齐，图的“节点顺序”固定为 all_tickers；
-    #       S&P500 模式只影响“哪些新闻参与建边”，以及“哪些 ticker 允许出现在边上”。
+    # V4 变更：图节点仅包含 S&P 500 成分股，训练脚本需读取 Graph_Tickers.json 对齐
     if use_sp500:
         # 兼容常见写法差异：BRK.B vs BRK-B（以及部分数据源用 '-' 替代 '.'）
         # 注意：这里仅用于“是否属于 S&P500”的判断，不改变图节点的 canonical 表示。
@@ -599,22 +598,24 @@ def build_dynamic_graph(use_llm=USE_LLM_DEFAULT, max_per_ticker=MAX_NEWS_PER_TIC
         active_tickers = all_tickers
         print(f"📌 [全量模式] 使用所有 {len(active_tickers)} 只股票")
     
-    # 图节点固定为 all_tickers（确保与训练数据 ticker2idx 对齐）
-    ticker2idx = {t: i for i, t in enumerate(all_tickers)}
-    alias2canonical = _build_ticker_alias_map(all_tickers)
-    num_nodes = len(all_tickers)
+    # 【V4 核心变更】图节点仅包含 active_tickers（S&P 500 模式下约500个）
+    # 这确保了邻接矩阵大小为 (N, N)，N ≈ 500，符合顶会论文标准
+    graph_tickers = active_tickers  # 图节点列表
+    ticker2idx = {t: i for i, t in enumerate(graph_tickers)}
+    alias2canonical = _build_ticker_alias_map(graph_tickers)
+    num_nodes = len(graph_tickers)
     active_set = set(active_tickers)
-    if active_tickers != all_tickers:
-        print(f"    图节点数保持为 {num_nodes}（全量 ticker），但仅对 {len(active_tickers)} 个 ticker 的新闻建边。")
-    else:
-        print(f"    最终使用 {num_nodes} 只股票构建图谱。")
 
-    # 保存 ticker 顺序，便于论文复现与排查索引对齐问题
-    tickers_meta_path = OUTPUT_GRAPH.replace(".npy", "_tickers.json")
+    print(f"    [V4 模式] 图节点数: {num_nodes} (仅包含 {'S&P 500' if use_sp500 else '全量'} 股票)")
+    if use_sp500 and num_nodes != len(all_tickers):
+        print(f"    原始数据包含 {len(all_tickers)} 只股票，过滤后保留 {num_nodes} 只")
+
+    # 保存图节点列表到标准文件（关键：供训练脚本对齐数据）
     try:
-        _atomic_save_json(tickers_meta_path, {"tickers": all_tickers})
-    except Exception:
-        pass
+        _atomic_save_json(OUTPUT_TICKERS, {"tickers": graph_tickers})
+        print(f"    [关键] 已保存节点列表至: {OUTPUT_TICKERS}")
+    except Exception as e:
+        print(f"    [WARN] 保存节点列表失败: {e}")
 
     if not os.path.exists(INPUT_NEWS):
         print(f"[WARN] 未找到新闻文件 {INPUT_NEWS}，保存单位阵。")

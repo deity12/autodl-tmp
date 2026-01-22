@@ -108,10 +108,28 @@ class FinancialDataset(Dataset):
         self.df['Date'] = pd.to_datetime(self.df['Date'])
         self.df = self.df.sort_values(['Ticker', 'Date']).reset_index(drop=True)
 
-        # 【GNN 支持】在划分 train/test 前，用全量 Ticker 构建 ticker->idx 映射
-        # 顺序与 build_graph.py、Final_Model_Data 的 sorted(unique) 一致，便于邻接矩阵对齐
-        all_tickers = sorted(self.df['Ticker'].unique())
-        self.ticker2idx = {t: i for i, t in enumerate(all_tickers)}
+        # 【GNN 支持 V4】读取图谱节点列表以确保索引对齐
+        # 如果 Graph_Tickers.json 存在，使用其中的节点顺序；否则使用数据中的全量 ticker
+        import json
+        graph_tickers_path = os.path.join(os.path.dirname(csv_path), 'Graph_Tickers.json')
+        if os.path.exists(graph_tickers_path):
+            try:
+                with open(graph_tickers_path, 'r') as f:
+                    graph_data = json.load(f)
+                    graph_tickers = graph_data.get('tickers', [])
+                print(f"    [V4 对齐] 从 Graph_Tickers.json 读取 {len(graph_tickers)} 个图节点")
+                self.ticker2idx = {t: i for i, t in enumerate(graph_tickers)}
+                # 过滤数据：只保留图中存在的股票
+                self.df = self.df[self.df['Ticker'].isin(set(graph_tickers))].copy()
+                print(f"    [V4 对齐] 过滤后数据包含 {self.df['Ticker'].nunique()} 只股票")
+            except Exception as e:
+                print(f"    [WARN] 读取 Graph_Tickers.json 失败: {e}，使用数据中的全量 ticker")
+                all_tickers = sorted(self.df['Ticker'].unique())
+                self.ticker2idx = {t: i for i, t in enumerate(all_tickers)}
+        else:
+            print(f"    [INFO] Graph_Tickers.json 不存在，使用数据中的全量 ticker")
+            all_tickers = sorted(self.df['Ticker'].unique())
+            self.ticker2idx = {t: i for i, t in enumerate(all_tickers)}
         
         # 2. 划分训练集与测试集
         dates = sorted(self.df['Date'].unique())
