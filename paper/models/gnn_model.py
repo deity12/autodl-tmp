@@ -1,16 +1,38 @@
 # -*- coding: utf-8 -*-
 """
-QL-MATCC-GNN 模型：在 Quantum-RWKV + MATCC 基础上融合 GNN（对应论文 2.4 动态图演化预测）
+Graph-RWKV 模型：基于大语言模型动态图谱与 Graph-RWKV 的时空解耦金融预测
 ========================================================================
+【核心创新点】根据新研究方向实现：
+
 架构：
-    1. MATCC：趋势/波动解耦
-    2. Quantum-RWKV：时序特征 H_temporal
-    3. GAT：基于 LLM 图谱的空间聚合 H_graph
-    4. 融合：Concat(H_temporal, H_graph) -> Linear -> 收益率预测
+    1. **RWKV 时间序列编码器**（时间维）：
+       - 利用 RWKV 的线性 Attention 机制（O(1) 推理复杂度）捕捉长程依赖
+       - 每个股票的特征序列独立进入 RWKV 模块
+       - 输出：包含时间上下文的节点嵌入 H_t ∈ R^(N×D)
+    
+    2. **动态图注意力网络 GAT**（空间维）：
+       - 基于 LLM 增强的情感加权混合图进行空间聚合
+       - 混合图包含：语义图（LLM提取的关系+情感极性）+ 统计图（收益率相关性）
+       - 使预测考虑到供应链上下游及竞争对手的实时状态
+       - 输出：空间聚合后的节点嵌入 H'_t = GAT(H_t, A_t^final)
+    
+    3. **时空特征融合**：
+       - Concat(H_temporal, H_graph) -> Linear -> 收益率预测
+       - 实现时空解耦建模，同时捕捉时间趋势和空间依赖
+
+【论文对应】：
+    - 时间维：RWKV-TimeSeries Encoder（对应论文 2.2 模块二）
+    - 空间维：动态图注意力（对应论文 2.1 模块一）
+    - 混合图：A_t^final = Norm(A_t^semantic + λ · A_t^stat)（对应论文 2.1）
 
 依赖：
-    - model.model：QL_MATCC_Model, Quantum_ChannelMixing, RWKV_TimeMixing, MATCCDecompose
-    - 邻接矩阵：./data/processed/Graph_Adjacency.npy（由 build_graph.py 生成）
+    - base_model：GraphRWKV_Model（新方向核心时序编码器）, RWKV_TimeMixing
+    - 邻接矩阵：./data/processed/Graph_Adjacency.npy（由 build_graph.py 生成，包含情感加权混合图）
+    
+【注意】以下组件在新方向中不使用，已注释：
+    - Quantum 量子计算相关代码
+    - MATCC 趋势解耦相关代码
+    - Market Guidance 市场引导相关代码
 """
 
 import torch
@@ -18,8 +40,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
-# 从同目录的 base_model.py 复用：QL_MATCC_Model、量子/经典通道、RWKV、MATCC 等
-from .base_model import QL_MATCC_Model, Quantum_ChannelMixing, RWKV_TimeMixing, MATCCDecompose
+# 从同目录的 base_model.py 复用：GraphRWKV_Model（新方向核心模型）、RWKV_TimeMixing
+from .base_model import GraphRWKV_Model, QL_MATCC_Model, RWKV_TimeMixing
+# 【注意】Quantum_ChannelMixing、MATCCDecompose 在新方向中不使用，已注释
 
 
 # ================= 1. 图注意力层 GAT (优化版) =================
@@ -108,14 +131,23 @@ class GraphAttentionLayer(nn.Module):
         return all_combinations_matrix.view(N, N, 2 * self.head_dim)
 
 
-# ================= 2. 完整模型 QL_MATCC_GNN_Model =================
-class QL_MATCC_GNN_Model(nn.Module):
+# ================= 2. Graph-RWKV 完整模型（新方向核心模型）=================
+class GraphRWKV_GNN_Model(nn.Module):
     """
-    【论文最终模型】QL-MATCC-GNN，改进点：
-    1. q_threshold 默认改为 0.5（只有高波动样本走量子通道）
-    2. 添加门控融合机制（Gated Fusion），自适应融合时序和图特征
-    3. 添加正则化层（Dropout + LayerNorm）
-    4. 改进残差连接
+    【新方向核心模型】Graph-RWKV：基于大语言模型动态图谱与 Graph-RWKV 的时空解耦金融预测
+    
+    【核心架构】：
+    1. RWKV 时间序列编码器（时间维）：
+       - 使用 GraphRWKV_Model 提取时序特征
+       - 输出：包含时间上下文的节点嵌入 H_t ∈ R^(N×D)
+    
+    2. 动态图注意力网络 GAT（空间维）：
+       - 基于 LLM 增强的情感加权混合图进行空间聚合
+       - 混合图包含：语义图（LLM提取的关系+情感极性）+ 统计图（收益率相关性）
+       - 输出：空间聚合后的节点嵌入 H'_t = GAT(H_t, A_t^final)
+    
+    3. 时空特征融合：
+       - Concat(H_temporal, H_graph) -> Linear -> 收益率预测
     """
 
     def __init__(
@@ -123,15 +155,9 @@ class QL_MATCC_GNN_Model(nn.Module):
         input_dim=8,
         n_embd=32,
         n_layers=2,
-        n_qubits=8,  # 【优化】默认8量子比特
         num_nodes=500,
         adj_matrix=None,
         gnn_embd=None,
-        use_matcc=True,
-        use_market_guidance=True,
-        use_quantum=True,
-        ma_window=5,
-        q_threshold=0.5,  # 【关键修改】默认阈值从 0.0 改为 0.5
         dropout=0.1,
         max_neighbors: int = 32,
     ):
@@ -139,21 +165,15 @@ class QL_MATCC_GNN_Model(nn.Module):
         gnn_embd = gnn_embd or min(n_embd, 64)
         self.max_neighbors = int(max_neighbors)
 
-        # ----- 1. 时序编码器：复用 QL_MATCC_Model，去掉 head，只做特征提取 -----
-        self.temporal_encoder = QL_MATCC_Model(
+        # ----- 1. 时序编码器：使用 GraphRWKV_Model（新方向核心）-----
+        self.temporal_encoder = GraphRWKV_Model(
             input_dim=input_dim,
             n_embd=n_embd,
             n_layers=n_layers,
-            n_qubits=n_qubits,
-            use_matcc=use_matcc,
-            use_market_guidance=use_market_guidance,
-            use_quantum=use_quantum,
-            ma_window=ma_window,
-            q_threshold=q_threshold,
             dropout=dropout,
         )
+        # 去掉 head，只做特征提取（供 GAT 使用）
         self.temporal_encoder.head = nn.Identity()
-        # 移除 temporal_encoder 的 pre_head_dropout，在这里统一处理
         self.temporal_encoder.pre_head_dropout = nn.Identity()
 
         # 若 GAT 使用较小维度以省显存，则先做投影
@@ -238,14 +258,14 @@ class QL_MATCC_GNN_Model(nn.Module):
                 neigh[i, : idx.numel()] = idx
         return neigh
 
-    def forward(self, x, vol, node_indices=None):
+    def forward(self, x, vol=None, node_indices=None):
         """
         x: (B, T, F) 输入序列
-        vol: (B, 1) 波动率，供 Quantum 分支使用
+        vol: (B, 1) 波动率（保留以兼容接口，但新方向中不使用）
         node_indices: (B,) 可选，当前 batch 各样本在整图中的节点索引；
                       若为 None，则用单位阵作为 batch 邻接（GNN 退化为仅自环，等价于 MLP）
         """
-        # Step 1: 时序特征 (B, n_embd)
+        # Step 1: 时序特征 (B, n_embd) - 使用 RWKV 时间编码器
         h_temporal = self.temporal_encoder(x, vol)
 
         # Step 2: 投影到 GAT 维度（若 gnn_embd != n_embd）
@@ -317,11 +337,10 @@ if __name__ == "__main__":
     adj = np.eye(10)
     adj[0, 1] = adj[1, 0] = 1
 
-    model = QL_MATCC_GNN_Model(
+    model = GraphRWKV_GNN_Model(
         input_dim=D,
         n_embd=32,
         n_layers=2,
-        n_qubits=4,
         num_nodes=10,
         adj_matrix=adj,
         gnn_embd=32,
@@ -329,4 +348,7 @@ if __name__ == "__main__":
 
     with torch.no_grad():
         y = model(x, vol, node_indices=None)
-    print("QL_MATCC_GNN_Model 测试通过, 输出形状:", y.shape)
+    print("GraphRWKV_GNN_Model 测试通过, 输出形状:", y.shape)
+
+# 为了向后兼容，创建别名
+QL_MATCC_GNN_Model = GraphRWKV_GNN_Model

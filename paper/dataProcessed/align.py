@@ -90,13 +90,18 @@ def align_all_data():
             df_news['Date'] = df_news['Date'].dt.tz_localize(None)
         
         # 【关键】聚合新闻：同一天同一个股票的多条新闻合并成一条
+        # 注意：这里的 Date 已经在 etl.py 中按 16:00 cut-off 规则对齐
+        # 即：16:00 之前的新闻归入当日，16:00 之后的归入次日
         print("正在聚合每日新闻 (这可能需要一点时间)...")
+        print("  [提示] 新闻日期已按 16:00 cut-off 规则对齐（在 etl.py 中完成）")
         # 自动识别新闻列名 (兼容 Headline 或 Article_title)
         text_col = 'Headline' if 'Headline' in df_news.columns else 'Article_title'
         
         if text_col in df_news.columns:
             # 填充空值防止报错
             df_news[text_col] = df_news[text_col].fillna("")
+            # 按对齐后的日期和股票代码聚合新闻
+            # 这样确保用于预测 T+1 日收益的新闻都是 T 日 16:00 之前发布的
             df_news_agg = df_news.groupby(['Date', 'Ticker'])[text_col].apply(
                 lambda x: ' | '.join(x.astype(str))
             ).reset_index()

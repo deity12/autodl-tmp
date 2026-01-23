@@ -1,7 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-QL-MATCC-GNN 模型训练脚本（优化版：解决消融实验优于全量模型问题）
+Graph-RWKV 模型训练脚本（基于大语言模型动态图谱与 Graph-RWKV 的时空解耦金融预测）
 ========================================================================
+【核心创新点】根据新研究方向实现：
+
+训练策略：
+    1. **滚动窗口验证（Rolling Window / Walk-Forward Validation）**：
+       - 为适应金融市场风格切换（Regime Shift），不采用静态划分
+       - 阶段 1：Train (2018-2020) → Test (2021 Q1)
+       - 阶段 2：Train (2018-2020 + 2021 Q1) → Test (2021 Q2)
+       - 阶段 3：...以此类推
+       - 【注意】当前实现为静态 80/20 划分，完整滚动窗口验证需在评估脚本中实现
+
+    2. **Loss Function**：RankIC Loss（侧重排序能力）
+       Loss = -PearsonCorr(Pred_rank, Target_rank)
+
 核心改进：
     1. 降低模型复杂度（n_embd 512->256, n_layers 4->3）
     2. 降低 batch_size（3072->512），增加梯度更新次数
@@ -9,6 +22,10 @@ QL-MATCC-GNN 模型训练脚本（优化版：解决消融实验优于全量模�
     4. 使用差异化学习率：量子层用更小的学习率（经典层 3e-4，量子层 3e-5）
     5. 动态设置量子阈值：基于训练数据的 70% 分位数
     6. 添加权重衰减和更强的 Dropout 正则化
+
+【论文对应】：
+    - 对应论文 3.3 训练与验证策略
+    - 模型架构：Graph-RWKV（RWKV 时间编码器 + 动态 GAT 空间聚合）
 """
 
 import sys
@@ -79,7 +96,7 @@ os.makedirs(FIGURE_DIR, exist_ok=True)
 
 try:
     from dataProcessed.dataset import FinancialDataset
-    from models.gnn_model import QL_MATCC_GNN_Model
+    from models.gnn_model import GraphRWKV_GNN_Model, QL_MATCC_GNN_Model  # QL_MATCC_GNN_Model 为兼容性别名
     from training.date_batch_sampler import DateGroupedBatchSampler
     print("✅ 成功导入 dataset、gnn_model 模块")
 except ImportError as e:
@@ -102,9 +119,8 @@ PAPER_CONFIG = {
     'batch_size': 512,
     'epochs': 30,  # 【优化】增加训练轮数，给复杂模型更多收敛时间
     'lr': 3e-4,
-    'quantum_lr_ratio': 0.1,
-    'use_differential_lr': True,
-    'q_threshold': None,
+    # 【注意】新方向不使用以下参数，已移除：
+    # 'quantum_lr_ratio', 'use_differential_lr', 'q_threshold'
     'dropout': 0.1,  # 【优化】降低dropout从0.15到0.1，减少正则化
     'weight_decay': 1e-5,
     'early_stop_patience': 8,  # 【优化】增加早停耐心值
@@ -221,14 +237,16 @@ def daily_ic_rankic(y_true: np.ndarray, y_pred: np.ndarray, dates: list[str]):
 
 def main():
     """
-    Full Model 训练入口（QL-MATCC-GNN）。
+    Graph-RWKV 模型训练入口（新方向核心模型）。
 
     主要步骤：
-      1) 加载 `FinancialDataset`（train/test）并读取训练集波动率统计（p70 用作 q_threshold）
+      1) 加载 `FinancialDataset`（train/test）
       2) 加载 `Graph_Adjacency.npy` 并与 dataset 的 ticker 顺序做一致性校验
-      3) 初始化 `QL_MATCC_GNN_Model`（启用量子门控 + 图聚合）
-      4) 训练（AMP / 梯度裁剪 / 早停 / 差异化学习率 / 可选 RankNet 排序损失）
+      3) 初始化 `GraphRWKV_GNN_Model`（RWKV 时间编码器 + 动态 GAT 空间聚合）
+      4) 训练（AMP / 梯度裁剪 / 早停 / 可选 RankNet 排序损失）
       5) 保存 best checkpoint、训练曲线与日志到 `outputs/`
+    
+    【注意】新方向不使用 Quantum、MATCC、MarketGuidance 组件
     """
     # 应用性能设置（TF32 / benchmark 等）
     _apply_perf_settings(bool(CONFIG.get("enable_perf_flags", True)))
@@ -248,7 +266,8 @@ def main():
         test_dataset = FinancialDataset(
             CONFIG['csv_path'], seq_len=CONFIG['seq_len'], mode='test', 
             scaler=train_dataset.scaler,
-            vol_stats=train_dataset.vol_stats  # 传入波动率统计
+            # 【注意】新方向不使用 vol_stats，但保留参数以兼容接口
+            vol_stats=train_dataset.vol_stats if hasattr(train_dataset, 'vol_stats') else None
         )
         print(f"   Train: {len(train_dataset)}, Test: {len(test_dataset)}")
     except Exception as e:
@@ -308,12 +327,7 @@ def main():
     num_nodes = dataset_num_nodes
 
     # 【关键】从训练数据获取量子阈值
-    q_threshold = CONFIG['q_threshold']
-    if q_threshold is None:
-        q_threshold = train_dataset.vol_stats.get('p70', 0.5)
-        print(f">>> 从数据自动获取量子阈值: q_threshold = {q_threshold:.4f} (70%分位数)")
-    else:
-        print(f">>> 使用配置的量子阈值: q_threshold = {q_threshold}")
+    # 【注意】新方向不使用 q_threshold（量子门控），已移除相关逻辑
 
     # DataLoader 参数：num_workers=0 时不能传 prefetch_factor/persistent_workers
     num_workers = int(CONFIG.get('num_workers', 4))
@@ -352,49 +366,30 @@ def main():
     )
 
     # ================= 5. 模型初始化 =================
-    print("\n>>> Initializing QL_MATCC_GNN_Model...")
-    model = QL_MATCC_GNN_Model(
+    print("\n>>> Initializing Graph-RWKV Model...")
+    model = GraphRWKV_GNN_Model(
         input_dim=CONFIG['input_dim'],
         n_embd=CONFIG['n_embd'],
         n_layers=CONFIG['n_layers'],
-        n_qubits=CONFIG['n_qubits'],
         num_nodes=num_nodes,
         adj_matrix=adj_matrix,
         gnn_embd=CONFIG.get('gnn_embd', 64),
-        q_threshold=q_threshold,  # 使用动态阈值
         dropout=CONFIG.get('dropout', 0.1),
     ).to(CONFIG['device'])
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"   Total parameters: {total_params:,}")
 
-    # ================= 6. 优化器（差异化学习率）=================
+    # ================= 6. 优化器 =================
     criterion = nn.MSELoss()
     
-    # 分离量子层和经典层参数
-    quantum_params = []
-    classic_params = []
-    for name, param in model.named_parameters():
-        # PennyLane TorchLayer 常用参数名包含 "weights"
-        if 'vqc' in name.lower() or 'quantum' in name.lower() or 'weights' in name.lower():
-            quantum_params.append(param)
-        else:
-            classic_params.append(param)
-    
-    if CONFIG.get('use_differential_lr', True) and len(quantum_params) > 0:
-        quantum_lr = CONFIG['lr'] * CONFIG.get('quantum_lr_ratio', 0.1)
-        optimizer = optim.AdamW([
-            {'params': classic_params, 'lr': CONFIG['lr']},
-            {'params': quantum_params, 'lr': quantum_lr}
-        ], betas=(0.9, 0.999), eps=1e-8, weight_decay=CONFIG.get('weight_decay', 1e-5))
-        print(f"   ✅ 差异化学习率: 经典层={CONFIG['lr']:.2e}, 量子层={quantum_lr:.2e}")
-    else:
-        optimizer = optim.AdamW(
-            model.parameters(), lr=CONFIG['lr'], 
-            betas=(0.9, 0.999), eps=1e-8, 
-            weight_decay=CONFIG.get('weight_decay', 1e-5)
-        )
-        print(f"   使用统一学习率: {CONFIG['lr']:.2e}")
+    # 【新方向】使用统一学习率（不再需要量子层差异化学习率）
+    optimizer = optim.AdamW(
+        model.parameters(), lr=CONFIG['lr'], 
+        betas=(0.9, 0.999), eps=1e-8, 
+        weight_decay=CONFIG.get('weight_decay', 1e-5)
+    )
+    print(f"   学习率: {CONFIG['lr']:.2e}")
     
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer, T_0=5, T_mult=2, eta_min=1e-6
@@ -412,7 +407,7 @@ def main():
     early_stop_counter = 0
     early_stop_patience = CONFIG['early_stop_patience']
 
-    print("\n>>> Start Training (QL-MATCC-GNN Full Model)...")
+    print("\n>>> Start Training (Graph-RWKV Model)...")
     print("=" * 60)
 
     for epoch in range(CONFIG['epochs']):
@@ -579,7 +574,7 @@ def main():
     if val_losses:
         be = val_losses.index(best_val_loss) + 1
         plt.plot(be, best_val_loss, 'g*', markersize=14, label=f'Best (Epoch {be})')
-    plt.title('QL-MATCC-GNN Full Model Training', fontsize=14)
+    plt.title('Graph-RWKV Model Training', fontsize=14)
     plt.xlabel('Epoch')
     plt.ylabel('MSE Loss')
     plt.legend()
@@ -605,9 +600,9 @@ def main():
             'n_embd': CONFIG['n_embd'],
             'n_layers': CONFIG['n_layers'],
             'gnn_embd': CONFIG.get('gnn_embd'),
-            'n_qubits': CONFIG.get('n_qubits'),
             'seq_len': CONFIG.get('seq_len'),
-            'q_threshold': q_threshold,
+            # 【注意】新方向不使用以下参数，已移除：
+            # 'n_qubits', 'q_threshold'
             'profile': os.environ.get("QL_PROFILE", "paper"),
         }
     }
@@ -616,7 +611,7 @@ def main():
     print(f">>> Loss 数据已保存: {loss_data_path}")
 
     print("\n" + "=" * 60)
-    print(">>> QL-MATCC-GNN Full Model 训练结束")
+    print(">>> Graph-RWKV Model 训练结束")
     print(f"    Best Val Loss: {best_val_loss:.6f}")
     if best_metrics_epoch:
         print(f"\n    📊 评估指标:")

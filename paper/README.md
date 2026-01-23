@@ -1,6 +1,16 @@
-# QL-MATCC-GNN：LLM 建图 + Quantum-RWKV 时序建模 + MATCC 趋势解耦 + GNN 融合（金融收益预测/风险评估）
+# Graph-RWKV：基于大语言模型动态图谱与 Graph-RWKV 的时空解耦金融预测
 
-本目录 `paper/` 是一套可复现实验工程：从 FNSPID 原始行情/新闻出发，完成 **数据清洗与对齐 → LLM 语义关系建图 → QL-MATCC-GNN 训练 → 评估与出图**。
+本目录 `paper/` 是一套可复现实验工程：从 FNSPID 原始行情/新闻出发，完成 **数据清洗与对齐 → LLM 语义关系建图（含情感极性）→ Graph-RWKV 训练 → 评估与出图**。
+
+【新方向核心】：
+- **RWKV 时间序列编码器**：O(1) 推理复杂度，高效处理长周期金融时序特征
+- **LLM 增强的情感加权混合图**：语义图（LLM提取的关系+情感极性）+ 统计图（收益率相关性）
+- **动态图注意力网络 GAT**：基于混合图进行空间聚合
+
+【注意】以下组件在新方向中不使用，已注释：
+- Quantum 量子计算相关代码
+- MATCC 趋势解耦相关代码
+- Market Guidance 市场引导相关代码
 
 > 这份 README 以“代码真实实现”为准：每一步对应到具体脚本、明确输入/输出文件、给出可直接运行的命令，并指出最常见的坑（例如图谱 tickers 顺序不一致、评估脚本模型维度不匹配等）。
 
@@ -30,10 +40,10 @@
 
 ```bash
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-pip install pennylane pandas numpy scikit-learn matplotlib tqdm akshare transformers
+pip install pandas numpy scikit-learn matplotlib tqdm akshare transformers
 ```
 
-> 说明：量子模块依赖 `pennylane`，如遇到 `autoray` 兼容问题，`models/base_model.py` 会提示你用 `pip install autoray==0.6.5 pennylane --upgrade` 修复。
+> 【注意】新方向不使用 Quantum 量子计算，因此不再需要 `pennylane` 依赖。
 
 ---
 
@@ -83,15 +93,14 @@ python -m dataProcessed.align
 # 3) 建图：从训练期新闻抽取股票关系（输出 Graph_Adjacency.npy + tickers.json）
 python -m dataProcessed.build_graph --use_llm
 
-# 4) 训练 Full Model（输出 best_model_full.pth + logs/figures）
-python -m training.train_full
+# 4) 训练全量模型（输出 best_model.pth + logs/figures）
+python 3_train.py
 
-# 5) 消融实验（默认 3 组：no_quantum / no_matcc / no_graph）
-python -m training.train_ablation
+# 5) 消融实验（新方向：w/o_graph, w/o_semantic, w/o_statistical, w/o_sentiment）
+python 3_train_ablation.py --ablation all
 
 # 6) 评估与出图
-python -m evaluation.evaluate_all
-python -m evaluation.evaluate_by_group
+python 4_evaluate.py --checkpoint ./outputs/best_model.pth --test_data ./data/processed/test.csv
 ```
 
 ### 方式 B：只跑 LLM 建图（长任务，建议 screen/tmux）
@@ -148,23 +157,20 @@ cd /root/autodl-tmp/paper
 ### `models/`：模型定义
 
 - `base_model.py`：时序主干（不含图）
-  - **MATCC**：因果滑动平均做趋势/波动解耦
-  - **RWKV**：时间混合层（JIT 加速），使用完整线性层保证表达能力
-  - **Quantum_ChannelMixing**：按波动率门控，高波动样本走量子分支（8量子比特 + 4层纠缠，256维希尔伯特空间）
-- `gnn_model.py`：完整模型 `QL_MATCC_GNN_Model`
-  - 先用 `QL_MATCC_Model` 提取时序表征
+  - **RWKV_TimeMixing**：时间混合层（JIT 加速），使用完整线性层保证表达能力
+  - **Classical_ChannelMixing**：经典 FFN 通道混合（新方向使用纯经典，不使用量子）
+  - **GraphRWKV_Model**：Graph-RWKV 时序编码器（新方向核心模型）
+- `gnn_model.py`：完整模型 `GraphRWKV_GNN_Model`（新方向核心模型）
+  - 先用 `GraphRWKV_Model` 提取时序表征（RWKV 时间编码器）
   - 再在 `Graph_Adjacency.npy` 上做双头稀疏 GAT 聚合（含 mini-batch 邻居扩展/诱导子图）
   - 融合后输出收益率预测
 
 ### `training/`：训练与消融
 
-- `train_full.py`：训练完整模型（默认配置：`n_embd=256, n_layers=3, n_qubits=8, gnn_embd=64, batch=512, epochs=30, dropout=0.1`）
-  - 从 `FinancialDataset` 的 `vol_stats['p70']` 自动取 `q_threshold`（量子门控阈值）
-  - 支持 AMP、梯度裁剪、早停、差异化学习率、按日期分组 batch、可选 RankNet 排序损失
-- `train_ablation.py`：消融实验（与论文/代码一致的 3 组）
-  - `no_quantum`：去掉量子模块
-  - `no_matcc`：去掉趋势解耦
-  - `no_graph`：去掉 GNN 图聚合
+- `train_full.py`：训练完整模型（默认配置：`n_embd=256, n_layers=3, gnn_embd=64, batch=512, epochs=30, dropout=0.1`）
+  - 支持 AMP、梯度裁剪、早停、按日期分组 batch、可选 RankNet 排序损失
+  - 【注意】新方向不使用量子门控，不再需要 q_threshold 和差异化学习率
+- `train_ablation.py`：消融实验（已注释：新方向不使用 Quantum、MATCC，不再需要这些消融实验）
 - `date_batch_sampler.py`：按 `target_date` 做 batch 的采样器（股票排序/RankIC 口径常用）
 
 ### `evaluation/`：评估与可视化
@@ -188,11 +194,12 @@ cd /root/autodl-tmp/paper
 ### 训练阶段（`paper/outputs/`）
 
 - `outputs/checkpoints/`
-  - `best_model_full.pth`
-  - `best_model_no_quantum.pth`
-  - `best_model_no_matcc.pth`
-  - `best_model_no_graph.pth`
-- `outputs/logs/`：训练过程与 loss 历史（json）
+  - `best_model.pth`（全量模型，由 3_train.py 生成）
+  - `best_model_ablation_w/o_graph.pth`（消融实验，由 3_train_ablation.py 生成）
+  - `best_model_ablation_w/o_semantic.pth`
+  - `best_model_ablation_w/o_statistical.pth`
+  - `best_model_ablation_w/o_sentiment.pth`
+- `outputs/logs/`：训练日志（每次运行自动生成，包含时间戳）
 - `outputs/figures/`：训练曲线、对比图（png）
 - `outputs/results/`：评估结果表（csv）
 
@@ -286,7 +293,7 @@ python -m dataProcessed.build_graph --use_llm
 
 ```bibtex
 @article{ql-matcc-gnn,
-  title={基于 LLM 语义增强与 Quantum-RWKV 时空解耦的金融风险评估研究},
+  title={基于大语言模型动态图谱与 Graph-RWKV 的时空解耦金融预测研究},
   author={Your Name},
   journal={...},
   year={2024}
@@ -295,8 +302,7 @@ python -m dataProcessed.build_graph --use_llm
 
 参考工作（方法/灵感来源）：
 
-- `https://github.com/caozhiy/MATCC`
-- `https://github.com/ChiShengChen/QuantumRWKV`
+- 【注意】新方向不使用 MATCC 和 Quantum-RWKV，相关参考已移除
 - `https://pennylane.ai/`
 
 ---

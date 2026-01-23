@@ -2,23 +2,33 @@
 PyTorch Dataset：将 `Final_Model_Data.csv` 转换为可训练样本（Step 4）
 ====================================================
 
+【核心创新点】根据新研究方向，本模块支持 Graph-RWKV 模型的数据加载：
+
 本模块提供 `FinancialDataset`，用于：
   - 数据清洗（裁剪极端值、处理 NaN/Inf）
   - 按时间 80/20 切分 train/test（避免未来信息泄露）
+     【注意】完整滚动窗口验证需在评估脚本中实现（见论文 3.3）
   - 特征标准化（训练集 fit，测试集 transform）
   - 以“同一股票”为单位构造滑动窗口序列样本
-  - 计算训练集波动率分位数 `vol_stats`（常用 p70 作为量子门控阈值）
+  - 计算训练集波动率分位数 `vol_stats`（已注释：新方向不使用量子门控）
   - 构建 `ticker2idx`，并在 `__getitem__` 返回 `node_indices` 供 GNN 使用
+     【关键】确保与 Graph_Tickers.json 中的节点顺序一致，避免索引错位
 
 输入：
   - `data/processed/Final_Model_Data.csv`（来自 `dataProcessed/align.py`）
+  - `data/processed/Graph_Tickers.json`（来自 `dataProcessed/build_graph.py`，用于节点对齐）
 
 输出（每条样本，dict）：
-  - `x`: (seq_len, input_dim) 过去若干天特征
-  - `y`: (1,) 目标日对数收益率
-  - `vol`: (1,) 波动率（最后一日）
-  - `node_indices`: (,) 股票节点索引（用于图聚合）
+  - `x`: (seq_len, input_dim) 过去若干天特征（输入 RWKV 时间编码器）
+  - `y`: (1,) 目标日对数收益率（预测目标）
+  - `vol`: (1,) 波动率（最后一日，保留以兼容接口，但新方向中不使用）
+  - `node_indices`: (,) 股票节点索引（用于 GAT 空间聚合）
   - `target_date`: str 目标日期（用于按日期截面 IC/RankIC 或按日分组 batch）
+
+【论文对应】：
+    - 对应论文 3.1 数据集准备
+    - 支持 RWKV 时间序列编码器的输入格式
+    - 支持动态图注意力网络的节点索引对齐
 """
 
 import pandas as pd
@@ -170,34 +180,18 @@ class FinancialDataset(Dataset):
         self.data_vol = self.df['Volatility_20d'].values.astype(np.float32)
         
         # =======================================================
-        # 【新增】计算波动率分位数，用于动态设置量子阈值
+        # 【注意】新方向不使用量子门控，vol_stats 计算已注释
         # =======================================================
+        # 为了兼容接口，保留 vol_stats 但设为空字典
         if mode == 'train':
-            # 在标准化后的波动率上计算分位数
-            vol_col_idx = self.feature_cols.index('Volatility_20d')
-            vol_standardized = self.data_x[:, vol_col_idx]  # 标准化后的波动率
-            self.vol_stats = {
-                'mean': float(np.mean(vol_standardized)),
-                'std': float(np.std(vol_standardized)),
-                'p50': float(np.percentile(vol_standardized, 50)),  # 中位数
-                'p60': float(np.percentile(vol_standardized, 60)),
-                'p70': float(np.percentile(vol_standardized, 70)),  # 推荐阈值
-                'p80': float(np.percentile(vol_standardized, 80)),
-                'p90': float(np.percentile(vol_standardized, 90)),
-                'min': float(np.min(vol_standardized)),
-                'max': float(np.max(vol_standardized)),
-            }
-            print(f"📊 波动率统计（标准化后）:")
-            print(f"   mean={self.vol_stats['mean']:.3f}, std={self.vol_stats['std']:.3f}")
-            print(f"   p50={self.vol_stats['p50']:.3f}, p70={self.vol_stats['p70']:.3f}, p90={self.vol_stats['p90']:.3f}")
-            print(f"   ⭐ 推荐量子阈值 q_threshold: {self.vol_stats['p70']:.3f} (70%分位数)")
+            # 【已注释】新方向不使用量子门控，不再需要计算波动率分位数
+            # vol_col_idx = self.feature_cols.index('Volatility_20d')
+            # vol_standardized = self.data_x[:, vol_col_idx]
+            # self.vol_stats = {...}
+            self.vol_stats = {}  # 空字典以兼容接口
         else:
-            if vol_stats is None:
-                # 如果测试时没提供 vol_stats，使用默认值
-                self.vol_stats = {'p70': 0.5}
-                print("⚠️ 测试模式未提供 vol_stats，使用默认阈值 0.5")
-            else:
-                self.vol_stats = vol_stats
+            # 兼容接口，但新方向中不使用
+            self.vol_stats = vol_stats if vol_stats is not None else {}
         
         # 4. 构建滑动窗口索引（确保不跨股票拼接序列）
         print("正在构建滑动窗口索引...")

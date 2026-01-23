@@ -30,6 +30,14 @@ if not os.path.exists(OUTPUT_DIR):
 START_DATE = '2019-01-01'  # 起始日期
 END_DATE = '2023-12-31'    # 结束日期
 
+# ================= 16:00 Cut-off 时间配置 =================
+# 【核心创新点】严格的前瞻偏差规避：严禁使用未来信息
+# 根据论文要求，设定每日 16:00（收盘时间）为界：
+# - T 日 16:00 之前发布的新闻 → 构建 T 日的图 → 参与预测 T+1 日收益
+# - T 日 16:00 之后发布的新闻 → 归入 T+1 日数据流
+CUTOFF_HOUR = 16  # 美股收盘时间（16:00 ET）
+CUTOFF_MINUTE = 0
+
 # ================= 任务1：合并股价数据 =================
 def merge_stock_prices():
     """
@@ -152,13 +160,48 @@ def process_huge_news_file(valid_tickers):
     
     # 逐块处理数据
     for i, chunk in enumerate(reader):
-        # 1. 时间处理：过滤指定时间范围的数据
+        # 1. 时间处理：过滤指定时间范围的数据，并实现 16:00 cut-off 对齐
         if 'Date' in chunk.columns:
             # 将日期列转换为datetime类型，无效日期转为NaN
+            # 注意：如果原始数据包含时间戳（如 '2023-01-01 15:30:00'），pd.to_datetime 会自动解析
             chunk['Date'] = pd.to_datetime(chunk['Date'], errors='coerce')
             # 删除日期为NaN的行
             chunk = chunk.dropna(subset=['Date'])
-            # 只保留指定时间范围内的数据
+            
+            # 【关键创新】16:00 Cut-off 时间对齐逻辑
+            # 如果 Date 列包含时间信息（datetime），则根据时间判断归属日期
+            # 如果 Date 列只有日期信息（date），则默认归入当日（假设为收盘前发布）
+            if chunk['Date'].dtype == 'datetime64[ns]':
+                # 提取日期部分（不包含时间）
+                chunk['Date_Only'] = chunk['Date'].dt.date
+                # 提取时间部分（小时和分钟）
+                chunk['Time'] = chunk['Date'].dt.time
+                
+                # 判断每条新闻是否在 16:00 之前发布
+                # 如果时间 >= 16:00，则归入次日；否则归入当日
+                cutoff_time = pd.Timestamp(f"{CUTOFF_HOUR:02d}:{CUTOFF_MINUTE:02d}").time()
+                chunk['Is_Before_Cutoff'] = chunk['Time'] < cutoff_time
+                
+                # 根据 cut-off 规则调整日期归属
+                # 16:00 之前的新闻归入当日，16:00 之后的归入次日
+                chunk['Aligned_Date'] = chunk['Date_Only'].copy()
+                # 16:00 之后的新闻，日期加1天
+                mask_after_cutoff = ~chunk['Is_Before_Cutoff']
+                if mask_after_cutoff.any():
+                    chunk.loc[mask_after_cutoff, 'Aligned_Date'] = (
+                        pd.to_datetime(chunk.loc[mask_after_cutoff, 'Date_Only']) + pd.Timedelta(days=1)
+                    ).dt.date
+                
+                # 使用对齐后的日期替换原始 Date 列
+                chunk['Date'] = pd.to_datetime(chunk['Aligned_Date'])
+                
+                # 清理临时列
+                chunk = chunk.drop(columns=['Date_Only', 'Time', 'Is_Before_Cutoff', 'Aligned_Date'], errors='ignore')
+            else:
+                # 如果只有日期信息，默认归入当日（假设为收盘前发布）
+                chunk['Date'] = pd.to_datetime(chunk['Date'])
+            
+            # 只保留指定时间范围内的数据（使用对齐后的日期）
             chunk = chunk[(chunk['Date'] >= START_DATE) & (chunk['Date'] <= END_DATE)]
         
         # 2. 股票代码处理：只保留有对应股价数据的股票新闻

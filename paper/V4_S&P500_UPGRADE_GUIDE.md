@@ -27,14 +27,14 @@
 **关键代码位置**：
 - [dataset.py:111-133](dataProcessed/dataset.py#L111-L133) - 读取 Graph_Tickers.json 并过滤数据
 
-### 3. 论文文档 ([newpaper.md](newpaper.md))
+### 3. 论文文档
 
 **变更内容**：
 - 更新主要贡献，强调 S&P 500 核心资产策略
 - 新增 S&P 500 核心域过滤小节
 - 增加 MASTER (AAAI 2024) 和 ADGAT (ICASSP 2024) baseline
 - 新增投资组合回测指标（Sharpe Ratio, Annualized Return, Max Drawdown）
-- 新增 RQ3：图构建方法对比实验
+- 【注意】新方向文档见 `new.md`，旧文档 `newpaper.md` 已删除
 
 ## 完整运行顺序
 

@@ -1,21 +1,29 @@
 """
-QL-MATCC 基础时序模型组件（不含图）
-=================================
+Graph-RWKV 基础时序模型组件（时间维编码器）
+===========================================
 
 本模块实现论文/工程中的“时序主干”，主要由三部分组成：
 
 1) **MATCC 趋势解耦**：
    - 用严格因果的滑动平均把序列分为 trend 与 fluctuation（避免未来信息泄露）
 
-2) **RWKV 时序编码器**：
-   - 使用 RWKV 的 TimeMixing（并用 torch.jit.script 加速关键算子）
+2) **RWKV 时间序列编码器**（核心组件）：
+   - 使用 RWKV 的 TimeMixing 实现线性 Attention 机制（并用 torch.jit.script 加速关键算子）
+   - 计算复杂度：O(1) 推理（相比 Transformer 的 O(L²)）
+   - 能够高效处理长周期金融时序特征（如过去 3-5 年的日线数据）
+   - 结合了 RNN 的线性推理效率和 Transformer 的并行训练能力
+   - 输出：包含时间上下文的节点嵌入 H_t ∈ R^(N×D)
 
-3) **Quantum / Classical Channel Mixing（量子门控）**：
-   - `Quantum_ChannelMixing`：根据样本波动率 `vol` 与阈值 `q_threshold` 决定是否走量子分支
-   - 低波动：走纯经典 FFN；高波动：走 PennyLane VQC 分支，并通过可学习缩放因子稳定训练
+2) **经典通道混合（Classical Channel Mixing）**：
+   - 使用经典 FFN 进行特征变换
+   - 与 RWKV 时间混合层配合，形成完整的时序编码器
+
+【论文对应】：
+    - 对应论文 2.2 模块二：Graph-RWKV 时空编码器的时间维部分
+    - RWKV 作为时间序列编码器，独立处理每个股票的特征序列
 
 上层模型：
-  - `QL_MATCC_Model`：组合上述组件输出收益预测（供 `models/gnn_model.py` 复用）
+  - `QL_MATCC_Model`：组合上述组件输出时序特征（供 `models/gnn_model.py` 的 GAT 层使用）
 
 依赖：
   - PennyLane（量子线路模拟）；如依赖版本不兼容，本文件会给出安装/修复提示。
@@ -27,24 +35,26 @@ import torch.nn.functional as F
 import numpy as np
 
 # ================= 依赖检查和导入 =================
-try:
-    import pennylane as qml
-except ImportError as e:
-    raise ImportError(
-        "[错误] PennyLane 导入失败。请运行以下命令修复依赖版本：\n"
-        "   pip install autoray==0.6.5 pennylane --upgrade\n"
-        f"   原始错误: {e}"
-    )
-except AttributeError as e:
-    if "'autoray.autoray' has no attribute 'NumpyMimic'" in str(e):
-        raise ImportError(
-            "[错误] PennyLane 与 autoray 版本不兼容！\n"
-            "   解决方法：运行以下命令修复依赖版本：\n"
-            "   pip install autoray==0.6.5 pennylane --upgrade\n"
-            f"   原始错误: {e}"
-        )
-    else:
-        raise
+# 【注意】新方向不使用 Quantum，因此不再需要 PennyLane
+# 以下代码已注释，如需使用 Quantum 功能可取消注释
+# try:
+#     import pennylane as qml
+# except ImportError as e:
+#     raise ImportError(
+#         "[错误] PennyLane 导入失败。请运行以下命令修复依赖版本：\n"
+#         "   pip install autoray==0.6.5 pennylane --upgrade\n"
+#         f"   原始错误: {e}"
+#     )
+# except AttributeError as e:
+#     if "'autoray.autoray' has no attribute 'NumpyMimic'" in str(e):
+#         raise ImportError(
+#             "[错误] PennyLane 与 autoray 版本不兼容！\n"
+#             "   解决方法：运行以下命令修复依赖版本：\n"
+#             "   pip install autoray==0.6.5 pennylane --upgrade\n"
+#             f"   原始错误: {e}"
+#         )
+#     else:
+#         raise
 
 # ================= 0. JIT 加速的核心算子 (已修复 CUDA 编译错误 + FP16 溢出) =================
 @torch.jit.script
@@ -90,42 +100,27 @@ def rwkv_linear_attention_cpu(time_decay: torch.Tensor,
         
     return wkv
 
-# ================= 1. 量子层定义 =================
-class VQC_Block(nn.Module):
-    """
-    变分量子线路（VQC）封装为 PyTorch 模块。
-
-    - 输入：形如 (batch, n_qubits) 的角度参数（通常已映射到 [0, π]）
-    - 输出：对每个 qubit 的 PauliZ 期望值（范围约 [-1, 1]）
-
-    说明：本实现使用 `default.qubit` 作为模拟器（CPU），稳定性最好；
-    如需 GPU 加速量子模拟，可研究 `pennylane-lightning-gpu`（需额外安装）。
-
-    【优化】增强量子容量：8量子比特（256维希尔伯特空间）+ 4层纠缠
-    """
-    def __init__(self, n_qubits=8, n_layers=4):
-        super().__init__()
-        self.n_qubits = n_qubits
-        
-        # 使用 default.qubit (CPU模拟器)，稳定性最好
-        # 如果你想尝试 GPU 加速量子模拟，需要安装 pennylane-lightning-gpu
-        self.dev = qml.device("default.qubit", wires=n_qubits)
-        
-        @qml.qnode(self.dev, interface="torch")
-        def _circuit(inputs, weights):
-            # 1. 编码层
-            qml.AngleEmbedding(inputs, wires=range(n_qubits))
-            # 2. 强纠缠层
-            qml.StronglyEntanglingLayers(weights, wires=range(n_qubits))
-            # 3. 测量层
-            return [qml.expval(qml.PauliZ(i)) for i in range(n_qubits)]
-            
-        self.qnode = _circuit
-        weight_shapes = {"weights": (n_layers, n_qubits, 3)}
-        self.vqc_layer = qml.qnn.TorchLayer(self.qnode, weight_shapes)
-
-    def forward(self, x):
-        return self.vqc_layer(x)
+# ================= 1. 量子层定义（已注释：新方向不使用）=================
+# 【注意】新方向不使用 Quantum 量子计算，以下代码已注释保留
+# class VQC_Block(nn.Module):
+#     """
+#     变分量子线路（VQC）封装为 PyTorch 模块。
+#     新方向中不使用，已注释。
+#     """
+#     def __init__(self, n_qubits=8, n_layers=4):
+#         super().__init__()
+#         self.n_qubits = n_qubits
+#         self.dev = qml.device("default.qubit", wires=n_qubits)
+#         @qml.qnode(self.dev, interface="torch")
+#         def _circuit(inputs, weights):
+#             qml.AngleEmbedding(inputs, wires=range(n_qubits))
+#             qml.StronglyEntanglingLayers(weights, wires=range(n_qubits))
+#             return [qml.expval(qml.PauliZ(i)) for i in range(n_qubits)]
+#         self.qnode = _circuit
+#         weight_shapes = {"weights": (n_layers, n_qubits, 3)}
+#         self.vqc_layer = qml.qnn.TorchLayer(self.qnode, weight_shapes)
+#     def forward(self, x):
+#         return self.vqc_layer(x)
 
 # ================= 2. RWKV 核心组件 (优化版) =================
 class RWKV_TimeMixing(nn.Module):
@@ -167,23 +162,17 @@ class RWKV_TimeMixing(nn.Module):
 
         return self.output(r * wkv)
 
-# ================= 2.5 因果滑动平均 (Causal Moving Average) =================
-def causal_moving_avg(x: torch.Tensor, k: int) -> torch.Tensor:
-    """
-    因果滑动平均：在时间维上，每个时刻 t 只使用 x[0:t+1] 的最近 k 个点做平均。
-    完全向量化，无循环，GPU 友好；保证不泄露未来信息。
-
-    优化原因：金融预测必须因果，用 cumsum 实现 O(T) 且可并行，比 conv1d 更易控制边界。
-    """
-    B, T, D = x.shape
-    c = torch.cumsum(x, dim=1)  # c[b,t,d] = sum(x[b,0:t+1,d])
-    c_pad = F.pad(c, (0, 0, k, 0), value=0)  # (B, T+k, D)，前面补 k 个 0
-    # sum(x[t-k+1:t+1]) = c[t] - c[t-k]；c_pad 左移后 [:,k:,:] 对应 c[0]..c[T-1]，[:,:T,:] 对应 c[-k]..c[T-1-k]
-    c_shift = c_pad[:, :T, :]  # c_shift[b,t,d] = c_pad[b,t,d] = c[b,t-k,d] 当 t>=k，否则 0
-    # 当 t<k: 用 sum(x[0:t+1])=c[t]，count=t+1；当 t>=k: sum=c[t]-c[t-k]，count=k
-    count = torch.arange(1, T + 1, device=x.device, dtype=x.dtype).view(1, -1, 1)
-    count = torch.minimum(count, torch.tensor(k, device=x.device, dtype=x.dtype))
-    return (c - c_shift) / count.clamp(min=1e-8)
+# ================= 2.5 因果滑动平均（已注释：新方向不使用 MATCC）=================
+# 【注意】新方向不使用 MATCC 趋势解耦，以下代码已注释保留
+# def causal_moving_avg(x: torch.Tensor, k: int) -> torch.Tensor:
+#     """因果滑动平均：在时间维上，每个时刻 t 只使用 x[0:t+1] 的最近 k 个点做平均。"""
+#     B, T, D = x.shape
+#     c = torch.cumsum(x, dim=1)
+#     c_pad = F.pad(c, (0, 0, k, 0), value=0)
+#     c_shift = c_pad[:, :T, :]
+#     count = torch.arange(1, T + 1, device=x.device, dtype=x.dtype).view(1, -1, 1)
+#     count = torch.minimum(count, torch.tensor(k, device=x.device, dtype=x.dtype))
+#     return (c - c_shift) / count.clamp(min=1e-8)
 
 
 # ================= 2.6 MATCC 趋势解耦 (Trend Decomposition) =================
@@ -233,11 +222,13 @@ class MarketGuidance(nn.Module):
         return h.transpose(1, 2)  # (B, T, n_embd)
 
 
-# ================= 2.8 纯经典通道混合 (消融 w/o Quantum 用) =================
+# ================= 2.8 经典通道混合（核心组件）=================
 class Classical_ChannelMixing(nn.Module):
     """
-    纯经典 FFN，与 Quantum_ChannelMixing 的 FFN 结构一致，用于 use_quantum=False。
-    放在 model.py 便于统一消融；model_classical 可复用或自实现以摆脱 PennyLane 依赖。
+    经典通道混合：使用 FFN 进行特征变换。
+    
+    【核心组件】新方向使用纯经典 FFN，不使用量子计算。
+    与 RWKV 时间混合层配合，形成完整的时序编码器。
     """
 
     def __init__(self, n_embd: int, dropout: float = 0.1):
@@ -251,185 +242,109 @@ class Classical_ChannelMixing(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor, vol: torch.Tensor = None) -> torch.Tensor:
+        # vol 参数保留以兼容接口，但新方向中不使用
         return self.layer_norm(x + self.dropout(self.ffn(x)))
 
+# ================= 3. 量子-经典混合通道（已注释：新方向不使用）=================
+# 【注意】新方向不使用 Quantum 量子计算，以下代码已注释保留
+# class Quantum_ChannelMixing(nn.Module):
+#     """量子-经典混合通道。新方向中不使用，已注释。"""
+#     def __init__(self, n_embd, n_qubits=8, q_threshold=0.5, dropout: float = 0.1):
+#         super().__init__()
+#         self.n_embd = n_embd
+#         self.n_qubits = n_qubits
+#         self.q_threshold = q_threshold
+#         self.ffn = nn.Sequential(
+#             nn.Linear(n_embd, n_embd * 4),
+#             nn.GELU(),
+#             nn.Linear(n_embd * 4, n_embd)
+#         )
+#         self.proj_down = nn.Linear(n_embd, n_qubits)
+#         self.vqc = VQC_Block(n_qubits=n_qubits)
+#         self.proj_up = nn.Linear(n_qubits, n_embd)
+#         self.quantum_scale = nn.Parameter(torch.tensor(0.5))
+#         self.layer_norm = nn.LayerNorm(n_embd)
+#         self.dropout = nn.Dropout(dropout)
+#     def forward(self, x, vol):
+#         # 量子分支逻辑已注释
+#         return self.layer_norm(x + self.dropout(self.ffn(x)))
 
-# ================= 3. 量子-经典混合通道 (优化版 V2) =================
-class Quantum_ChannelMixing(nn.Module):
+# ================= 4. Graph-RWKV 时序编码器模型（核心模型）=================
+class GraphRWKV_Model(nn.Module):
     """
-    量子-经典混合通道，核心改进：
-    1. q_threshold 默认使用波动率 70% 分位数（约 0.5~1.0），而非 0.0
-    2. 量子输出缩放：添加可学习的缩放因子，稳定训练
-    3. 残差连接：量子分支也使用残差，防止梯度消失
-    4. 梯度裁剪兼容：使用 clamp 防止数值溢出
-
-    【优化】增强量子容量：8量子比特 + 4层纠缠
+    Graph-RWKV 时序编码器模型（新方向核心模型）。
+    
+    【核心架构】：
+    1. 输入投影：Linear(input_dim -> n_embd)
+    2. N 层 RWKV Block：
+       - RWKV_TimeMixing：时间维线性注意力
+       - Classical_ChannelMixing：经典 FFN 通道混合
+    3. 输出：最后一个时间步的特征向量
+    
+    【论文对应】：
+    - 对应论文 2.2 模块二：Graph-RWKV 时空编码器的时间维部分
+    - 输出时序特征供 GAT 层进行空间聚合
     """
-    def __init__(self, n_embd, n_qubits=8, q_threshold=0.5, dropout: float = 0.1):
-        super().__init__()
-        self.n_embd = n_embd
-        self.n_qubits = n_qubits
-        # 【关键修复】阈值默认 0.5，对应标准化后波动率的约 60-70% 分位数
-        # 这样只有真正高波动的样本才进入量子通道
-        self.q_threshold = q_threshold
-        
-        # 经典 FFN 分支
-        self.ffn = nn.Sequential(
-            nn.Linear(n_embd, n_embd * 4),
-            nn.GELU(),
-            nn.Linear(n_embd * 4, n_embd)
-        )
-        
-        # 量子分支
-        self.proj_down = nn.Linear(n_embd, n_qubits)
-        self.vqc = VQC_Block(n_qubits=n_qubits)
-        self.proj_up = nn.Linear(n_qubits, n_embd)
-        
-        # 【优化】量子输出缩放因子，增大初始值以充分利用量子容量
-        self.quantum_scale = nn.Parameter(torch.tensor(0.5))
-        
-        self.layer_norm = nn.LayerNorm(n_embd)
-        
-        # 【新增】Dropout 正则化（与论文/训练脚本保持一致）
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x, vol):
-        # 错误处理：Batch一致性检查
-        assert x.shape[0] == vol.shape[0], f"Batch size mismatch: X({x.shape[0]}) vs Vol({vol.shape[0]})"
-        
-        batch_size = x.shape[0]
-        out = torch.zeros_like(x)
-        
-        # 广播判断高风险样本（波动率超过阈值）
-        # vol 已经过标准化，阈值 0.5 约对应 60-70% 分位数
-        is_high_risk = (vol > self.q_threshold).reshape(-1)
-        
-        high_risk_idx = torch.where(is_high_risk)[0]
-        normal_idx = torch.where(~is_high_risk)[0]
-        
-        # --- 量子分支（高波动样本）---
-        if len(high_risk_idx) > 0:
-            x_q = x[high_risk_idx]
-            Bq, T, C = x_q.shape
-            x_q_flat = x_q.view(-1, C)
-            
-            # 【改进】更稳定的归一化：使用 sigmoid 映射到 [0, pi]
-            # sigmoid 输出在 [0, 1]，比 tanh 更平滑，梯度更稳定
-            proj_out = self.proj_down(x_q_flat)
-            # Clamp 防止数值过大导致 sigmoid 饱和
-            proj_out = proj_out.clamp(-10, 10)
-            q_in = torch.sigmoid(proj_out) * np.pi
-            
-            # VQC 前向
-            q_out = self.vqc(q_in)  # (Bq*T, n_qubits), 输出范围 [-1, 1]
-            
-            # 投影回高维 + 缩放
-            x_q_out = self.proj_up(q_out).view(Bq, T, C)
-            # 【关键】使用可学习的缩放因子，初始时量子贡献较小
-            x_q_out = x_q_out * torch.abs(self.quantum_scale)
-            
-            # 残差连接 + Dropout
-            out[high_risk_idx] = x_q + self.dropout(x_q_out)
-            
-        # --- 经典分支（正常样本）---
-        if len(normal_idx) > 0:
-            x_c = x[normal_idx]
-            out[normal_idx] = x_c + self.dropout(self.ffn(x_c))
-            
-        return self.layer_norm(out)
-
-# ================= 4. 整体模型（支持 MATCC / 市场引导 / 量子 消融）=================
-class QL_MATCC_Model(nn.Module):
-    """
-    QL-MATCC 模型，改进点：
-    1. q_threshold 默认改为 0.5（对应标准化后的中高波动率分位数）
-    2. 添加 Dropout 正则化防止过拟合
-    3. 改进特征融合方式
-    """
-    # 市场指数列索引（与 dataset.feature_cols 对应）
-    # ['Open', 'Close', 'High', 'Low', 'Volume', 'Market_Close', 'Market_Vol', 'Volatility_20d']
-    MARKET_FEATURE_NAMES = ['Market_Close', 'Market_Vol']
-
+    
     def __init__(
         self,
         input_dim=8,
         n_embd=32,
         n_layers=2,
-        n_qubits=8,  # 【优化】默认8量子比特
-        use_matcc=True,
-        use_market_guidance=True,
-        use_quantum=True,
-        ma_window=5,
-        q_threshold=0.5,  # 【关键修改】默认阈值从 0.0 改为 0.5
         dropout=0.1,
     ):
         super().__init__()
-        self.use_matcc = use_matcc
-        self.use_market_guidance = use_market_guidance
-        self.use_quantum = use_quantum
-
-        if use_matcc:
-            self.decompose = MATCCDecompose(input_dim, n_embd, ma_window=ma_window)
-        else:
-            self.embedding = nn.Linear(input_dim, n_embd)
-
-        if use_market_guidance:
-            self.market_guidance = MarketGuidance(n_embd, market_dim=2)
-        else:
-            self.market_guidance = None
-
+        
+        # 输入投影层
+        self.embedding = nn.Linear(input_dim, n_embd)
+        
+        # RWKV 层堆叠
         self.layers = nn.ModuleList()
         for _ in range(n_layers):
-            ch = (
-                Quantum_ChannelMixing(n_embd, n_qubits=n_qubits, q_threshold=q_threshold, dropout=dropout)
-                if use_quantum
-                else Classical_ChannelMixing(n_embd, dropout=dropout)
-            )
             self.layers.append(
                 nn.ModuleDict({
                     'time_mix': RWKV_TimeMixing(n_embd),
                     'layer_norm1': nn.LayerNorm(n_embd),
-                    'channel_mix': ch,
+                    'channel_mix': Classical_ChannelMixing(n_embd, dropout=dropout),
                     'layer_norm2': nn.LayerNorm(n_embd),
                 })
             )
         
-        # 【新增】输出头前的 Dropout 正则化
+        # 输出头前的 Dropout 正则化
         self.pre_head_dropout = nn.Dropout(dropout)
         self.head = nn.Linear(n_embd, 1)
 
-    def forward(self, x: torch.Tensor, vol: torch.Tensor) -> torch.Tensor:
-        # 动态获取市场指数列索引（基于特征名称）
-        # 假设 dataset.feature_cols = ['Open', 'Close', 'High', 'Low', 'Volume', 'Market_Close', 'Market_Vol', 'Volatility_20d']
-        # 这里使用硬编码作为后备，但建议从 dataset 传入
-        try:
-            # 简化：直接使用已知索引，但添加注释说明依赖关系
-            market_idx_start = 5  # Market_Close 的索引
-            market_idx_end = 7    # Market_Vol 之后的索引
-        except (AttributeError, TypeError):
-            market_idx_start = 5
-            market_idx_end = 7
-
-        # 消融 w/o Market Guidance：从输入中移除大盘，与论文「移除大盘指数输入」一致
-        M = x[:, :, market_idx_start:market_idx_end]
-        if not self.use_market_guidance:
-            x = x.clone()
-            x[:, :, market_idx_start:market_idx_end] = 0.0
-
-        if self.use_matcc:
-            h = self.decompose(x)
-        else:
-            h = self.embedding(x)
-
-        if self.market_guidance is not None:
-            h = h + self.market_guidance(M)
-
+    def forward(self, x: torch.Tensor, vol: torch.Tensor = None) -> torch.Tensor:
+        """
+        x: (B, T, F) 输入序列
+        vol: (B, 1) 波动率（保留以兼容接口，但新方向中不使用）
+        """
+        # 输入投影
+        h = self.embedding(x)
+        
+        # RWKV 层堆叠
         for layer in self.layers:
             h = h + layer['time_mix'](layer['layer_norm1'](h))
             h = layer['channel_mix'](layer['layer_norm2'](h), vol)
-
+        
         # 取最后一个时间步 + Dropout + 线性头
         return self.head(self.pre_head_dropout(h[:, -1, :]))
+
+# ================= 5. 兼容性模型（已注释：保留旧接口）=================
+# 【注意】为了兼容旧代码，保留 QL_MATCC_Model 作为别名，但默认关闭所有可选组件
+# class QL_MATCC_Model(nn.Module):
+#     """兼容性别名，实际使用 GraphRWKV_Model"""
+#     def __init__(self, input_dim=8, n_embd=32, n_layers=2, 
+#                  use_matcc=False, use_market_guidance=False, use_quantum=False,
+#                  dropout=0.1, **kwargs):
+#         super().__init__()
+#         # 直接使用 GraphRWKV_Model
+#         self.model = GraphRWKV_Model(input_dim, n_embd, n_layers, dropout)
+#     def forward(self, x, vol=None):
+#         return self.model(x, vol)
+
+# 为了向后兼容，创建别名
+QL_MATCC_Model = GraphRWKV_Model
 
 # ================= 测试入口 =================
 if __name__ == "__main__":
@@ -442,14 +357,14 @@ if __name__ == "__main__":
     x = torch.randn(B, T, D).to(device)
     vol = (torch.rand(B, 1) * 3).to(device) # 0~3之间随机
     
-    # 初始化模型
-    model = QL_MATCC_Model(input_dim=D, n_embd=16, n_qubits=4).to(device)
+    # 初始化模型（新方向：Graph-RWKV）
+    model = GraphRWKV_Model(input_dim=D, n_embd=16, n_layers=2).to(device)
     
     print("\n>>> Testing Forward Pass...")
     try:
         y_pred = model(x, vol)
         print(f"Output Shape: {y_pred.shape}")
-        print("[成功] Optimized Quantum-RWKV Forward pass successful!")
+        print("[成功] Graph-RWKV Forward pass successful!")
         
         # 验证 JIT 是否工作
         # 只要没有报错，说明 torch.jit.script 编译成功

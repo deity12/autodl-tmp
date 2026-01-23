@@ -1,0 +1,195 @@
+# Codex 代码优化快速提示词（更新版）
+
+## 项目背景
+Graph-RWKV：基于大语言模型动态图谱与 Graph-RWKV 的时空解耦金融预测研究
+
+核心架构：
+- 时间维：RWKV 时间序列编码器（GraphRWKV_Model，O(1) 推理复杂度）
+- 空间维：动态图注意力网络 GAT（基于 LLM 增强的情感加权混合图）
+- 数据对齐：16:00 Cut-off 机制，严格避免前瞻偏差
+
+## 🖥️ 服务器配置（重要！）
+- GPU: 48GB VRAM (vGPU-48GB-350W) × 1
+- CPU: 12 vCPU Intel Xeon Platinum 8260 @ 2.40GHz
+- RAM: 90GB
+- Disk: 50GB 数据盘
+- PyTorch 2.1.2, Python 3.10, CUDA 11.8, Ubuntu 22.04
+
+## 🎯 核心要求（最重要！）
+
+### 1. 傻瓜式运行（直接点击运行，无需命令行）
+- 重构为 5 个独立可运行的脚本：
+  - `1_preprocess_data.py` - 数据预处理
+  - `2_build_graph.py` - 构建图谱
+  - `3_train.py` - 全量模型训练（完整架构）
+  - `3_train_ablation.py` - 消融实验训练（w/o_graph, w/o_semantic, w/o_statistical, w/o_sentiment）
+  - `4_evaluate.py` - 评估模型
+- **可以直接在 IDE 中点击运行**，配置直接写在 py 文件里（不使用 config.yaml，已删除）
+- **所有配置参数都在脚本顶部**，方便修改
+- 命令行参数是可选的，用于覆盖默认配置
+- 全量模型训练和消融实验分开，避免混淆
+- 示例：
+  ```bash
+  # 数据预处理
+  python 1_preprocess_data.py --input_dir ./data/raw --output_dir ./data/processed
+  
+  # 构建图谱
+  python 2_build_graph.py --news ./data/processed/Stock_News.csv --output ./data/processed
+  
+  # 全量模型训练
+  python 3_train.py --data ./data/processed/Final_Model_Data.csv --graph ./data/processed/Graph_Adjacency.npy --output ./outputs --batch_size 1024
+  
+  # 消融实验（单个）
+  python 3_train_ablation.py --data ./data/processed/Final_Model_Data.csv --graph ./data/processed/Graph_Adjacency.npy --ablation w/o_graph --output ./outputs
+  
+  # 消融实验（所有）
+  python 3_train_ablation.py --data ./data/processed/Final_Model_Data.csv --graph ./data/processed/Graph_Adjacency.npy --ablation all --output ./outputs
+  
+  # 评估模型
+  python 4_evaluate.py --checkpoint ./outputs/best_model.pth --test_data ./data/processed/test.csv
+  ```
+
+### 2. 日志系统（重要！每次运行自动保存）
+- **每次运行自动保存日志到文件**
+- **日志文件命名包含时间戳**：`train_20260123_143025.log`
+- **日志内容**：时间戳、步骤、进度、错误、资源使用等
+- **同时输出到控制台和文件**，方便实时查看和后续检查
+- **日志格式清晰**，方便调试和修改代码
+- **示例日志内容**：
+  ```
+  2026-01-23 14:30:25 - INFO - 开始训练 Graph-RWKV 模型
+  2026-01-23 14:30:26 - INFO - 步骤 1/5: 加载数据...
+  2026-01-23 14:30:30 - INFO - 数据加载完成，训练集: 10000 样本
+  2026-01-23 14:30:31 - INFO - 步骤 2/5: 初始化模型...
+  2026-01-23 14:30:35 - INFO - Epoch 1/30 完成，Loss: 0.0234
+  ```
+
+### 3. 充分利用硬件
+- 48GB GPU：batch_size=1024+，seq_len=60+，启用 TF32，torch.compile
+- 90GB RAM：数据预加载到 RAM，内存映射文件
+- 12 vCPU：num_workers=8-10，多进程数据加载
+
+## 优化任务（按优先级）
+
+### P0：脚本重构（最高优先级）
+1. 将现有代码重构为 5 个独立可运行脚本
+2. **可以直接点击运行**：使用脚本中的默认配置，无需命令行参数
+3. **完善的日志系统**：每次运行自动保存日志到文件（包含时间戳）
+4. 全量模型训练（3_train.py）和消融实验（3_train_ablation.py）分开
+5. 命令行参数可选（用于覆盖默认配置）
+6. 添加进度条（tqdm）和中文提示
+7. 添加错误处理和友好提示
+8. 消融实验支持单个运行或批量运行所有
+
+### P1：性能优化（针对 48GB GPU + 90GB RAM）
+1. RWKV TimeMixing：
+   - 使用 torch.compile 加速（PyTorch 2.1.2）
+   - 启用 TF32 精度
+   - 支持 batch_size=1024+，seq_len=60+
+   - 参考 RWKV-LM 官方实现
+
+2. GAT 层：
+   - 使用 PyTorch Geometric 的 GATv2Conv 替代手动实现
+   - 支持边权重（情感分数）
+   - 参考 ADGAT 实现
+
+3. 数据加载：
+   - num_workers=8-10（充分利用 12 vCPU）
+   - 数据预加载到 RAM（90GB 足够）
+   - pin_memory=True, prefetch_factor=4
+
+### P2：代码质量
+1. 添加完整类型注解（typing 模块）
+2. 增强错误处理（输入验证、友好错误消息）
+3. 标准化文档字符串（中文，Google 风格）
+
+## 参考资源（论文公开源码）
+1. RWKV-LM: https://github.com/BlinkDL/RWKV-LM
+2. ADGAT: https://github.com/RuichengFIC/ADGAT
+3. PyTorch Geometric: https://github.com/pyg-team/pytorch_geometric
+4. FinGPT: https://github.com/AI4Finance-Foundation/FinGPT
+
+## 代码规范
+- PEP 8 风格，Black 格式化（行长度 100）
+- 中文注释（项目要求）
+- 类型注解：函数参数和返回值
+- 命名：类 PascalCase，函数 snake_case，常量 UPPER_SNAKE_CASE
+
+## 验收标准
+- ✅ 5 个独立可运行脚本，**可以直接点击运行**（无需命令行）
+- ✅ **每次运行自动保存日志到文件**（包含时间戳，如 train_20260123_143025.log）
+- ✅ 日志内容完整：时间戳、步骤、进度、错误、资源使用
+- ✅ 全量模型训练和消融实验分开（3_train.py 和 3_train_ablation.py）
+- ✅ 消融实验支持：w/o_graph, w/o_semantic, w/o_statistical, w/o_sentiment
+- ✅ 训练速度：batch_size=1024 时，每个 epoch < 5 分钟
+- ✅ GPU 利用率：> 90%，GPU 内存使用 30-40GB
+- ✅ 通过 mypy 类型检查
+- ✅ 所有函数有完整中文文档字符串
+
+## 注意事项
+- **配置直接写在 py 文件里**，不使用 config.yaml
+- **所有配置参数都在脚本顶部**，用大写常量定义（如 DATA_CSV_PATH, TRAIN_BATCH_SIZE）
+- 保持向后兼容（保留 QL_MATCC_Model 等别名）
+- 渐进式优化，每次优化后测试
+- 更新相关文档
+- 参考论文源码但不要照搬，要适配我们的架构
+
+## 📌 使用哪个提示词文件？
+
+**推荐使用：`CODEX_QUICK_PROMPT.txt`**
+
+原因：
+- ✅ 更简洁，包含所有核心要点
+- ✅ 适合直接复制给 Codex
+- ✅ 重点突出：直接点击运行、日志系统、配置写在文件里
+
+**详细版：`CODEX_OPTIMIZATION_PROMPT.md`**
+
+用途：
+- 📖 详细参考文档
+- 📖 包含完整的代码示例
+- 📖 深入理解优化方向
+
+**建议使用流程**：
+1. 先复制 `CODEX_QUICK_PROMPT.txt` 给 Codex
+2. 如果需要更多细节，参考 `CODEX_OPTIMIZATION_PROMPT.md`
+
+## 💡 额外建议
+
+### 1. 项目结构
+- 创建 requirements.txt（明确版本）
+- **配置直接写在 py 文件里**（不使用 config.yaml，已删除）
+- 创建 check_environment.py（环境检查）
+- 创建 run_all.py（一键运行完整流程）
+
+### 2. 日志系统（重要！）
+- **每次运行自动创建新的日志文件**（包含时间戳）
+- 使用 logging 模块，同时输出到文件和控制台
+- 日志文件命名：`{script_name}_{YYYYMMDD}_{HHMMSS}.log`
+- 日志内容：时间戳、步骤、进度、错误、资源使用
+- 记录关键步骤（如 "步骤 1/5: 加载数据..."）
+- 记录配置参数（batch_size、epochs 等）
+- 记录训练进度（每个 epoch 的 loss）
+- 完整的错误信息和堆栈跟踪
+
+### 3. 数据管理（50GB 磁盘）
+- 使用压缩格式（npz, parquet）
+- 清理临时文件
+- 支持断点续跑
+- 数据检查点机制
+
+### 4. 性能监控
+- 监控 CPU、内存、GPU 使用
+- 记录训练时间和资源消耗
+- 自动生成训练报告
+
+### 5. 实验管理
+- 实验命名（时间戳或描述性）
+- 保存完整配置和参数
+- Git 版本记录
+
+### 6. README 完善
+- 快速开始指南
+- 常见问题解答
+- 性能优化建议
+- 示例命令
