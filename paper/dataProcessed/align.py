@@ -40,6 +40,12 @@ MARKET_INDEX_PATH = './data/raw/FNSPID/SP500_Index.csv'
 # 3. 最终输出路径
 OUTPUT_FILE = './data/processed/Final_Model_Data.csv'
 
+# Alpha158（轻量）特征配置
+USE_ALPHA158 = False
+ALPHA_OUTPUT_FILE = './data/processed/sp500_alpha158_features.parquet'
+FEATURE_COLUMNS_PATH = './data/processed/feature_columns.json'
+FEATURE_TARGET_DIM = 100  # 论文规范：50~100 个 Alpha158-like 因子即可（不强求 158）
+
 # ================= 主逻辑：数据对齐 =================
 def align_all_data():
     """
@@ -67,6 +73,13 @@ def align_all_data():
     print("正在读取股价数据...")
     df_price = pd.read_csv(PROCESSED_PRICE_PATH)
     df_price['Date'] = pd.to_datetime(df_price['Date'])
+    if "Ticker" in df_price.columns:
+        df_price["Ticker"] = (
+            df_price["Ticker"]
+            .astype(str)
+            .str.upper()
+            .str.replace("-", ".", regex=False)
+        )
     # 确保按Date和Ticker排序，便于后续计算
     df_price = df_price.sort_values(['Ticker', 'Date']).reset_index(drop=True)
     
@@ -82,6 +95,13 @@ def align_all_data():
     if os.path.exists(PROCESSED_NEWS_PATH):
         df_news = pd.read_csv(PROCESSED_NEWS_PATH, low_memory=False)  # 修复 mixed types 警告
         df_news['Date'] = pd.to_datetime(df_news['Date'])
+        if "Ticker" in df_news.columns:
+            df_news["Ticker"] = (
+                df_news["Ticker"]
+                .astype(str)
+                .str.upper()
+                .str.replace("-", ".", regex=False)
+            )
         
         # 【关键修复】统一时区格式：如果Date列带时区，转换为无时区的datetime
         # 这样可以避免合并时的时区不匹配错误
@@ -169,9 +189,29 @@ def align_all_data():
     merged_df['Volatility_20d'] = merged_df['Volatility_20d'].fillna(0)
     merged_df['Log_Ret'] = merged_df['Log_Ret'].fillna(0)
 
-    # 保存
+    # 保存基础数据
     print(f"正在保存最终文件至 {OUTPUT_FILE} ...")
     merged_df.to_csv(OUTPUT_FILE, index=False)
+    print("✅ 基础数据已保存。")
+
+    # 可选：生成 Alpha158-like 因子（独立落盘为 Parquet，供 DataLoader 读取并 merge）
+    if USE_ALPHA158:
+        try:
+            from dataProcessed.feature_engineering import build_feature_file
+
+            print(">>> 开始生成 Alpha158-like 因子（pandas-ta 优先）...")
+            out_path, cols = build_feature_file(
+                prices_csv=PROCESSED_PRICE_PATH,
+                output_parquet=ALPHA_OUTPUT_FILE,
+                feature_columns_path=FEATURE_COLUMNS_PATH,
+                n_features=FEATURE_TARGET_DIM,
+                use_pandas_ta=True,
+            )
+            print(f"✅ Alpha158-like 因子已保存: {out_path} (dim={len(cols)})")
+            print(f"✅ 特征列清单已保存: {FEATURE_COLUMNS_PATH}")
+        except Exception as e:
+            print(f"⚠️ Alpha158-like 因子生成失败: {e}")
+
     print("✅ 全部完成！你的数据已经准备好进入模型了。")
     print("包含列:", merged_df.columns.tolist())
     print(f"数据总行数: {len(merged_df)}")

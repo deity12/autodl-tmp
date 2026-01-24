@@ -30,7 +30,7 @@
 
 ### 1.3 输出文件（复现/断点续跑/审计）
 
-- **节点顺序元数据**：`data/processed/Graph_Adjacency_tickers.json`
+- **节点顺序元数据**：`data/processed/Graph_Tickers.json`
   - 内容：`{"tickers": [ ... all_tickers ... ]}`
   - 用途：保证和训练阶段 `dataset.py` 的 `ticker2idx` 对齐；也便于论文复现实验。
 
@@ -60,7 +60,7 @@
 
 - `all_tickers = sorted(self.df['Ticker'].unique())`
 
-因此 `build_graph.py` 也固定使用 `Final_Model_Data.csv` 的 `Ticker` 作为**节点全集**与**节点顺序**，并写入 `Graph_Adjacency_tickers.json`。  
+因此 `build_graph.py` 也固定使用 `Final_Model_Data.csv` 的 `Ticker` 作为**节点全集**与**节点顺序**，并写入 `Graph_Tickers.json`。  
 即使开启 `S&P 500` 模式，也**不会改变邻接矩阵的节点数量与顺序**，只会影响：
 
 - 哪些新闻参与建边（新闻会先按 S&P 500 过滤）
@@ -246,7 +246,7 @@ LLM Prompt 固定输出 JSON 列表，关系类型限定为 6 类：
 常用 sanity check：
 
 1. `Graph_Adjacency.npy` 存在且形状为 `(N,N)`  
-2. `Graph_Adjacency_tickers.json` 的 `tickers` 长度等于 `N`  
+2. `Graph_Tickers.json` 的 `tickers` 长度等于 `N`  
 3. 若 LLM 模式：`Graph_Adjacency_relation_stats.json` 中 `relation_type_counts` 非空（否则说明抽取失败率高或数据问题）
 
 ---
@@ -263,7 +263,7 @@ S&P 500 模式只影响建边数据与边的允许范围，不改变 `Graph_Adja
 只要满足：
 
 - 训练数据的 `ticker2idx` 来自同一份 `Final_Model_Data.csv`
-- 图谱由同目录下的 `build_graph.py` 生成（会写入 `Graph_Adjacency_tickers.json`）
+- 图谱由同目录下的 `build_graph.py` 生成（会写入 `Graph_Tickers.json`）
 
 则 `node_indices` 一定与邻接矩阵对齐。
 

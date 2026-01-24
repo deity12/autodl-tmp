@@ -9,6 +9,7 @@ paper/data/processed/*.npy
 *.pt
 *.pth
 *.onnx
+paper/data/raw/
 
 # 忽略缓存和临时文件
 __pycache__/

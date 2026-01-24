@@ -46,8 +46,22 @@ class FinancialDataset(Dataset):
     3. 改进的数据清洗流程
     4. 添加数据增强选项（可选）
     """
-    def __init__(self, csv_path, seq_len=30, pred_len=1, mode='train', scaler=None, 
-                 vol_stats=None, use_robust_scaler=False):
+    def __init__(
+        self,
+        csv_path,
+        features_path=None,
+        seq_len=30,
+        pred_len=1,
+        mode='train',
+        scaler=None,
+        vol_stats=None,
+        use_robust_scaler=False,
+        start_date=None,
+        end_date=None,
+        use_date_split=True,
+        feature_cols=None,
+        feature_columns_path=None,
+    ):
         """
         参数说明:
             csv_path: 清洗后的数据文件 Final_Model_Data.csv 的路径
@@ -69,17 +83,77 @@ class FinancialDataset(Dataset):
         self.pred_len = pred_len
         self.mode = mode
         self.use_robust_scaler = use_robust_scaler
+        self.features_path = features_path
+        self.split_date = None
+        self.start_date = start_date
+        self.end_date = end_date
 
-        # 【关键对齐】统一股票代码格式为大写，确保与 build_graph.py 输出的 Graph_Adjacency_tickers.json 一致
+        # 【关键对齐】统一股票代码格式为大写，确保与 build_graph.py 输出的 Graph_Tickers.json 一致
         # 避免出现因大小写差异导致的“图谱索引错位”（最危险：不一定报错，但会让训练结果失真）
         if 'Ticker' in self.df.columns:
-            self.df['Ticker'] = self.df['Ticker'].astype(str).str.upper()
+            # 与 build_graph / filter_sp500 统一：大小写归一 + '-'/' .' 归一（如 BRK-B -> BRK.B）
+            self.df['Ticker'] = (
+                self.df['Ticker']
+                .astype(str)
+                .str.upper()
+                .str.replace("-", ".", regex=False)
+            )
             # 清理异常 ticker（极少数情况下会出现 NaN -> "NAN"）
             self.df = self.df[self.df['Ticker'] != 'NAN'].copy()
         
         # 定义特征列和目标列
-        self.feature_cols = ['Open', 'Close', 'High', 'Low', 'Volume', 'Market_Close', 'Market_Vol', 'Volatility_20d']
+        default_feature_cols = [
+            'Open', 'Close', 'High', 'Low', 'Volume',
+            'Market_Close', 'Market_Vol', 'Volatility_20d',
+        ]
+        if feature_cols is not None:
+            self.feature_cols = list(feature_cols)
+        else:
+            if feature_columns_path is None:
+                feature_columns_path = os.path.join(os.path.dirname(csv_path), 'feature_columns.json')
+            if os.path.exists(feature_columns_path):
+                try:
+                    import json
+                    with open(feature_columns_path, 'r', encoding='utf-8') as f:
+                        self.feature_cols = json.load(f)
+                    print(f"    [特征] 从 {feature_columns_path} 读取特征列，共 {len(self.feature_cols)} 维")
+                except Exception as e:
+                    print(f"    [WARN] 读取特征列失败: {e}，回退默认 8 维特征")
+                    self.feature_cols = default_feature_cols
+            else:
+                self.feature_cols = default_feature_cols
         self.target_col = 'Log_Ret'
+
+        # 如果特征列不在主 CSV 中，则尝试从外部特征文件（Parquet）合并进来。
+        # 这与“Alpha158-like 因子单独落盘为 Parquet”流程对齐。
+        missing_cols = [c for c in self.feature_cols if c not in self.df.columns]
+        if missing_cols:
+            # 默认在同目录查找：sp500_alpha158_features.parquet
+            feat_path = features_path
+            if feat_path is None:
+                candidate = os.path.join(os.path.dirname(csv_path), "sp500_alpha158_features.parquet")
+                if os.path.exists(candidate):
+                    feat_path = candidate
+
+            if feat_path and os.path.exists(feat_path):
+                try:
+                    df_feat = pd.read_parquet(feat_path)
+                    df_feat["Date"] = pd.to_datetime(df_feat["Date"], errors="coerce")
+                    df_feat["Ticker"] = (
+                        df_feat["Ticker"]
+                        .astype(str)
+                        .str.upper()
+                        .str.replace("-", ".", regex=False)
+                    )
+                    # 左连接：保留主数据的交易日与样本定义
+                    self.df = self.df.merge(df_feat, on=["Date", "Ticker"], how="left")
+                except Exception as e:
+                    raise ValueError(f"特征列缺失且外部特征文件读取/合并失败: {feat_path}, err={e}") from e
+
+                missing_cols = [c for c in self.feature_cols if c not in self.df.columns]
+
+            if missing_cols:
+                raise ValueError(f"特征列不存在: {missing_cols}")
         
         # =======================================================
         # 🛡️ 【改进】鲁棒性数据清洗防火墙
@@ -141,19 +215,26 @@ class FinancialDataset(Dataset):
             all_tickers = sorted(self.df['Ticker'].unique())
             self.ticker2idx = {t: i for i, t in enumerate(all_tickers)}
         
-        # 2. 划分训练集与测试集
-        dates = sorted(self.df['Date'].unique())
-        if len(dates) < 2:
-            raise ValueError(f"数据量不足：仅找到 {len(dates)} 个日期。")
+        # 2. 日期过滤与切分
+        if start_date or end_date:
+            if start_date:
+                self.df = self.df[self.df['Date'] >= pd.to_datetime(start_date)].copy()
+            if end_date:
+                self.df = self.df[self.df['Date'] <= pd.to_datetime(end_date)].copy()
+        elif use_date_split:
+            dates = sorted(self.df['Date'].unique())
+            if len(dates) < 2:
+                raise ValueError(f"数据量不足：仅找到 {len(dates)} 个日期。")
+                
+            split_idx = int(len(dates) * 0.8)
+            split_idx = min(split_idx, len(dates) - 1)
+            split_date = dates[split_idx]
+            self.split_date = pd.to_datetime(split_date)
             
-        split_idx = int(len(dates) * 0.8)
-        split_idx = min(split_idx, len(dates) - 1)
-        split_date = dates[split_idx]
-        
-        if mode == 'train':
-            self.df = self.df[self.df['Date'] < split_date].copy()
-        else:
-            self.df = self.df[self.df['Date'] >= split_date].copy()
+            if mode == 'train':
+                self.df = self.df[self.df['Date'] < split_date].copy()
+            else:
+                self.df = self.df[self.df['Date'] >= split_date].copy()
             
         # 【关键修复】重置索引！避免后续滑动窗口出错
         self.df = self.df.reset_index(drop=True)
@@ -287,5 +368,10 @@ if __name__ == "__main__":
     print(f"  - 输入序列长度: {train_dataset.seq_len}")
     print(f"  - 预测步长: {train_dataset.pred_len}")
     print(f"  - 特征维度数: {len(train_dataset.feature_cols)}")
-    print(f"  - 波动率分位数 (p70): {train_dataset.vol_stats['p70']:.4f}")
-    print(f"  - 推荐量子阈值: {train_dataset.vol_stats['p70']:.4f}")
+    p70 = train_dataset.vol_stats.get('p70') if hasattr(train_dataset, "vol_stats") else None
+    if p70 is not None:
+        print(f"  - 波动率分位数 (p70): {p70:.4f}")
+        print(f"  - 推荐量子阈值: {p70:.4f}")
+    else:
+        print("  - 波动率分位数 (p70): N/A")
+        print("  - 推荐量子阈值: N/A")

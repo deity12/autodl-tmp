@@ -162,17 +162,17 @@ class RWKV_TimeMixing(nn.Module):
 
         return self.output(r * wkv)
 
-# ================= 2.5 因果滑动平均（已注释：新方向不使用 MATCC）=================
-# 【注意】新方向不使用 MATCC 趋势解耦，以下代码已注释保留
-# def causal_moving_avg(x: torch.Tensor, k: int) -> torch.Tensor:
-#     """因果滑动平均：在时间维上，每个时刻 t 只使用 x[0:t+1] 的最近 k 个点做平均。"""
-#     B, T, D = x.shape
-#     c = torch.cumsum(x, dim=1)
-#     c_pad = F.pad(c, (0, 0, k, 0), value=0)
-#     c_shift = c_pad[:, :T, :]
-#     count = torch.arange(1, T + 1, device=x.device, dtype=x.dtype).view(1, -1, 1)
-#     count = torch.minimum(count, torch.tensor(k, device=x.device, dtype=x.dtype))
-#     return (c - c_shift) / count.clamp(min=1e-8)
+# ================= 2.5 因果滑动平均（兼容保留）=================
+# 【注意】新方向不使用 MATCC 趋势解耦，但为兼容旧接口保留该实现
+def causal_moving_avg(x: torch.Tensor, k: int) -> torch.Tensor:
+    """因果滑动平均：在时间维上，每个时刻 t 只使用 x[0:t+1] 的最近 k 个点做平均。"""
+    B, T, D = x.shape
+    c = torch.cumsum(x, dim=1)
+    c_pad = F.pad(c, (0, 0, k, 0), value=0)
+    c_shift = c_pad[:, :T, :]
+    count = torch.arange(1, T + 1, device=x.device, dtype=x.dtype).view(1, -1, 1)
+    count = torch.minimum(count, torch.tensor(k, device=x.device, dtype=x.dtype))
+    return (c - c_shift) / count.clamp(min=1e-8)
 
 
 # ================= 2.6 MATCC 趋势解耦 (Trend Decomposition) =================
@@ -329,6 +329,73 @@ class GraphRWKV_Model(nn.Module):
         
         # 取最后一个时间步 + Dropout + 线性头
         return self.head(self.pre_head_dropout(h[:, -1, :]))
+
+
+class RNN_TemporalEncoder(nn.Module):
+    """
+    轻量 RNN 时间编码器：支持 LSTM/GRU。
+    用于消融实验替代 RWKV。
+    """
+
+    def __init__(
+        self,
+        input_dim: int = 8,
+        n_embd: int = 128,
+        n_layers: int = 2,
+        dropout: float = 0.1,
+        rnn_type: str = "lstm",
+    ):
+        super().__init__()
+        self.embedding = nn.Linear(input_dim, n_embd)
+        rnn_type = rnn_type.lower()
+        if rnn_type == "gru":
+            self.rnn = nn.GRU(
+                input_size=n_embd,
+                hidden_size=n_embd,
+                num_layers=n_layers,
+                batch_first=True,
+                dropout=dropout if n_layers > 1 else 0.0,
+            )
+        else:
+            self.rnn = nn.LSTM(
+                input_size=n_embd,
+                hidden_size=n_embd,
+                num_layers=n_layers,
+                batch_first=True,
+                dropout=dropout if n_layers > 1 else 0.0,
+            )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor, vol: torch.Tensor = None) -> torch.Tensor:
+        h = self.embedding(x)
+        h, _ = self.rnn(h)
+        return self.dropout(h[:, -1, :])
+
+
+class RNN_Model(nn.Module):
+    """RNN 预测模型（LSTM/GRU），用于 w/o_graph 或消融基线。"""
+
+    def __init__(
+        self,
+        input_dim: int = 8,
+        n_embd: int = 128,
+        n_layers: int = 2,
+        dropout: float = 0.1,
+        rnn_type: str = "lstm",
+    ):
+        super().__init__()
+        self.encoder = RNN_TemporalEncoder(
+            input_dim=input_dim,
+            n_embd=n_embd,
+            n_layers=n_layers,
+            dropout=dropout,
+            rnn_type=rnn_type,
+        )
+        self.head = nn.Linear(n_embd, 1)
+
+    def forward(self, x: torch.Tensor, vol: torch.Tensor = None) -> torch.Tensor:
+        h = self.encoder(x, vol)
+        return self.head(h)
 
 # ================= 5. 兼容性模型（已注释：保留旧接口）=================
 # 【注意】为了兼容旧代码，保留 QL_MATCC_Model 作为别名，但默认关闭所有可选组件

@@ -51,6 +51,10 @@ INPUT_NEWS = os.path.join(DATA_PROCESSED, 'Stock_News.csv')
 INPUT_MODEL_DATA = os.path.join(DATA_PROCESSED, 'Final_Model_Data.csv')
 OUTPUT_GRAPH = os.path.join(DATA_PROCESSED, 'Graph_Adjacency.npy')
 OUTPUT_TICKERS = os.path.join(DATA_PROCESSED, 'Graph_Tickers.json')  # 新增：节点列表文件
+RELATIONS_PARQUET_PATH = os.path.join(DATA_PROCESSED, "llm_relations.parquet")
+SAVE_RELATIONS_PARQUET = True
+USE_CACHED_RELATIONS = False
+RELATIONS_PARTITION_COLS = None
 
 # LLM 配置
 USE_LOCAL_MODEL = True
@@ -158,6 +162,7 @@ USE_SP500_ONLY = True
 # ================= 混合图构建配置（核心创新点）=================
 # 时间衰减累积参数（用于语义图的时间连续性）
 TEMPORAL_DECAY_ALPHA = 0.9  # 衰减因子 α，范围 [0, 1]，越大表示历史信息保留越多
+USE_TEMPORAL_DECAY = True
 
 # 统计相关性图参数
 STAT_CORR_WINDOW = 30  # 计算过去30天收益率的皮尔逊相关系数
@@ -394,6 +399,84 @@ def _canonicalize_ticker(t, alias2canonical, ticker2idx=None):
     return c
 
 
+def _normalize_date_key(value):
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    ts = pd.to_datetime(value, errors="coerce")
+    if pd.isna(ts):
+        return None
+    return ts.strftime("%Y-%m-%d")
+
+
+def _normalize_sentiment_weight(sentiment, weight=None):
+    """
+    统一处理情感分数与边权重：
+    - sentiment 期望在 [-1, 1]
+    - weight 为 None/无效时用 |sentiment|，若仍为 0 则给默认 0.5
+    """
+    s = 0.0
+    if sentiment is not None:
+        try:
+            s = float(sentiment)
+        except (TypeError, ValueError):
+            s = 0.0
+    if np.isnan(s):
+        s = 0.0
+    s = max(-1.0, min(1.0, s))
+
+    if weight is None:
+        w = abs(s)
+    else:
+        try:
+            w = float(weight)
+        except (TypeError, ValueError):
+            w = abs(s)
+    if np.isnan(w):
+        w = abs(s)
+    if w == 0.0:
+        w = 0.5
+    return s, w
+
+
+def _load_relations_table(path: str) -> pd.DataFrame:
+    """
+    读取离线关系文件（优先 Parquet，失败则尝试 CSV）。
+    期望字段：date, source_ticker, target_ticker, relation_type, sentiment_score, weight
+    """
+    if not path or not os.path.exists(path):
+        raise FileNotFoundError(f"关系文件不存在: {path}")
+    try:
+        return pd.read_parquet(path)
+    except Exception as e:
+        csv_path = path if path.lower().endswith(".csv") else path.replace(".parquet", ".csv")
+        if os.path.exists(csv_path):
+            print(f"[WARN] 读取 Parquet 失败，回退 CSV: {e}")
+            return pd.read_csv(csv_path, low_memory=False)
+        raise RuntimeError(f"读取关系文件失败: {path}, err={e}") from e
+
+
+def _save_relations_table(df: pd.DataFrame, path: str, partition_cols=None) -> None:
+    """
+    保存离线关系文件（Parquet 优先）。失败时回退 CSV 并给出提示。
+    """
+    if df is None or df.empty:
+        print("[INFO] 关系记录为空，跳过保存。")
+        return
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    try:
+        df.to_parquet(path, index=False, partition_cols=partition_cols)
+        print(f"[OK] 关系已保存为 Parquet: {path}")
+        return
+    except Exception as e:
+        print(f"[WARN] 保存 Parquet 失败: {e}")
+        csv_path = path if path.lower().endswith(".csv") else path.replace(".parquet", ".csv")
+        try:
+            df.to_csv(csv_path, index=False)
+            print(f"[WARN] 已回退保存为 CSV: {csv_path}")
+        except Exception as e2:
+            raise RuntimeError(f"保存关系文件失败: {path}, err={e2}") from e2
+
+
 def extract_relations_with_llm_batch(
     news_texts,
     local_model=None,
@@ -566,7 +649,7 @@ def build_statistical_correlation_graph(df_price, ticker2idx, window=STAT_CORR_W
     返回:
         adj_stat: (N, N) 的统计相关性邻接矩阵，值为 0 或 1
     """
-    print(f"\n>>> [统计图构建] 计算过去 {window} 天收益率的皮er逊相关系数...")
+    print(f"\n>>> [统计图构建] 计算过去 {window} 天收益率的皮尔逊相关系数...")
     
     num_nodes = len(ticker2idx)
     adj_stat = np.zeros((num_nodes, num_nodes), dtype=np.float32)
@@ -676,7 +759,16 @@ def stratified_sample_news(df_news, max_per_ticker=20, max_total=50000, random_s
     return df_sampled
 
 
-def build_dynamic_graph(use_llm=USE_LLM_DEFAULT, max_per_ticker=MAX_NEWS_PER_TICKER, max_total=MAX_TOTAL_NEWS, use_sp500=USE_SP500_ONLY):
+def build_dynamic_graph(
+    use_llm=USE_LLM_DEFAULT,
+    max_per_ticker=MAX_NEWS_PER_TICKER,
+    max_total=MAX_TOTAL_NEWS,
+    use_sp500=USE_SP500_ONLY,
+    relations_parquet_path=RELATIONS_PARQUET_PATH,
+    save_relations=SAVE_RELATIONS_PARQUET,
+    use_cached_relations=USE_CACHED_RELATIONS,
+    relations_partition_cols=RELATIONS_PARTITION_COLS,
+):
     """
     构建动态图谱
     
@@ -685,6 +777,10 @@ def build_dynamic_graph(use_llm=USE_LLM_DEFAULT, max_per_ticker=MAX_NEWS_PER_TIC
         max_per_ticker: 每个股票最多采样多少条新闻
         max_total: 总共最多处理多少条新闻
         use_sp500: 是否只使用 S&P 500 成分股（推荐用于论文）
+        relations_parquet_path: 离线关系文件路径（Parquet/CSV）
+        save_relations: 是否保存 LLM 关系为离线文件（Parquet 优先）
+        use_cached_relations: 是否优先从离线关系文件加载并构图
+        relations_partition_cols: Parquet 分区列（例如 ["date"]），None 表示不分区
     """
     print("=" * 70)
     print(">>> [Step 1] 读取模型数据与新闻...")
@@ -695,7 +791,13 @@ def build_dynamic_graph(use_llm=USE_LLM_DEFAULT, max_per_ticker=MAX_NEWS_PER_TIC
         return
 
     df_price = pd.read_csv(INPUT_MODEL_DATA)
-    all_tickers = sorted(df_price['Ticker'].astype(str).str.upper().unique())
+    all_tickers = sorted(
+        df_price["Ticker"]
+        .astype(str)
+        .str.upper()
+        .str.replace("-", ".", regex=False)
+        .unique()
+    )
     print(f"    原始数据检测到 {len(all_tickers)} 只股票。")
     
     # =============== S&P 500 过滤（推荐用于论文）===============
@@ -740,260 +842,330 @@ def build_dynamic_graph(use_llm=USE_LLM_DEFAULT, max_per_ticker=MAX_NEWS_PER_TIC
     except Exception as e:
         print(f"    [WARN] 保存节点列表失败: {e}")
 
-    if not os.path.exists(INPUT_NEWS):
-        print(f"[WARN] 未找到新闻文件 {INPUT_NEWS}，保存单位阵。")
-        adj_matrix = np.eye(num_nodes, dtype=np.float32)
-        _atomic_save_npy(OUTPUT_GRAPH, adj_matrix)
-        return
+    relations_parquet_path = relations_parquet_path or RELATIONS_PARQUET_PATH
+    save_relations = bool(save_relations)
+    use_cached_relations = bool(use_cached_relations)
+    relations_partition_cols = relations_partition_cols or RELATIONS_PARTITION_COLS
 
-    df_news = pd.read_csv(INPUT_NEWS, low_memory=False)
-    print(f"    原始新闻总数: {len(df_news)}")
-
-    # 统一新闻里的 ticker 格式，避免分层采样时因大小写/写法差异导致“同一只股票被拆成多个组”
-    if 'Ticker' in df_news.columns:
-        df_news['Ticker'] = df_news['Ticker'].astype(str).str.upper()
-    
-    # 如果使用 S&P 500 模式，过滤新闻数据
-    if use_sp500 and len(active_tickers) < len(all_tickers):
-        before_filter = len(df_news)
-        df_news = df_news[df_news['Ticker'].isin(active_tickers)].copy()
-        print(f"    [S&P 500 过滤] 保留新闻: {before_filter} -> {len(df_news)}")
-
-    # =========================== 防止"未来信息"数据泄露 ===========================
-    try:
-        if 'Date' in df_news.columns:
-            df_news['Date'] = pd.to_datetime(df_news['Date'], errors='coerce')
-            
-            if df_news['Date'].dt.tz is not None:
-                df_news['Date'] = df_news['Date'].dt.tz_localize(None)
-
-            df_price_for_split = pd.read_csv(INPUT_MODEL_DATA, usecols=['Date'])
-            df_price_for_split['Date'] = pd.to_datetime(df_price_for_split['Date'])
-            unique_dates = sorted(df_price_for_split['Date'].unique())
-            
-            if len(unique_dates) >= 2:
-                split_idx = int(len(unique_dates) * 0.8)
-                split_idx = min(split_idx, len(unique_dates) - 1)
-                split_date = unique_dates[split_idx]
-                
-                print(f"\n[防泄露] 切分日期 split_date = {split_date}")
-                before_news = len(df_news)
-                df_news = df_news[df_news['Date'] < split_date].copy()
-                print(f"[防泄露] 过滤后保留新闻: {before_news} -> {len(df_news)}")
-            else:
-                print("[WARN] 日期不足，跳过过滤。")
-    except Exception as e:
-        print(f"[ERROR] 时间过滤失败: {e}，将使用全量新闻（存在泄露风险）。")
-
-    # =========================== 分层采样（关键修正）===========================
-    df_news_sampled = stratified_sample_news(
-        df_news, 
-        max_per_ticker=max_per_ticker, 
-        max_total=max_total
-    )
-
-    # 获取文本列
-    text_col = 'Headline' if 'Headline' in df_news_sampled.columns else 'Article_title'
-    if text_col not in df_news_sampled.columns:
-        cols = [c for c in df_news_sampled.columns if df_news_sampled[c].dtype == object]
-        text_col = cols[0] if cols else None
-    
-    if text_col is None:
-        print("[WARN] 没找到文本列，保存单位阵。")
-        _atomic_save_npy(OUTPUT_GRAPH, np.eye(num_nodes, dtype=np.float32))
-        return
-
-    # 初始化邻接矩阵（单位阵 = 自环）
+    # 初始化邻接矩阵（单位阵 = 自环）与统计容器
     adj_matrix = np.eye(num_nodes, dtype=np.float32)
-
-    # =========================== 加载 LLM 模型（可选）===========================
-    local_model = None
-    local_tokenizer = None
-    
-    if use_llm:
-        try:
-            from transformers import AutoModelForCausalLM, AutoTokenizer
-            print(f"\n[加载中] 正在加载本地模型: {LOCAL_MODEL_PATH} ...")
-            
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            print(f"    设备: {device}")
-
-            local_tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL_PATH, trust_remote_code=True)
-            # decoder-only 模型必须使用 left padding，否则可能影响生成结果并产生警告
-            local_tokenizer.padding_side = "left"
-            if getattr(local_tokenizer, "pad_token", None) is None:
-                local_tokenizer.pad_token = local_tokenizer.eos_token
-
-            dtype = torch.float16 if device == "cuda" else torch.float32
-            model_kwargs = dict(
-                device_map="auto" if device == "cuda" else None,
-                trust_remote_code=True,
-            )
-            # 尝试启用更快的注意力实现（若环境不支持会自动回退）
-            if device == "cuda":
-                model_kwargs["attn_implementation"] = "flash_attention_2"
-            # 兼容不同 transformers 版本：优先使用新参数 dtype=（可消除 torch_dtype deprecation 提示）
-            try:
-                local_model = AutoModelForCausalLM.from_pretrained(
-                    LOCAL_MODEL_PATH,
-                    dtype=dtype,
-                    **model_kwargs,
-                )
-            except Exception:
-                # 回退：移除 flash_attention_2 或 dtype 参数差异
-                model_kwargs.pop("attn_implementation", None)
-                local_model = AutoModelForCausalLM.from_pretrained(
-                    LOCAL_MODEL_PATH,
-                    torch_dtype=dtype,
-                    **model_kwargs,
-                )
-
-            # 同步 pad_token_id，避免generate阶段的padding问题
-            try:
-                local_model.config.pad_token_id = local_tokenizer.pad_token_id
-            except Exception:
-                pass
-            try:
-                local_model.eval()
-            except Exception:
-                pass
-            print("[OK] 模型加载成功！")
-        except Exception as e:
-            print(f"[ERROR] 模型加载失败: {e}")
-            print(">>> 降级为规则模拟模式。")
-            local_model = None
-
-    # =========================== 循环建图（批处理优化）===========================
-    print(f"\n>>> [Step 2] 开始建图 (共 {len(df_news_sampled)} 条新闻)...")
-    print("=" * 70)
-    
-    # 进度保存配置
-    CHECKPOINT_INTERVAL = 10000
-    checkpoint_path = OUTPUT_GRAPH.replace('.npy', '_checkpoint.npz')
-    sampled_path = OUTPUT_GRAPH.replace('.npy', '_news_sampled.csv')
-    BATCH_SIZE = int(os.environ.get("LLM_BATCH_SIZE", str(LLM_BATCH_SIZE_DEFAULT)))
-    MAX_INPUT_TOKENS = int(os.environ.get("LLM_MAX_INPUT_TOKENS", str(LLM_MAX_INPUT_TOKENS_DEFAULT)))
-    MAX_NEW_TOKENS = int(os.environ.get("LLM_MAX_NEW_TOKENS", str(LLM_MAX_NEW_TOKENS_DEFAULT)))
-    DO_SAMPLE = os.environ.get("LLM_DO_SAMPLE", "1" if LLM_DO_SAMPLE_DEFAULT else "0") == "1"
-    
+    date_edge_weights = defaultdict(dict)
+    use_temporal_decay = USE_TEMPORAL_DECAY
     edge_count = 0
     matched_tickers = set()
     relation_type_counter = Counter()
     edge_counter = Counter()  # (src, dst) -> count
     failures = 0
+    relation_records = [] if save_relations else None
 
-    # 固化采样结果，确保可复现 & 可断点续跑
-    if os.path.exists(sampled_path):
-        try:
-            df_news_sampled = pd.read_csv(sampled_path, low_memory=False)
-            print(f"[Resume] 检测到已保存的采样新闻: {sampled_path} (n={len(df_news_sampled)})")
-        except Exception as e:
-            print(f"[WARN] 读取采样新闻失败，将重新采样: {e}")
+    # =========================== 防止"未来信息"数据泄露：split_date ===========================
+    split_date = None
+    try:
+        df_price_for_split = pd.read_csv(INPUT_MODEL_DATA, usecols=['Date'])
+        df_price_for_split['Date'] = pd.to_datetime(df_price_for_split['Date'])
+        unique_dates = sorted(df_price_for_split['Date'].unique())
+        if len(unique_dates) >= 2:
+            split_idx = int(len(unique_dates) * 0.8)
+            split_idx = min(split_idx, len(unique_dates) - 1)
+            split_date = unique_dates[split_idx]
+            print(f"\n[防泄露] 切分日期 split_date = {split_date}")
+        else:
+            print("[WARN] 日期不足，跳过防泄露过滤。")
+    except Exception as e:
+        print(f"[ERROR] split_date 计算失败: {e}，将跳过防泄露过滤。")
+
+    # =========================== 离线关系优先模式 ===========================
+    use_cached_ready = bool(use_cached_relations and relations_parquet_path and os.path.exists(relations_parquet_path))
+    if use_cached_ready:
+        print(f"\n>>> [Step 1.5] 使用离线关系文件构图: {relations_parquet_path}")
+        df_rel = _load_relations_table(relations_parquet_path)
+
+        rename_map = {}
+        for cand in ("date", "Date"):
+            if cand in df_rel.columns:
+                rename_map[cand] = "date"
+                break
+        for cand in ("source_ticker", "src", "source", "from"):
+            if cand in df_rel.columns:
+                rename_map[cand] = "source_ticker"
+                break
+        for cand in ("target_ticker", "dst", "target", "to"):
+            if cand in df_rel.columns:
+                rename_map[cand] = "target_ticker"
+                break
+        for cand in ("relation_type", "relation", "type"):
+            if cand in df_rel.columns:
+                rename_map[cand] = "relation_type"
+                break
+        for cand in ("sentiment_score", "sentiment"):
+            if cand in df_rel.columns:
+                rename_map[cand] = "sentiment_score"
+                break
+        if "weight" in df_rel.columns:
+            rename_map["weight"] = "weight"
+        df_rel = df_rel.rename(columns=rename_map)
+
+        if "source_ticker" not in df_rel.columns or "target_ticker" not in df_rel.columns:
+            raise ValueError("离线关系文件缺少 source_ticker/target_ticker 列")
+
+        if "date" not in df_rel.columns:
+            df_rel["date"] = None
+        if "relation_type" not in df_rel.columns:
+            df_rel["relation_type"] = None
+        if "sentiment_score" not in df_rel.columns:
+            df_rel["sentiment_score"] = 0.0
+        if "weight" not in df_rel.columns:
+            df_rel["weight"] = np.nan
+
+        df_rel["date"] = pd.to_datetime(df_rel["date"], errors="coerce")
+        df_rel = df_rel.dropna(subset=["date"])
+        if split_date is not None:
+            before = len(df_rel)
+            df_rel = df_rel[df_rel["date"] < split_date].copy()
+            print(f"[防泄露] 关系过滤: {before} -> {len(df_rel)}")
+        df_rel["date"] = df_rel["date"].dt.strftime("%Y-%m-%d")
+
+        for row in df_rel.itertuples(index=False):
+            src_c = _canonicalize_ticker(row.source_ticker, alias2canonical, ticker2idx)
+            dst_c = _canonicalize_ticker(row.target_ticker, alias2canonical, ticker2idx)
+            if not src_c or not dst_c or src_c == dst_c:
+                continue
+            if use_sp500 and (active_set != set(all_tickers)):
+                if src_c not in active_set or dst_c not in active_set:
+                    continue
+            s, w = _normalize_sentiment_weight(getattr(row, "sentiment_score", 0.0), getattr(row, "weight", None))
+            i, j = ticker2idx[src_c], ticker2idx[dst_c]
+            if adj_matrix[i, j] == 0:
+                edge_count += 1
+            adj_matrix[i, j] = max(adj_matrix[i, j], w)
+            adj_matrix[j, i] = max(adj_matrix[j, i], w)
+            matched_tickers.add(src_c)
+            matched_tickers.add(dst_c)
+
+            date_key = getattr(row, "date", None)
+            if use_temporal_decay and date_key:
+                edge_key = (i, j) if i <= j else (j, i)
+                prev = date_edge_weights[date_key].get(edge_key, 0.0)
+                date_edge_weights[date_key][edge_key] = max(prev, float(w))
+
+            rel = getattr(row, "relation_type", None)
+            a, b = (src_c, dst_c) if src_c <= dst_c else (dst_c, src_c)
+            edge_counter[(a, b)] += 1
+            if rel:
+                relation_type_counter[str(rel).strip()] += 1
     else:
-        try:
-            df_news_sampled.to_csv(sampled_path, index=False)
-            print(f"[OK] 已保存采样新闻（用于断点续跑/复现）: {sampled_path}")
-        except Exception as e:
-            print(f"[WARN] 保存采样新闻失败（不影响运行，但无法稳定断点续跑）: {e}")
+        if not os.path.exists(INPUT_NEWS):
+            print(f"[WARN] 未找到新闻文件 {INPUT_NEWS}，保存单位阵。")
+            _atomic_save_npy(OUTPUT_GRAPH, adj_matrix)
+            return
 
-    # 断点续跑：如果 checkpoint 存在，加载 adj + 进度
-    start_pos = 0
-    if os.path.exists(checkpoint_path):
-        ck_adj, ck_meta = _load_checkpoint_npz(checkpoint_path)
-        if ck_adj is not None and ck_meta:
-            # 简单一致性校验：节点数必须一致
-            if isinstance(ck_adj, np.ndarray) and ck_adj.shape == adj_matrix.shape:
-                adj_matrix = ck_adj.astype(np.float32, copy=False)
-                start_pos = int(ck_meta.get("next_pos", 0))
-                # 也可沿用上次已降过的 batch size
-                if "batch_size" in ck_meta:
-                    try:
-                        BATCH_SIZE = int(ck_meta["batch_size"])
-                    except Exception:
-                        pass
-                print(f"[Resume] 从 checkpoint 恢复：next_pos={start_pos}, batch_size={BATCH_SIZE}")
-            else:
-                print(f"[WARN] checkpoint 形状不匹配，忽略断点续跑（ck={getattr(ck_adj,'shape',None)} vs cur={adj_matrix.shape}）")
+        df_news = pd.read_csv(INPUT_NEWS, low_memory=False)
+        print(f"    原始新闻总数: {len(df_news)}")
+
+        # 统一新闻里的 ticker 格式，避免分层采样时因大小写/写法差异导致“同一只股票被拆成多个组”
+        if 'Ticker' in df_news.columns:
+            df_news["Ticker"] = (
+                df_news["Ticker"]
+                .astype(str)
+                .str.upper()
+                .str.replace("-", ".", regex=False)
+            )
     
-    if local_model:
-        print(f"[批处理模式] batch={BATCH_SIZE}, max_input_tokens={MAX_INPUT_TOKENS}, max_new_tokens={MAX_NEW_TOKENS}, do_sample={DO_SAMPLE}")
+        # 如果使用 S&P 500 模式，过滤新闻数据
+        if use_sp500 and len(active_tickers) < len(all_tickers):
+            before_filter = len(df_news)
+            df_news = df_news[df_news['Ticker'].isin(active_tickers)].copy()
+            print(f"    [S&P 500 过滤] 保留新闻: {before_filter} -> {len(df_news)}")
+
+        # =========================== 防止"未来信息"数据泄露（新闻）===========================
+        try:
+            if 'Date' in df_news.columns:
+                df_news['Date'] = pd.to_datetime(df_news['Date'], errors='coerce')
+                if df_news['Date'].dt.tz is not None:
+                    df_news['Date'] = df_news['Date'].dt.tz_localize(None)
+                if split_date is not None:
+                    before_news = len(df_news)
+                    df_news = df_news[df_news['Date'] < split_date].copy()
+                    print(f"[防泄露] 过滤后保留新闻: {before_news} -> {len(df_news)}")
+        except Exception as e:
+            print(f"[ERROR] 时间过滤失败: {e}，将使用全量新闻（存在泄露风险）。")
+
+        # =========================== 分层采样（关键修正）===========================
+        df_news_sampled = stratified_sample_news(
+            df_news,
+            max_per_ticker=max_per_ticker,
+            max_total=max_total,
+        )
+
+        if 'Date' in df_news_sampled.columns:
+            df_news_sampled = df_news_sampled.sort_values('Date').reset_index(drop=True)
+
+        # 获取文本列
+        text_col = 'Headline' if 'Headline' in df_news_sampled.columns else 'Article_title'
+        if text_col not in df_news_sampled.columns:
+            cols = [c for c in df_news_sampled.columns if df_news_sampled[c].dtype == object]
+            text_col = cols[0] if cols else None
         
-        # 批处理LLM推理
-        batch_news = []
-        batch_tickers = []
+        if text_col is None:
+            print("[WARN] 没找到文本列，保存单位阵。")
+            _atomic_save_npy(OUTPUT_GRAPH, np.eye(num_nodes, dtype=np.float32))
+            return
 
-        t0 = time.time()
-        pbar = tqdm(total=len(df_news_sampled), desc="Building Graph", initial=start_pos)
-        cur_pos = start_pos
+        # =========================== 加载 LLM 模型（可选）===========================
+        local_model = None
+        local_tokenizer = None
 
-        def _flush_batch():
-            """把当前 batch_news/batch_tickers 做一次 LLM 推理并更新图。"""
-            nonlocal BATCH_SIZE, edge_count, failures
-            nonlocal MAX_INPUT_TOKENS, MAX_NEW_TOKENS
-            nonlocal batch_news, batch_tickers
+        if use_llm:
+            try:
+                from transformers import AutoModelForCausalLM, AutoTokenizer
 
-            if not batch_news:
-                return
+                print(f"\n[加载中] 正在加载本地模型: {LOCAL_MODEL_PATH} ...")
 
-            # 批量推理（遇到OOM自动降低batch再重试）
-            oom_tries = 0
-            while True:
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+                print(f"    设备: {device}")
+
+                local_tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL_PATH, trust_remote_code=True)
+                # decoder-only 模型必须使用 left padding，否则可能影响生成结果并产生警告
+                local_tokenizer.padding_side = "left"
+                if getattr(local_tokenizer, "pad_token", None) is None:
+                    local_tokenizer.pad_token = local_tokenizer.eos_token
+
+                dtype = torch.float16 if device == "cuda" else torch.float32
+                model_kwargs = dict(
+                    device_map="auto" if device == "cuda" else None,
+                    trust_remote_code=True,
+                )
+                # 尝试启用更快的注意力实现（若环境不支持会自动回退）
+                if device == "cuda":
+                    model_kwargs["attn_implementation"] = "flash_attention_2"
+
+                # 兼容不同 transformers 版本：优先使用新参数 dtype=
+                try:
+                    local_model = AutoModelForCausalLM.from_pretrained(
+                        LOCAL_MODEL_PATH,
+                        dtype=dtype,
+                        **model_kwargs,
+                    )
+                except Exception:
+                    # 回退：移除可能不被支持的参数
+                    model_kwargs.pop("attn_implementation", None)
+                    local_model = AutoModelForCausalLM.from_pretrained(
+                        LOCAL_MODEL_PATH,
+                        torch_dtype=dtype,
+                        **model_kwargs,
+                    )
+
+                # 同步 pad_token_id，避免 generate 阶段的 padding 问题
+                try:
+                    local_model.config.pad_token_id = local_tokenizer.pad_token_id
+                except Exception:
+                    pass
+                try:
+                    local_model.eval()
+                except Exception:
+                    pass
+                print("[OK] 模型加载成功！")
+            except Exception as e:
+                print(f"[ERROR] 模型加载失败: {e}")
+                print(">>> 降级为规则模拟模式。")
+                local_model = None
+        
+        # =========================== 循环建图（批处理优化）===========================
+        print(f"\n>>> [Step 2] 开始建图 (共 {len(df_news_sampled)} 条新闻)...")
+        print("=" * 70)
+        
+        # 进度保存配置
+        CHECKPOINT_INTERVAL = 10000
+        checkpoint_path = OUTPUT_GRAPH.replace('.npy', '_checkpoint.npz')
+        sampled_path = OUTPUT_GRAPH.replace('.npy', '_news_sampled.csv')
+        BATCH_SIZE = int(os.environ.get("LLM_BATCH_SIZE", str(LLM_BATCH_SIZE_DEFAULT)))
+        MAX_INPUT_TOKENS = int(os.environ.get("LLM_MAX_INPUT_TOKENS", str(LLM_MAX_INPUT_TOKENS_DEFAULT)))
+        MAX_NEW_TOKENS = int(os.environ.get("LLM_MAX_NEW_TOKENS", str(LLM_MAX_NEW_TOKENS_DEFAULT)))
+        DO_SAMPLE = os.environ.get("LLM_DO_SAMPLE", "1" if LLM_DO_SAMPLE_DEFAULT else "0") == "1"
+        
+        edge_count = 0
+        matched_tickers = set()
+        relation_type_counter = Counter()
+        edge_counter = Counter()  # (src, dst) -> count
+        failures = 0
+        
+        # 固化采样结果，确保可复现 & 可断点续跑
+        if os.path.exists(sampled_path):
+            try:
+                df_news_sampled = pd.read_csv(sampled_path, low_memory=False)
+                print(f"[Resume] 检测到已保存的采样新闻: {sampled_path} (n={len(df_news_sampled)})")
+            except Exception as e:
+                print(f"[WARN] 读取采样新闻失败，将重新采样: {e}")
+        else:
+            try:
+                df_news_sampled.to_csv(sampled_path, index=False)
+                print(f"[OK] 已保存采样新闻（用于断点续跑/复现）: {sampled_path}")
+            except Exception as e:
+                print(f"[WARN] 保存采样新闻失败（不影响运行，但无法稳定断点续跑）: {e}")
+
+        # 断点续跑：如果 checkpoint 存在，加载 adj + 进度
+        start_pos = 0
+        if os.path.exists(checkpoint_path):
+            ck_adj, ck_meta = _load_checkpoint_npz(checkpoint_path)
+            if ck_adj is not None and ck_meta:
+                # 简单一致性校验：节点数必须一致
+                if isinstance(ck_adj, np.ndarray) and ck_adj.shape == adj_matrix.shape:
+                    adj_matrix = ck_adj.astype(np.float32, copy=False)
+                    start_pos = int(ck_meta.get("next_pos", 0))
+                    # 也可沿用上次已降过的 batch size
+                    if "batch_size" in ck_meta:
+                        try:
+                            BATCH_SIZE = int(ck_meta["batch_size"])
+                        except Exception:
+                            pass
+                    print(f"[Resume] 从 checkpoint 恢复：next_pos={start_pos}, batch_size={BATCH_SIZE}")
+                else:
+                    print(f"[WARN] checkpoint 形状不匹配，忽略断点续跑（ck={getattr(ck_adj,'shape',None)} vs cur={adj_matrix.shape}）")
+        
+        if local_model:
+            print(f"[批处理模式] batch={BATCH_SIZE}, max_input_tokens={MAX_INPUT_TOKENS}, max_new_tokens={MAX_NEW_TOKENS}, do_sample={DO_SAMPLE}")
+
+            # 简化实现：按 BATCH_SIZE 分批调用 LLM 提取关系并更新邻接矩阵
+            t0 = time.time()
+            pbar = tqdm(total=len(df_news_sampled), desc="Building Graph", initial=start_pos)
+
+            for i in range(start_pos, len(df_news_sampled), BATCH_SIZE):
+                batch_df = df_news_sampled.iloc[i : i + BATCH_SIZE]
+                texts = batch_df[text_col].astype(str).fillna("").tolist()
+                tickers = batch_df["Ticker"].astype(str).fillna("").tolist()
+                dates = []
+                for d in batch_df.get("Date", pd.Series([None] * len(batch_df))):
+                    if isinstance(d, pd.Timestamp):
+                        dates.append(d.strftime("%Y-%m-%d"))
+                    else:
+                        try:
+                            dates.append(pd.to_datetime(d).strftime("%Y-%m-%d"))
+                        except Exception:
+                            dates.append(None)
+
                 try:
                     batch_relations = extract_relations_with_llm_batch(
-                        batch_news,
+                        texts,
                         local_model,
                         local_tokenizer,
-                        batch_size=BATCH_SIZE,
+                        batch_size=len(texts),
                         max_input_tokens=MAX_INPUT_TOKENS,
                         max_new_tokens=MAX_NEW_TOKENS,
                         do_sample=DO_SAMPLE,
                     )
-                    break
-                except torch.cuda.OutOfMemoryError:
-                    oom_tries += 1
-                    try:
-                        torch.cuda.empty_cache()
-                    except Exception:
-                        pass
+                except Exception as e:
+                    print(f"[WARN] LLM 批处理失败（跳过该批次）: {e}")
+                    batch_relations = [[] for _ in texts]
 
-                    # 优先降 batch，其次降输入长度，再降输出长度；最后跳过该 batch 避免整任务中断
-                    if BATCH_SIZE > 1:
-                        new_bs = max(1, BATCH_SIZE // 2)
-                        if new_bs == BATCH_SIZE:
-                            new_bs = max(1, BATCH_SIZE - 1)
-                        BATCH_SIZE = new_bs
-                        print(f"\n[OOM] 显存不足，降低 batch_size -> {BATCH_SIZE} 后重试")
+                # 处理每条新闻的返回结果
+                for src_ticker, relations, date_key in zip(tickers, batch_relations, dates):
+                    if not relations:
                         continue
-
-                    if MAX_INPUT_TOKENS > 512:
-                        MAX_INPUT_TOKENS = max(512, int(MAX_INPUT_TOKENS * 0.75))
-                        print(f"\n[OOM] batch_size=1仍不足，降低 max_input_tokens -> {MAX_INPUT_TOKENS} 后重试")
-                        continue
-
-                    if MAX_NEW_TOKENS > 48:
-                        MAX_NEW_TOKENS = max(48, int(MAX_NEW_TOKENS * 0.75))
-                        print(f"\n[OOM] 仍不足，降低 max_new_tokens -> {MAX_NEW_TOKENS} 后重试")
-                        continue
-
-                    # 实在无法恢复：跳过该 batch（不让整次运行失败）
-                    failures += 1
-                    print(f"\n[OOM] 多次重试仍失败（oom_tries={oom_tries}），将跳过该批次以继续运行")
-                    batch_relations = [[] for _ in batch_news]
-                    break
-                except Exception:
-                    failures += 1
-                    batch_relations = [[] for _ in batch_news]
-                    break
-
-            # 处理结果
-            for src_t, relations in zip(batch_tickers, batch_relations):
-                if relations:
                     for r in relations:
-                        # 兼容：r 可能是 dict 或 list/tuple（LLM 输出偶发跑偏）
                         if isinstance(r, dict):
-                            src, dst = r.get("src"), r.get("dst")
+                            src = r.get("src")
+                            dst = r.get("dst")
                             rel = r.get("relation")
-                            # 【核心创新点】提取情感极性分数
                             sentiment = r.get("sentiment_score", 0.0)
                         elif isinstance(r, (list, tuple)) and len(r) >= 2:
                             src, dst = r[0], r[1]
@@ -1007,78 +1179,38 @@ def build_dynamic_graph(use_llm=USE_LLM_DEFAULT, max_per_ticker=MAX_NEWS_PER_TIC
                         if not src_c or not dst_c or src_c == dst_c:
                             continue
 
-                        # S&P500 模式：限制边两端都在 active 集合内（更符合论文“核心成分股”设定）
                         if use_sp500 and (active_set != set(all_tickers)):
                             if src_c not in active_set or dst_c not in active_set:
                                 continue
 
-                        i, j = ticker2idx[src_c], ticker2idx[dst_c]
-                        
-                        # 【核心创新点】使用情感分数作为边权重（而非简单的二值）
-                        # 情感分数范围：-1.0（利空）到 1.0（利好）
-                        # 为了构建无向图，使用绝对值表示关系强度
+                        i_idx, j_idx = ticker2idx[src_c], ticker2idx[dst_c]
+
                         try:
                             sentiment_weight = abs(float(sentiment))
-                            # 如果情感分数为0或无效，使用默认权重0.5（中性关系）
                             if sentiment_weight == 0.0 or np.isnan(sentiment_weight):
                                 sentiment_weight = 0.5
-                        except (ValueError, TypeError):
-                            sentiment_weight = 0.5  # 默认中性权重
-                        
-                        # 时间衰减累积：如果边已存在，取最大值（保留最强关系）
-                        # 简化实现：在实际应用中，应该按日期逐日累积
-                        if adj_matrix[i, j] == 0:
-                            edge_count += 1
-                        # 使用最大值保留最强的情感权重
-                        adj_matrix[i, j] = max(adj_matrix[i, j], sentiment_weight)
-                        adj_matrix[j, i] = max(adj_matrix[j, i], sentiment_weight)  # 无向图
-                        matched_tickers.add(src_c)
-                        matched_tickers.add(dst_c)
+                        except Exception:
+                            sentiment_weight = 0.5
 
-                        # 统计（用于论文与排错）
-                        # 统计边（无向图）：用排序后的 (min,max) 作为 key，避免双向重复计数
+                        if adj_matrix[i_idx, j_idx] == 0:
+                            edge_count += 1
+                        adj_matrix[i_idx, j_idx] = max(adj_matrix[i_idx, j_idx], sentiment_weight)
+                        adj_matrix[j_idx, i_idx] = adj_matrix[i_idx, j_idx]
+
+                        if use_temporal_decay and date_key:
+                            edge_key = (i_idx, j_idx) if i_idx <= j_idx else (j_idx, i_idx)
+                            prev = date_edge_weights[date_key].get(edge_key, 0.0)
+                            date_edge_weights[date_key][edge_key] = max(prev, float(sentiment_weight))
+
                         a, b = (src_c, dst_c) if src_c <= dst_c else (dst_c, src_c)
                         edge_counter[(a, b)] += 1
                         if rel:
                             relation_type_counter[str(rel).strip()] += 1
 
-            # 清空批次
-            batch_news = []
-            batch_tickers = []
-
-        try:
-            for pos in range(start_pos, len(df_news_sampled)):
-                cur_pos = pos
-                row = df_news_sampled.iloc[pos]
-                src_ticker = str(row.get('Ticker', '')).strip().upper()
-                # S&P500 模式：仅处理 active 集合内的源节点
-                content = row.get(text_col, "")
-
-                # 是否把当前行纳入 batch
-                ok = True
-                if not src_ticker:
-                    ok = False
-                elif use_sp500 and (active_set != set(all_tickers)) and (src_ticker not in active_set):
-                    ok = False
-                elif src_ticker not in ticker2idx:
-                    ok = False
-                elif not content or (isinstance(content, float) and pd.isna(content)):
-                    ok = False
-
-                if ok:
-                    batch_news.append(str(content))
-                    batch_tickers.append(src_ticker)
-
-                # 达到批次大小则 flush
-                if len(batch_news) >= BATCH_SIZE:
-                    _flush_batch()
-
-                # 进度保存（按处理条数）
-                if (pos + 1) % CHECKPOINT_INTERVAL == 0:
-                    # 保存前先把 batch 刷掉，确保 checkpoint 的图是“可用的”
-                    _flush_batch()
+                # 定期保存 checkpoint，便于断点续跑
+                if (i + BATCH_SIZE) % CHECKPOINT_INTERVAL == 0:
                     meta = {
-                        "next_pos": pos + 1,
+                        "next_pos": min(i + BATCH_SIZE, len(df_news_sampled)),
                         "batch_size": BATCH_SIZE,
                         "max_input_tokens": MAX_INPUT_TOKENS,
                         "max_new_tokens": MAX_NEW_TOKENS,
@@ -1089,48 +1221,13 @@ def build_dynamic_graph(use_llm=USE_LLM_DEFAULT, max_per_ticker=MAX_NEWS_PER_TIC
                         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
                     }
                     _atomic_save_checkpoint_npz(checkpoint_path, adj_matrix, meta)
-                    speed = (pos + 1 - start_pos) / max(1e-6, (time.time() - t0))
-                    print(f"\n[进度保存] 已处理 {pos+1}/{len(df_news_sampled)} 条 (边数: {int((adj_matrix.sum()-num_nodes)/2)}), {speed:.2f} it/s")
 
-                # 更新进度条（按扫描行数）
-                pbar.update(1)
+                pbar.update(len(texts))
 
-            # 循环结束后，把残余 batch 全部 flush（避免末尾若干行被跳过导致漏刷）
-            _flush_batch()
-
-        except Exception as e:
-            failures += 1
-            # 发生异常时尽量保存 checkpoint，避免“跑一点点就白跑”
-            try:
-                meta = {
-                    "next_pos": int(cur_pos),
-                    "batch_size": BATCH_SIZE,
-                    "max_input_tokens": MAX_INPUT_TOKENS,
-                    "max_new_tokens": MAX_NEW_TOKENS,
-                    "do_sample": bool(DO_SAMPLE),
-                    "use_sp500": bool(use_sp500),
-                    "num_nodes": int(num_nodes),
-                    "active_tickers": sorted(list(active_set)) if (use_sp500 and active_set != set(all_tickers)) else None,
-                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    "error": repr(e),
-                    "traceback": traceback.format_exc()[-8000:],  # 避免过长
-                }
-                # 异常时也尽量先 flush 一下，让 checkpoint 的图尽可能完整
-                try:
-                    _flush_batch()
-                except Exception:
-                    pass
-                _atomic_save_checkpoint_npz(checkpoint_path, adj_matrix, meta)
-                print(f"\n[ERROR] 发生异常，已保存 checkpoint（可断点续跑）: {checkpoint_path}")
-            except Exception:
-                pass
-            raise
-        finally:
             try:
                 pbar.close()
             except Exception:
                 pass
-    else:
         # 规则模式（不变）
         start_pos = 0
         if os.path.exists(checkpoint_path):
@@ -1143,8 +1240,12 @@ def build_dynamic_graph(use_llm=USE_LLM_DEFAULT, max_per_ticker=MAX_NEWS_PER_TIC
         for pos in tqdm(range(start_pos, len(df_news_sampled)), total=len(df_news_sampled), initial=start_pos, desc="Building Graph"):
             row = df_news_sampled.iloc[pos]
             src_ticker = str(row.get('Ticker', '')).strip().upper()
-                
+
             content = row.get(text_col, "")
+            date_key = row.get('Date')
+            if isinstance(date_key, pd.Timestamp):
+                date_key = date_key.strftime("%Y-%m-%d")
+            date_key = str(date_key) if date_key is not None else None
 
             ok = True
             if not src_ticker:
@@ -1155,7 +1256,7 @@ def build_dynamic_graph(use_llm=USE_LLM_DEFAULT, max_per_ticker=MAX_NEWS_PER_TIC
                 ok = False
             elif not content or (isinstance(content, float) and pd.isna(content)):
                 ok = False
-
+        
             if ok:
                 content = str(content)
                 # 规则匹配
@@ -1171,7 +1272,10 @@ def build_dynamic_graph(use_llm=USE_LLM_DEFAULT, max_per_ticker=MAX_NEWS_PER_TIC
                             adj_matrix[j, i] = 1.0
                             matched_tickers.add(src_ticker)
                             matched_tickers.add(t)
-            
+                            if use_temporal_decay and date_key:
+                                edge_key = (i, j) if i <= j else (j, i)
+                                date_edge_weights[date_key][edge_key] = 1.0
+
             if (pos + 1) % CHECKPOINT_INTERVAL == 0:
                 meta = {
                     "next_pos": pos + 1,
@@ -1183,6 +1287,19 @@ def build_dynamic_graph(use_llm=USE_LLM_DEFAULT, max_per_ticker=MAX_NEWS_PER_TIC
                 }
                 _atomic_save_checkpoint_npz(checkpoint_path, adj_matrix, meta)
                 print(f"\n[进度保存] 已处理 {pos+1}/{len(df_news_sampled)} 条 (边数: {int((adj_matrix.sum()-num_nodes)/2)})")
+        
+        # =========================== 时间衰减累积（语义图）===========================
+    if use_temporal_decay and date_edge_weights:
+        print("\n>>> [Step 2.5] 应用时间衰减累积（语义图）...")
+        adj_matrix = np.eye(num_nodes, dtype=np.float32)
+        for date_key in sorted(date_edge_weights.keys()):
+            adj_matrix *= TEMPORAL_DECAY_ALPHA
+            edges = date_edge_weights[date_key]
+            for (i, j), w in edges.items():
+                adj_matrix[i, j] = adj_matrix[i, j] + (1.0 - TEMPORAL_DECAY_ALPHA) * float(w)
+                adj_matrix[j, i] = adj_matrix[i, j]
+        np.fill_diagonal(adj_matrix, 1.0)
+        print("    ✅ 时间衰减累积完成")
 
     # =========================== 构建统计相关性图（隐式层）===========================
     print("\n>>> [Step 3] 构建统计相关性图（隐式层）...")
@@ -1224,10 +1341,16 @@ def build_dynamic_graph(use_llm=USE_LLM_DEFAULT, max_per_ticker=MAX_NEWS_PER_TIC
     # 归一化语义图（避免数值过大）
     if adj_semantic.max() > 0:
         adj_semantic = adj_semantic / adj_semantic.max()
+
+    # 消融用：去除情感权重（仅保留关系边）
+    adj_semantic_nosent = (adj_matrix > 0).astype(np.float32)
+    np.fill_diagonal(adj_semantic_nosent, 1.0)
     
     # 【核心创新点】混合图构建：A_t^{final} = Norm(A_t^{semantic} + λ · A_t^{stat})
     # 其中 λ 是统计图的权重，用于平衡语义图和统计图
     print(f"    混合图参数：λ = {HYBRID_LAMBDA}（统计图权重）")
+    # 统计图补自环，便于与语义图一致
+    np.fill_diagonal(adj_stat, 1.0)
     adj_final = adj_semantic + HYBRID_LAMBDA * adj_stat
     
     # 归一化最终图（确保数值范围合理）
@@ -1250,6 +1373,14 @@ def build_dynamic_graph(use_llm=USE_LLM_DEFAULT, max_per_ticker=MAX_NEWS_PER_TIC
     # =========================== 保存最终结果 ===========================
     print("\n>>> [Step 5] 保存最终结果...")
     _atomic_save_npy(OUTPUT_GRAPH, adj_final)
+
+    # 额外输出：消融所需的语义/统计图
+    try:
+        _atomic_save_npy(OUTPUT_GRAPH.replace(".npy", "_semantic.npy"), adj_semantic)
+        _atomic_save_npy(OUTPUT_GRAPH.replace(".npy", "_stat.npy"), adj_stat)
+        _atomic_save_npy(OUTPUT_GRAPH.replace(".npy", "_semantic_nosent.npy"), adj_semantic_nosent)
+    except Exception as e:
+        print(f"[WARN] 保存消融图失败: {e}")
     
     # 删除checkpoint文件
     if os.path.exists(checkpoint_path):

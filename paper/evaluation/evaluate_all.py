@@ -58,6 +58,7 @@ if not os.path.exists(CSV_PATH):
 try:
     from dataProcessed.dataset import FinancialDataset
     from models.gnn_model import GraphRWKV_GNN_Model, QL_MATCC_GNN_Model  # QL_MATCC_GNN_Model 为兼容性别名
+    from models.base_model import RNN_Model
     print("✅ 成功导入基础模块")
 except ImportError as e:
     print(f"❌ 导入失败: {e}")
@@ -65,6 +66,8 @@ except ImportError as e:
 
 # 配置
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+TOP_K = int(os.environ.get("TOP_K", "10"))
+ANNUALIZATION = int(os.environ.get("ANNUALIZATION", "252"))
 
 def _load_train_config(parent_dir_: str) -> dict:
     """
@@ -139,6 +142,7 @@ MODELS_TO_EVALUATE = [
         'use_semantic': True,
         'use_statistical': True,
         'use_sentiment': True,
+        'graph_variant': 'full',
     },
     {
         'name': 'w/o Graph',
@@ -148,6 +152,7 @@ MODELS_TO_EVALUATE = [
         'use_semantic': False,
         'use_statistical': False,
         'use_sentiment': False,
+        'graph_variant': None,
     },
     {
         'name': 'w/o Semantic',
@@ -157,6 +162,7 @@ MODELS_TO_EVALUATE = [
         'use_semantic': False,
         'use_statistical': True,
         'use_sentiment': False,
+        'graph_variant': 'stat',
     },
     {
         'name': 'w/o Statistical',
@@ -166,6 +172,7 @@ MODELS_TO_EVALUATE = [
         'use_semantic': True,
         'use_statistical': False,
         'use_sentiment': True,
+        'graph_variant': 'semantic',
     },
     {
         'name': 'w/o Sentiment',
@@ -175,6 +182,29 @@ MODELS_TO_EVALUATE = [
         'use_semantic': True,
         'use_statistical': True,
         'use_sentiment': False,
+        'graph_variant': 'semantic_nosent',
+    },
+    {
+        'name': 'Hybrid + LSTM',
+        'exp_name': 'lstm_hybrid',
+        'path': os.path.join(CHECKPOINT_DIR, 'best_model_ablation_lstm_hybrid.pth'),
+        'use_graph': True,
+        'use_semantic': True,
+        'use_statistical': True,
+        'use_sentiment': True,
+        'graph_variant': 'full',
+        'temporal_backend': 'lstm',
+    },
+    {
+        'name': 'Hybrid + GRU',
+        'exp_name': 'gru_hybrid',
+        'path': os.path.join(CHECKPOINT_DIR, 'best_model_ablation_gru_hybrid.pth'),
+        'use_graph': True,
+        'use_semantic': True,
+        'use_statistical': True,
+        'use_sentiment': True,
+        'graph_variant': 'full',
+        'temporal_backend': 'gru',
     },
 ]
 
@@ -227,7 +257,54 @@ def calculate_metrics(y_true, y_pred):
     }
 
 
-def load_model_and_predict(model_config, test_loader, adj_matrix, num_nodes):
+def calculate_backtest_metrics(y_true, y_pred, dates, top_k=10, annualization=252):
+    """Top-K Long-Short 回测指标。"""
+    if not dates:
+        return {}
+    df = {
+        "date": dates,
+        "y_true": np.array(y_true).flatten(),
+        "y_pred": np.array(y_pred).flatten(),
+    }
+    data = np.rec.fromarrays([df["date"], df["y_true"], df["y_pred"]], names="date,y_true,y_pred")
+
+    daily_returns = []
+    unique_dates = np.unique(data["date"])
+    for d in unique_dates:
+        day = data[data["date"] == d]
+        if len(day) < top_k * 2:
+            continue
+        order = np.argsort(day["y_pred"])
+        short_idx = order[:top_k]
+        long_idx = order[-top_k:]
+        long_ret = np.expm1(day["y_true"][long_idx]).mean()
+        short_ret = np.expm1(day["y_true"][short_idx]).mean()
+        daily_returns.append(long_ret - short_ret)
+
+    if not daily_returns:
+        return {}
+
+    daily_returns = np.array(daily_returns, dtype=np.float64)
+    mean_ret = daily_returns.mean()
+    std_ret = daily_returns.std(ddof=1) if daily_returns.size > 1 else 0.0
+
+    cumulative = np.cumprod(1.0 + daily_returns)
+    peak = np.maximum.accumulate(cumulative)
+    drawdown = (cumulative - peak) / peak
+
+    ann_return = cumulative[-1] ** (annualization / len(daily_returns)) - 1.0
+    sharpe = (mean_ret / std_ret) * np.sqrt(annualization) if std_ret > 1e-12 else None
+    max_dd = float(drawdown.min()) if drawdown.size else 0.0
+
+    return {
+        'annual_return': float(ann_return),
+        'sharpe': float(sharpe) if sharpe is not None else None,
+        'max_drawdown': max_dd,
+        'n_days': int(len(daily_returns)),
+    }
+
+
+def load_model_and_predict(model_config, test_loader, adj_mats, num_nodes):
     """加载模型并获取预测结果（新方向：Graph-RWKV）"""
     model_path = model_config['path']
     
@@ -236,17 +313,26 @@ def load_model_and_predict(model_config, test_loader, adj_matrix, num_nodes):
         return None, None, None
     
     # 处理 w/o Graph 的情况（只用 RWKV，不用 GAT）
+    backend = str(model_config.get("temporal_backend", "rwkv")).lower()
     if not model_config['use_graph']:
         from models.base_model import GraphRWKV_Model
-        model = GraphRWKV_Model(
-            input_dim=MODEL_CONFIG['input_dim'],
-            n_embd=MODEL_CONFIG['n_embd'],
-            n_layers=MODEL_CONFIG['n_layers'],
-        ).to(DEVICE)
+        if backend in ("lstm", "gru"):
+            model = RNN_Model(
+                input_dim=MODEL_CONFIG['input_dim'],
+                n_embd=MODEL_CONFIG['n_embd'],
+                n_layers=MODEL_CONFIG['n_layers'],
+                rnn_type=backend,
+            ).to(DEVICE)
+        else:
+            model = GraphRWKV_Model(
+                input_dim=MODEL_CONFIG['input_dim'],
+                n_embd=MODEL_CONFIG['n_embd'],
+                n_layers=MODEL_CONFIG['n_layers'],
+            ).to(DEVICE)
     else:
         # 使用 Graph-RWKV 模型（根据消融配置调整图结构）
         # 注意：这里简化处理，实际应该根据 use_semantic/use_statistical 调整图
-        adj = adj_matrix  # 简化：使用完整图
+        adj = adj_mats.get(model_config.get("graph_variant", "full"), adj_mats.get("full"))
         model = GraphRWKV_GNN_Model(
             input_dim=MODEL_CONFIG['input_dim'],
             n_embd=MODEL_CONFIG['n_embd'],
@@ -254,6 +340,7 @@ def load_model_and_predict(model_config, test_loader, adj_matrix, num_nodes):
             num_nodes=num_nodes,
             adj_matrix=adj,
             gnn_embd=MODEL_CONFIG['gnn_embd'],
+            temporal_backend=backend,
         ).to(DEVICE)
     
     # 加载权重
@@ -264,6 +351,7 @@ def load_model_and_predict(model_config, test_loader, adj_matrix, num_nodes):
     all_preds = []
     all_labels = []
     all_vols = []
+    all_dates = []
     
     with torch.inference_mode():
         for batch in test_loader:
@@ -275,6 +363,9 @@ def load_model_and_predict(model_config, test_loader, adj_matrix, num_nodes):
             node_idx = batch.get('node_indices')
             if node_idx is not None:
                 node_idx = node_idx.to(DEVICE, non_blocking=True)
+            dates = batch.get('target_date')
+            if dates is not None:
+                all_dates.extend(list(dates))
             
             # 新方向：vol 参数可选
             if model_config['use_graph']:
@@ -291,7 +382,7 @@ def load_model_and_predict(model_config, test_loader, adj_matrix, num_nodes):
     labels = np.concatenate(all_labels, axis=0).flatten()
     vols = np.concatenate(all_vols, axis=0).flatten() if all_vols else None
     
-    return preds, labels, vols
+    return preds, labels, vols, all_dates
 
 
 # ================= 3. 主程序 =================
@@ -331,14 +422,15 @@ def main():
     # 加载数据
     print("\n>>> 加载测试数据...")
     train_dataset = FinancialDataset(CSV_PATH, seq_len=MODEL_CONFIG['seq_len'], mode='train')
-        test_dataset = FinancialDataset(
-            CSV_PATH,
-            seq_len=MODEL_CONFIG['seq_len'],
-            mode='test',
-            scaler=train_dataset.scaler,
-            # 【注意】新方向不使用 vol_stats，但保留参数以兼容接口
-            vol_stats=getattr(train_dataset, 'vol_stats', None),
-        )
+    test_dataset = FinancialDataset(
+        CSV_PATH,
+        seq_len=MODEL_CONFIG['seq_len'],
+        mode='test',
+        scaler=train_dataset.scaler,
+        # 【注意】新方向不使用 vol_stats，但保留参数以兼容接口
+        vol_stats=getattr(train_dataset, 'vol_stats', None),
+    )
+    MODEL_CONFIG['input_dim'] = len(train_dataset.feature_cols)
     # 更贴近服务器：用更多 worker + pin_memory（若 CUDA）
     num_workers = min(8, max(2, (os.cpu_count() or 12) - 2))
     pin_memory = torch.cuda.is_available()
@@ -358,17 +450,29 @@ def main():
     MODEL_CONFIG['batch_size'] = bs
     print(f"   测试集样本数: {len(test_dataset)}")
     
-    # 加载图
+    # 加载图（全量 + 消融）
+    adj_mats = {}
     if GRAPH_PATH and os.path.exists(GRAPH_PATH):
-        adj_matrix = np.load(GRAPH_PATH)
-        print(f"   图谱: {GRAPH_PATH}, 形状: {adj_matrix.shape}")
+        adj_mats["full"] = np.load(GRAPH_PATH)
+        print(f"   图谱(full): {GRAPH_PATH}, 形状: {adj_mats['full'].shape}")
     else:
         df_t = pd.read_csv(CSV_PATH, usecols=['Ticker'])
         num_nodes = int(df_t['Ticker'].nunique())
-        adj_matrix = np.eye(num_nodes, dtype=np.float32)
-        print(f"   未找到图谱，使用单位阵，形状: {adj_matrix.shape}")
-    
-    num_nodes = adj_matrix.shape[0]
+        adj_mats["full"] = np.eye(num_nodes, dtype=np.float32)
+        print(f"   未找到图谱，使用单位阵，形状: {adj_mats['full'].shape}")
+
+    # 可选消融图
+    semantic_path = GRAPH_PATH.replace(".npy", "_semantic.npy")
+    stat_path = GRAPH_PATH.replace(".npy", "_stat.npy")
+    nosent_path = GRAPH_PATH.replace(".npy", "_semantic_nosent.npy")
+    if os.path.exists(semantic_path):
+        adj_mats["semantic"] = np.load(semantic_path)
+    if os.path.exists(stat_path):
+        adj_mats["stat"] = np.load(stat_path)
+    if os.path.exists(nosent_path):
+        adj_mats["semantic_nosent"] = np.load(nosent_path)
+
+    num_nodes = adj_mats["full"].shape[0]
     
     # 评估所有模型
     print("\n>>> 评估所有模型...")
@@ -380,7 +484,7 @@ def main():
     
     for model_config in available_models:
         print(f"\n   📌 正在评估: {model_config['name']}...")
-        preds, labels, vol_data = load_model_and_predict(model_config, test_loader, adj_matrix, num_nodes)
+        preds, labels, vol_data, date_list = load_model_and_predict(model_config, test_loader, adj_mats, num_nodes)
         
         if preds is None:
             continue
@@ -393,12 +497,18 @@ def main():
         
         # 计算全量指标
         metrics = calculate_metrics(labels, preds)
+        bt_metrics = calculate_backtest_metrics(labels, preds, date_list, top_k=TOP_K, annualization=ANNUALIZATION)
+        metrics.update(bt_metrics)
         metrics['name'] = model_config['name']
         metrics['exp_name'] = model_config['exp_name']
         all_results.append(metrics)
         
+        ic_str = f"{metrics['ic']:.4f}" if metrics['ic'] is not None else "N/A"
         print(f"      MSE: {metrics['mse']:.6f}, R²: {metrics['r2']:.4f}, "
-              f"DirAcc: {metrics['dir_acc']:.4f}, IC: {metrics['ic']:.4f if metrics['ic'] else 'N/A'}")
+              f"DirAcc: {metrics['dir_acc']:.4f}, IC: {ic_str}")
+        if bt_metrics:
+            print(f"      Backtest: AnnRet={bt_metrics.get('annual_return'):.4f}, "
+                  f"Sharpe={bt_metrics.get('sharpe')}, MaxDD={bt_metrics.get('max_drawdown'):.4f}")
     
     # ================= 全量评估结果 =================
     print("\n" + "="*70)
@@ -406,7 +516,7 @@ def main():
     print("="*70)
     
     df_results = pd.DataFrame(all_results)
-    cols_order = ['name', 'mse', 'mae', 'rmse', 'r2', 'dir_acc', 'ic', 'rank_ic', 'n_samples']
+    cols_order = ['name', 'mse', 'mae', 'rmse', 'r2', 'dir_acc', 'ic', 'rank_ic', 'annual_return', 'sharpe', 'max_drawdown', 'n_samples']
     cols_order = [c for c in cols_order if c in df_results.columns]
     df_results = df_results[cols_order]
     
@@ -486,8 +596,12 @@ def main():
             winner_ic = "✅ Full" if (full_ic or 0) > (no_graph_ic or 0) else "❌ NoGraph"
             winner_rank_ic = "✅ Full" if (full_rank_ic or 0) > (no_graph_rank_ic or 0) else "❌ NoGraph"
             print(f"MSE               | {full_mse:<14.6f} | {no_graph_mse:<14.6f} | {winner_mse}")
-            print(f"IC                | {full_ic if full_ic else 'N/A':<14.4f} | {no_graph_ic if no_graph_ic else 'N/A':<14.4f} | {winner_ic}")
-            print(f"RankIC            | {full_rank_ic if full_rank_ic else 'N/A':<14.4f} | {no_graph_rank_ic if no_graph_rank_ic else 'N/A':<14.4f} | {winner_rank_ic}")
+            full_ic_str = f"{full_ic:.4f}" if full_ic is not None else "N/A"
+            no_graph_ic_str = f"{no_graph_ic:.4f}" if no_graph_ic is not None else "N/A"
+            full_ric_str = f"{full_rank_ic:.4f}" if full_rank_ic is not None else "N/A"
+            no_graph_ric_str = f"{no_graph_rank_ic:.4f}" if no_graph_rank_ic is not None else "N/A"
+            print(f"IC                | {full_ic_str:<14} | {no_graph_ic_str:<14} | {winner_ic}")
+            print(f"RankIC            | {full_ric_str:<14} | {no_graph_ric_str:<14} | {winner_rank_ic}")
             
             # 结论
             if full_mse < no_graph_mse:

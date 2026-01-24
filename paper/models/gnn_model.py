@@ -40,8 +40,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
+try:
+    from torch_geometric.nn import GATv2Conv
+    _HAS_PYG = True
+except Exception:
+    _HAS_PYG = False
+
 # 从同目录的 base_model.py 复用：GraphRWKV_Model（新方向核心模型）、RWKV_TimeMixing
-from .base_model import GraphRWKV_Model, QL_MATCC_Model, RWKV_TimeMixing
+from .base_model import GraphRWKV_Model, QL_MATCC_Model, RWKV_TimeMixing, RNN_TemporalEncoder
 # 【注意】Quantum_ChannelMixing、MATCCDecompose 在新方向中不使用，已注释
 
 
@@ -105,6 +111,10 @@ class GraphAttentionLayer(nn.Module):
             a_input = self._prepare_attentional_mechanism_input(Wh_head)  # (N, N, 2*head_dim)
             e = self.leakyrelu(torch.matmul(a_input, self.a[head_idx]).squeeze(2))  # (N, N)
 
+            # 支持边权重：将权重作为注意力先验
+            if adj is not None:
+                e = e + torch.log(adj.clamp(min=1e-6))
+
             # 【优化 #3】稀疏掩码：只对有边的位置计算注意力
             zero_vec = -9e15 * torch.ones_like(e)
             attention = torch.where(adj > 0, e, zero_vec)
@@ -160,32 +170,65 @@ class GraphRWKV_GNN_Model(nn.Module):
         gnn_embd=None,
         dropout=0.1,
         max_neighbors: int = 32,
+        use_pyg: bool | None = None,
+        temporal_backend: str = "rwkv",
     ):
         super().__init__()
         gnn_embd = gnn_embd or min(n_embd, 64)
         self.max_neighbors = int(max_neighbors)
+        self.use_pyg = bool(_HAS_PYG if use_pyg is None else use_pyg)
 
-        # ----- 1. 时序编码器：使用 GraphRWKV_Model（新方向核心）-----
-        self.temporal_encoder = GraphRWKV_Model(
-            input_dim=input_dim,
-            n_embd=n_embd,
-            n_layers=n_layers,
-            dropout=dropout,
-        )
-        # 去掉 head，只做特征提取（供 GAT 使用）
-        self.temporal_encoder.head = nn.Identity()
-        self.temporal_encoder.pre_head_dropout = nn.Identity()
+        # ----- 1. 时序编码器：支持 RWKV/LSTM/GRU -----
+        temporal_backend = str(temporal_backend).lower()
+        if temporal_backend in ("lstm", "gru"):
+            self.temporal_encoder = RNN_TemporalEncoder(
+                input_dim=input_dim,
+                n_embd=n_embd,
+                n_layers=n_layers,
+                dropout=dropout,
+                rnn_type=temporal_backend,
+            )
+        else:
+            self.temporal_encoder = GraphRWKV_Model(
+                input_dim=input_dim,
+                n_embd=n_embd,
+                n_layers=n_layers,
+                dropout=dropout,
+            )
+            # 去掉 head，只做特征提取（供 GAT 使用）
+            self.temporal_encoder.head = nn.Identity()
+            self.temporal_encoder.pre_head_dropout = nn.Identity()
 
         # 若 GAT 使用较小维度以省显存，则先做投影
         self.gnn_proj = nn.Linear(n_embd, gnn_embd) if gnn_embd != n_embd else nn.Identity()
 
         # ----- 2. 图注意力层 GAT -----
-        self.gnn = GraphAttentionLayer(
-            in_features=gnn_embd,
-            out_features=gnn_embd,
-            dropout=dropout,
-            alpha=0.2,
-        )
+        if self.use_pyg:
+            try:
+                self.gnn = GATv2Conv(
+                    gnn_embd,
+                    gnn_embd,
+                    heads=2,
+                    concat=False,
+                    dropout=dropout,
+                    edge_dim=1,
+                    add_self_loops=False,
+                )
+            except Exception:
+                self.use_pyg = False
+                self.gnn = GraphAttentionLayer(
+                    in_features=gnn_embd,
+                    out_features=gnn_embd,
+                    dropout=dropout,
+                    alpha=0.2,
+                )
+        else:
+            self.gnn = GraphAttentionLayer(
+                in_features=gnn_embd,
+                out_features=gnn_embd,
+                dropout=dropout,
+                alpha=0.2,
+            )
         
         # 【新增】GAT 后的 LayerNorm，稳定图特征
         self.gnn_ln = nn.LayerNorm(gnn_embd)
@@ -313,7 +356,12 @@ class GraphRWKV_GNN_Model(nn.Module):
 
             # 注意：这里构造的是诱导子图的 dense 邻接；当图节点规模在几百（S&P500）时非常快
             sub_adj = adj.index_select(0, sub_nodes).index_select(1, sub_nodes)
-            sub_out = self.gnn(sub_feats, sub_adj)
+            if self.use_pyg:
+                edge_index = (sub_adj > 0).nonzero(as_tuple=False).t().contiguous()
+                edge_attr = sub_adj[edge_index[0], edge_index[1]].view(-1, 1)
+                sub_out = self.gnn(sub_feats, edge_index, edge_attr)
+            else:
+                sub_out = self.gnn(sub_feats, sub_adj)
             sub_out = self.gnn_ln(sub_out)
 
             # 取回 batch 节点的图特征，并映射回每条样本

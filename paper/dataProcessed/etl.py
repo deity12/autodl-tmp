@@ -11,6 +11,7 @@ ETL脚本：股票价格和新闻数据清洗与合并
 """
 
 import pandas as pd
+import numpy as np
 import os
 import glob
 from tqdm import tqdm
@@ -27,7 +28,7 @@ if not os.path.exists(OUTPUT_DIR):
 
 # ================= 时间范围配置 =================
 # 设定数据提取的时间范围（与论文研究期间一致）
-START_DATE = '2019-01-01'  # 起始日期
+START_DATE = '2018-01-01'  # 起始日期
 END_DATE = '2023-12-31'    # 结束日期
 
 # ================= 16:00 Cut-off 时间配置 =================
@@ -76,7 +77,7 @@ def merge_stock_prices():
             
             # 从文件名提取股票代码（Ticker）
             # 例如：AAPL.csv -> AAPL，并统一转换为大写格式
-            ticker = os.path.basename(filename).replace('.csv', '').upper()
+            ticker = os.path.basename(filename).replace('.csv', '').upper().replace("-", ".")
             df['Ticker'] = ticker  # 新增的列默认首字母大写，保持一致性
             
             # 核心数据清洗流程
@@ -151,6 +152,19 @@ def process_huge_news_file(valid_tickers):
         print(f"❌ 找不到新闻文件: {RAW_NEWS_FILE}")
         return
 
+    # 交易日历：用于把周末/假期新闻对齐到“下一交易日”，避免新闻丢失。
+    # 优先从已生成的 Stock_Prices.csv 中提取全局交易日序列。
+    trading_days = None
+    price_path = os.path.join(OUTPUT_DIR, "Stock_Prices.csv")
+    if os.path.exists(price_path):
+        try:
+            df_dates = pd.read_csv(price_path, usecols=["Date"])
+            td = pd.to_datetime(df_dates["Date"], errors="coerce").dropna().dt.normalize().unique()
+            trading_days = np.sort(td)
+        except Exception as e:
+            print(f"⚠️ 无法加载交易日历，将使用自然日对齐: {e}")
+            trading_days = None
+
     # 设置分块大小：每次读取10万行，防止内存溢出
     CHUNK_SIZE = 100000 
     cleaned_chunks = []  # 存储所有清洗后的数据块
@@ -162,52 +176,50 @@ def process_huge_news_file(valid_tickers):
     for i, chunk in enumerate(reader):
         # 1. 时间处理：过滤指定时间范围的数据，并实现 16:00 cut-off 对齐
         if 'Date' in chunk.columns:
-            # 将日期列转换为datetime类型，无效日期转为NaN
-            # 注意：如果原始数据包含时间戳（如 '2023-01-01 15:30:00'），pd.to_datetime 会自动解析
-            chunk['Date'] = pd.to_datetime(chunk['Date'], errors='coerce')
-            # 删除日期为NaN的行
-            chunk = chunk.dropna(subset=['Date'])
-            
-            # 【关键创新】16:00 Cut-off 时间对齐逻辑
-            # 如果 Date 列包含时间信息（datetime），则根据时间判断归属日期
-            # 如果 Date 列只有日期信息（date），则默认归入当日（假设为收盘前发布）
-            if chunk['Date'].dtype == 'datetime64[ns]':
-                # 提取日期部分（不包含时间）
-                chunk['Date_Only'] = chunk['Date'].dt.date
-                # 提取时间部分（小时和分钟）
-                chunk['Time'] = chunk['Date'].dt.time
-                
-                # 判断每条新闻是否在 16:00 之前发布
-                # 如果时间 >= 16:00，则归入次日；否则归入当日
-                cutoff_time = pd.Timestamp(f"{CUTOFF_HOUR:02d}:{CUTOFF_MINUTE:02d}").time()
-                chunk['Is_Before_Cutoff'] = chunk['Time'] < cutoff_time
-                
-                # 根据 cut-off 规则调整日期归属
-                # 16:00 之前的新闻归入当日，16:00 之后的归入次日
-                chunk['Aligned_Date'] = chunk['Date_Only'].copy()
-                # 16:00 之后的新闻，日期加1天
-                mask_after_cutoff = ~chunk['Is_Before_Cutoff']
-                if mask_after_cutoff.any():
-                    chunk.loc[mask_after_cutoff, 'Aligned_Date'] = (
-                        pd.to_datetime(chunk.loc[mask_after_cutoff, 'Date_Only']) + pd.Timedelta(days=1)
-                    ).dt.date
-                
-                # 使用对齐后的日期替换原始 Date 列
-                chunk['Date'] = pd.to_datetime(chunk['Aligned_Date'])
-                
-                # 清理临时列
-                chunk = chunk.drop(columns=['Date_Only', 'Time', 'Is_Before_Cutoff', 'Aligned_Date'], errors='ignore')
+            # 【严格规范】FNSPID 时间戳极大概率为 UTC：必须先 tz_convert('US/Eastern')，再按 16:00 做 cut-off。
+            # 严禁在 UTC 上直接按 16:00 截断，否则会产生系统性日期错配（尤其是夏令时/DST）。
+            ts_utc = pd.to_datetime(chunk["Date"], errors="coerce", utc=True)
+            valid_ts = ts_utc.notna()
+            if valid_ts.any():
+                chunk = chunk.loc[valid_ts].copy()
+                ts_utc = ts_utc.loc[valid_ts]
+
+                ts_et = ts_utc.dt.tz_convert("US/Eastern")
+
+                # 16:00 cut-off（基于美东时间，包含秒级，且 16:00:00 归入当日）
+                cutoff_seconds = int(CUTOFF_HOUR) * 3600 + int(CUTOFF_MINUTE) * 60
+                secs = (
+                    ts_et.dt.hour * 3600
+                    + ts_et.dt.minute * 60
+                    + ts_et.dt.second
+                    + ts_et.dt.microsecond / 1_000_000.0
+                )
+                is_before_cutoff = secs <= cutoff_seconds
+
+                aligned_day_et = ts_et.dt.normalize()
+                aligned_day_et = aligned_day_et.where(is_before_cutoff, aligned_day_et + pd.Timedelta(days=1))
+                aligned_day = aligned_day_et.dt.tz_localize(None)  # tz-aware -> tz-naive，便于后续 merge
+
+                # 周末/假期对齐到下一交易日（如果交易日历可用）
+                if trading_days is not None and len(trading_days) > 0:
+                    idx = np.searchsorted(trading_days, aligned_day.values.astype("datetime64[ns]"), side="left")
+                    out = np.full(shape=idx.shape, fill_value=np.datetime64("NaT"), dtype="datetime64[ns]")
+                    ok = idx < len(trading_days)
+                    out[ok] = trading_days[idx[ok]]
+                    chunk["Date"] = out
+                else:
+                    chunk["Date"] = aligned_day.values.astype("datetime64[ns]")
+
+                # 只保留指定时间范围内的数据（使用对齐后的交易日）
+                chunk = chunk.dropna(subset=["Date"])
+                chunk = chunk[(chunk["Date"] >= START_DATE) & (chunk["Date"] <= END_DATE)]
             else:
-                # 如果只有日期信息，默认归入当日（假设为收盘前发布）
-                chunk['Date'] = pd.to_datetime(chunk['Date'])
-            
-            # 只保留指定时间范围内的数据（使用对齐后的日期）
-            chunk = chunk[(chunk['Date'] >= START_DATE) & (chunk['Date'] <= END_DATE)]
+                chunk = chunk.iloc[0:0]
         
         # 2. 股票代码处理：只保留有对应股价数据的股票新闻
         if 'Stock_symbol' in chunk.columns and valid_tickers:
             # 统一股票代码为大写格式（与股价数据中的格式一致）
-            chunk['Stock_symbol'] = chunk['Stock_symbol'].astype(str).str.upper()
+            chunk['Stock_symbol'] = chunk['Stock_symbol'].astype(str).str.upper().str.replace("-", ".", regex=False)
             # 只保留在有效股票代码列表中的新闻
             chunk = chunk[chunk['Stock_symbol'].isin(valid_tickers)]
             # 重命名为 Ticker，与股价数据保持一致

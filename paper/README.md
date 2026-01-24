@@ -39,6 +39,7 @@
 ### 安装依赖（示例）
 
 ```bash
+pip install -r requirements.txt
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 pip install pandas numpy scikit-learn matplotlib tqdm akshare transformers
 ```
@@ -81,25 +82,28 @@ python -m dataProcessed.download_market_index
 cd /root/autodl-tmp/paper
 ```
 
+可选：先做环境检查
+
+```bash
+python check_environment.py
+```
+
 ### 方式 A：分步运行（推荐，最清晰、最稳）
 
 ```bash
-# 1) ETL：合并个股行情 + 从新闻大文件抽取（输出 Stock_Prices.csv / Stock_News.csv）
-python -m dataProcessed.etl
+# 1) 预处理：ETL + 对齐（输出 Stock_Prices.csv / Stock_News.csv / Final_Model_Data.csv）
+python 1_preprocess_data.py --run_align
 
-# 2) 对齐：个股 + 大盘 + 新闻，并生成标签/特征（输出 Final_Model_Data.csv）
-python -m dataProcessed.align
+# 2) 建图：从训练期新闻抽取股票关系（输出 Graph_Adjacency.npy + Graph_Tickers.json）
+python 2_build_graph.py --llm
 
-# 3) 建图：从训练期新闻抽取股票关系（输出 Graph_Adjacency.npy + tickers.json）
-python -m dataProcessed.build_graph --use_llm
-
-# 4) 训练全量模型（输出 best_model.pth + logs/figures）
+# 3) 训练全量模型（输出 best_model.pth + logs/figures）
 python 3_train.py
 
-# 5) 消融实验（新方向：w/o_graph, w/o_semantic, w/o_statistical, w/o_sentiment）
+# 4) 消融实验（新方向：w/o_graph, w/o_semantic, w/o_statistical, w/o_sentiment）
 python 3_train_ablation.py --ablation all
 
-# 6) 评估与出图
+# 5) 评估与出图
 python 4_evaluate.py --checkpoint ./outputs/best_model.pth --test_data ./data/processed/test.csv
 ```
 
@@ -127,7 +131,7 @@ python -m dataProcessed.build_graph --use_llm
 
 ```bash
 cd /root/autodl-tmp/paper
-./run_optimized.sh
+python run_all.py
 ```
 
 说明：`run_optimized.sh` 是“流程编排脚本”，但其注释/提示中个别超参描述可能与当前训练脚本默认值不一致；**最终以 `training/train_full.py` / `training/train_ablation.py` 中的 `CONFIG/BASE_CONFIG` 为准**。
@@ -145,10 +149,10 @@ cd /root/autodl-tmp/paper
   输出 `data/processed/Final_Model_Data.csv`
 - `build_graph.py`：从训练期新闻构建关系图，输出
   - `data/processed/Graph_Adjacency.npy`：邻接矩阵（无向，含自环）
-  - `data/processed/Graph_Adjacency_tickers.json`：节点顺序（用于与 Dataset 的 `ticker2idx` 对齐）
+- `data/processed/Graph_Tickers.json`：节点顺序（用于与 Dataset 的 `ticker2idx` 对齐）
   关键机制：S&P500 过滤、分层采样、LLM 批处理抽取、断点续跑、自动 OOM 降级、严格防未来泄露
 - `dataset.py`：`FinancialDataset`，把 `Final_Model_Data.csv` 变成训练样本：
-  - 输入 `x`：过去 `seq_len(=30)` 天 × 8 个特征
+  - input `x`: past `seq_len(=30)` days x F features (F=8 or 158, controlled by feature_columns.json)
   - 标签 `y`：目标日 `Log_Ret`
   - `vol`：波动率
   - `node_indices`：股票在图中的节点编号
@@ -168,7 +172,7 @@ cd /root/autodl-tmp/paper
 ### `training/`：训练与消融
 
 - `train_full.py`：训练完整模型（默认配置：`n_embd=256, n_layers=3, gnn_embd=64, batch=512, epochs=30, dropout=0.1`）
-  - 支持 AMP、梯度裁剪、早停、按日期分组 batch、可选 RankNet 排序损失
+  - 支持 AMP、梯度裁剪、早停、按日期分组 batch、可选 RankIC/RankNet 排序损失
   - 【注意】新方向不使用量子门控，不再需要 q_threshold 和差异化学习率
 - `train_ablation.py`：消融实验（已注释：新方向不使用 Quantum、MATCC，不再需要这些消融实验）
 - `date_batch_sampler.py`：按 `target_date` 做 batch 的采样器（股票排序/RankIC 口径常用）
@@ -189,7 +193,7 @@ cd /root/autodl-tmp/paper
 - `Stock_News.csv`：过滤后的新闻
 - `Final_Model_Data.csv`：对齐后的训练表（特征 + 标签 + 新闻聚合）
 - `Graph_Adjacency.npy`：关系图邻接矩阵
-- `Graph_Adjacency_tickers.json`：邻接矩阵对应的 ticker 顺序（**非常关键**）
+- `Graph_Tickers.json`：邻接矩阵对应的 ticker 顺序（**非常关键**）
 
 ### 训练阶段（`paper/outputs/`）
 
@@ -247,7 +251,7 @@ cd /root/autodl-tmp/paper
 解决：
 
 - 删除旧图并用同一份 `Final_Model_Data.csv` 重新生成：
-  - 删除 `data/processed/Graph_Adjacency.npy` 和 `data/processed/Graph_Adjacency_tickers.json`
+  - 删除 `data/processed/Graph_Adjacency.npy` 和 `data/processed/Graph_Tickers.json`
   - 重新运行 `python -m dataProcessed.build_graph --use_llm`
 
 ### 2) LLM 建图 OOM 或太慢
