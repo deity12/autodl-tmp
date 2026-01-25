@@ -254,7 +254,7 @@ PAPER_CONFIG = {
     'walk_forward_test_end': '2023-12-31',
     'walk_forward_freq': 'Q',
     # 训练/评估日期范围（由 walk-forward 覆盖）
-    'train_start': None,
+    'train_start': '2018-01-01',
     'train_end': '2020-12-31',
     'test_start': None,
     'test_end': None,

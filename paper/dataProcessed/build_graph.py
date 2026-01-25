@@ -89,7 +89,10 @@ LLM_DO_SAMPLE_DEFAULT = os.environ.get("LLM_DO_SAMPLE", "0") == "1"
 # ================= S&P 500 成分股（2023年版本，约500只）=================
 # 这是学术研究中常用的核心股票列表
 # 数据来源：Wikipedia / Yahoo Finance
-SP500_TICKERS = {
+# 注意：优先尝试从本地 sp500_list.txt 加载（便于审计与复现）；找不到则回退到内置列表。
+
+# 内置回退列表（保留以防没有本地文件或无法联网）
+_HARDCODED_SP500_TICKERS = {
     # 信息技术 (Information Technology)
     'AAPL', 'MSFT', 'NVDA', 'AVGO', 'CSCO', 'ADBE', 'CRM', 'ORCL', 'ACN', 'IBM',
     'INTC', 'AMD', 'QCOM', 'TXN', 'AMAT', 'MU', 'LRCX', 'ADI', 'KLAC', 'SNPS',
@@ -154,7 +157,45 @@ SP500_TICKERS = {
     'NEE', 'DUK', 'SO', 'D', 'AEP', 'SRE', 'EXC', 'XEL', 'ED', 'PEG',
     'WEC', 'ES', 'AWK', 'DTE', 'EIX', 'ETR', 'FE', 'PPL', 'AEE', 'CMS',
     'CNP', 'EVRG', 'ATO', 'NI', 'LNT', 'PNW', 'NRG', 'CEG',
+
 }
+
+
+def _sp500_list_candidates():
+    return [
+        os.path.join(PROJECT_ROOT, "sp500_list.txt"),
+        os.path.join(PROJECT_ROOT, "data", "raw", "FNSPID", "sp500_list.txt"),
+        os.path.join(PROJECT_ROOT, "paper", "data", "raw", "FNSPID", "sp500_list.txt"),
+    ]
+
+
+def load_sp500_list_from_file(path=None):
+    """尝试从本地文件加载 S&P500 列表，返回 set(tickers) 或 None（未找到/空）。
+
+    规范化规则：strip, upper, 将 '-' 统一为 '.' 以匹配代码库中的规范。
+    """
+    paths = [path] if path else _sp500_list_candidates()
+    for p in paths:
+        if not p:
+            continue
+        try:
+            if os.path.exists(p):
+                with open(p, "r", encoding="utf-8") as f:
+                    tickers = {
+                        line.strip().upper().replace("-", ".")
+                        for line in f
+                        if line.strip() and not line.strip().startswith("#")
+                    }
+                if tickers:
+                    print(f"[INFO] Loaded S&P500 tickers from: {p} (N={len(tickers)})")
+                    return tickers
+        except Exception as e:
+            print(f"[WARN] Failed to read sp500 list {p}: {e}")
+    return None
+
+
+# 最终生效的 SP500_TICKERS：优先来自本地文件，否则使用内置回退列表
+SP500_TICKERS = load_sp500_list_from_file() or _HARDCODED_SP500_TICKERS
 
 # 是否只使用 S&P 500 成分股（强烈推荐用于论文）
 USE_SP500_ONLY = True
@@ -768,6 +809,7 @@ def build_dynamic_graph(
     save_relations=SAVE_RELATIONS_PARQUET,
     use_cached_relations=USE_CACHED_RELATIONS,
     relations_partition_cols=RELATIONS_PARTITION_COLS,
+    split_date=None,
 ):
     """
     构建动态图谱
@@ -858,21 +900,19 @@ def build_dynamic_graph(
     failures = 0
     relation_records = [] if save_relations else None
 
-    # =========================== 防止"未来信息"数据泄露：split_date ===========================
-    split_date = None
-    try:
-        df_price_for_split = pd.read_csv(INPUT_MODEL_DATA, usecols=['Date'])
-        df_price_for_split['Date'] = pd.to_datetime(df_price_for_split['Date'])
-        unique_dates = sorted(df_price_for_split['Date'].unique())
-        if len(unique_dates) >= 2:
-            split_idx = int(len(unique_dates) * 0.8)
-            split_idx = min(split_idx, len(unique_dates) - 1)
-            split_date = unique_dates[split_idx]
-            print(f"\n[防泄露] 切分日期 split_date = {split_date}")
-        else:
-            print("[WARN] 日期不足，跳过防泄露过滤。")
-    except Exception as e:
-        print(f"[ERROR] split_date 计算失败: {e}，将跳过防泄露过滤。")
+    # =========================== 防止"未来信息"数据泄露：强制 split_date ===========================
+    # [FIXED] 不再自动计算 80% 切分，而是强制从外部参数传入
+    if split_date:
+        try:
+            split_date_ts = pd.to_datetime(split_date)
+            split_date = split_date_ts
+            print(f"\n[Strict Data Leakage Prevention] Graph Cut-off Date: {split_date}")
+        except Exception as e:
+            print(f"[ERROR] 无效的 split_date 参数: {e}，将忽略防泄露过滤。")
+            split_date = None
+    else:
+        print("\n[WARN] 未指定 split_date！图谱可能包含全量数据（仅供调试，严禁用于论文实验）！")
+        split_date = None
 
     # =========================== 离线关系优先模式 ===========================
     use_cached_ready = bool(use_cached_relations and relations_parquet_path and os.path.exists(relations_parquet_path))
@@ -1447,6 +1487,8 @@ if __name__ == "__main__":
     parser.add_argument('--max_per_ticker', type=int, default=MAX_NEWS_PER_TICKER, help='每个股票最多采样多少条新闻')
     parser.add_argument('--max_total', type=int, default=MAX_TOTAL_NEWS, help='总共最多处理多少条新闻')
     parser.add_argument('--all_stocks', action='store_true', help='使用全量股票（默认只用 S&P 500）')
+    parser.add_argument('--split_date', type=str, default='2020-12-31', 
+                        help='图谱构建截止日期（必须与训练集结束日期严格一致，防泄露）')
     
     args = parser.parse_args()
     
@@ -1479,4 +1521,5 @@ if __name__ == "__main__":
         max_per_ticker=args.max_per_ticker,
         max_total=args.max_total,
         use_sp500=not args.all_stocks  # 默认使用 S&P 500
+        ,split_date=args.split_date
     )

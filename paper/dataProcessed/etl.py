@@ -17,10 +17,43 @@ import glob
 from tqdm import tqdm
 
 # ================= 配置路径 =================
-# 【注意】请根据你的实际文件夹层级调整这里，如果有两层 full_history 记得加上
-RAW_PRICES_DIR = './data/raw/FNSPID/full_history/'  # 股价CSV文件所在目录
-RAW_NEWS_FILE = './data/raw/FNSPID/nasdaq_exteral_data.csv'  # 新闻数据大文件路径
-OUTPUT_DIR = './data/processed/'  # 处理后的数据输出目录
+# 使用基于脚本位置的路径，避免依赖当前工作目录导致的路径不一致
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+RAW_PRICES_DIR = os.path.join(PROJECT_ROOT, 'data', 'raw', 'FNSPID', 'full_history')  # 股价CSV文件所在目录
+RAW_NEWS_FILE = os.path.join(PROJECT_ROOT, 'data', 'raw', 'FNSPID', 'nasdaq_exteral_data.csv')  # 新闻数据大文件路径
+OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'data', 'processed')  # 处理后的数据输出目录
+
+# 自动创建输出目录（如果不存在）
+if not os.path.exists(OUTPUT_DIR):
+    os.makedirs(OUTPUT_DIR)
+
+# ================= 时间范围配置 =================
+"""
+ETL脚本：股票价格和新闻数据清洗与合并
+
+功能：
+1. 合并数千个个股CSV文件为统一的股价数据文件
+2. 流式处理23GB新闻大文件，提取指定时间范围和股票代码的新闻
+
+输出：
+- Stock_Prices.csv: 合并后的股价数据（包含Date, Ticker, Open, Close, High, Low, Volume）
+- Stock_News.csv: 清洗后的新闻数据（包含Date, Ticker, Headline, Publisher）
+"""
+
+import pandas as pd
+import numpy as np
+import os
+import glob
+from tqdm import tqdm
+
+# ================= 配置路径 =================
+# 使用基于脚本位置的路径，避免依赖当前工作目录导致的路径不一致
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+RAW_PRICES_DIR = os.path.join(PROJECT_ROOT, 'data', 'raw', 'FNSPID', 'full_history')  # 股价CSV文件所在目录
+RAW_NEWS_FILE = os.path.join(PROJECT_ROOT, 'data', 'raw', 'FNSPID', 'nasdaq_exteral_data.csv')  # 新闻数据大文件路径
+OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'data', 'processed')  # 处理后的数据输出目录
 
 # 自动创建输出目录（如果不存在）
 if not os.path.exists(OUTPUT_DIR):
@@ -132,28 +165,15 @@ def merge_stock_prices():
 def process_huge_news_file(valid_tickers):
     """
     流式处理23GB新闻大文件，提取指定时间范围和股票代码的新闻
-    
-    采用分块读取（chunk processing）方式，避免一次性加载整个文件导致内存溢出
-    
-    Args:
-        valid_tickers (list): 有效的股票代码列表（从股价数据中提取）
-    
-    处理流程：
-    1. 分块读取大文件（每次10万行）
-    2. 对每个数据块进行时间过滤
-    3. 对每个数据块进行股票代码过滤
-    4. 只保留关键列，节省存储空间
-    5. 合并所有清洗后的数据块并保存
+    【修正版】：针对无时间戳数据实施"保守型 T+1 偏移"策略，解决前瞻偏差。
     """
-    print("\n>>> 正在流式处理 23GB 新闻大文件...")
+    print("\n>>> 正在流式处理 23GB 新闻大文件 (启动保守型防泄露策略)...")
     
-    # 检查文件是否存在
     if not os.path.exists(RAW_NEWS_FILE):
         print(f"❌ 找不到新闻文件: {RAW_NEWS_FILE}")
         return
 
-    # 交易日历：用于把周末/假期新闻对齐到“下一交易日”，避免新闻丢失。
-    # 优先从已生成的 Stock_Prices.csv 中提取全局交易日序列。
+    # 加载交易日历
     trading_days = None
     price_path = os.path.join(OUTPUT_DIR, "Stock_Prices.csv")
     if os.path.exists(price_path):
@@ -162,45 +182,41 @@ def process_huge_news_file(valid_tickers):
             td = pd.to_datetime(df_dates["Date"], errors="coerce").dropna().dt.normalize().unique()
             trading_days = np.sort(td)
         except Exception as e:
-            print(f"⚠️ 无法加载交易日历，将使用自然日对齐: {e}")
-            trading_days = None
+            print(f"⚠️ 无法加载交易日历: {e}")
 
-    # 设置分块大小：每次读取10万行，防止内存溢出
     CHUNK_SIZE = 100000 
-    cleaned_chunks = []  # 存储所有清洗后的数据块
+    cleaned_chunks = []
     
-    # 创建分块读取器：chunksize指定每块大小，on_bad_lines='skip'跳过格式错误的行
-    warned_missing_time = False
-    reader = pd.read_csv(RAW_NEWS_FILE, chunksize=CHUNK_SIZE, on_bad_lines='skip')
+    # 【修复】添加 low_memory=False 解决 DtypeWarning
+    reader = pd.read_csv(RAW_NEWS_FILE, chunksize=CHUNK_SIZE, on_bad_lines='skip', low_memory=False)
     
-    # 逐块处理数据
+    # 状态标记
+    has_warned_resolution = False
+
     for i, chunk in enumerate(reader):
-        # 1. 时间处理：过滤指定时间范围的数据，并实现 16:00 cut-off 对齐
         if 'Date' in chunk.columns:
-            # 【严格规范】FNSPID 时间戳极大概率为 UTC：必须先 tz_convert('US/Eastern')，再按 16:00 做 cut-off。
-            # 严禁在 UTC 上直接按 16:00 截断，否则会产生系统性日期错配（尤其是夏令时/DST）。
+            # 1. 基础转换
             ts_utc = pd.to_datetime(chunk["Date"], errors="coerce", utc=True)
             valid_ts = ts_utc.notna()
-            if not warned_missing_time and valid_ts.any():
-                ts_valid = ts_utc.loc[valid_ts]
-                zero_time = (
-                    (ts_valid.dt.hour == 0)
-                    & (ts_valid.dt.minute == 0)
-                    & (ts_valid.dt.second == 0)
-                )
-                if zero_time.mean() > 0.9:
-                    print(
-                        "\033[91m[CRITICAL WARN] Source data lacks specific time (HH:MM:SS). "
-                        "16:00 cut-off strategy might fail!\033[0m"
-                    )
-                    warned_missing_time = True
+            
             if valid_ts.any():
                 chunk = chunk.loc[valid_ts].copy()
                 ts_utc = ts_utc.loc[valid_ts]
 
+                # 【核心修正】检测分钟级精度丢失 (00:00:00)
+                # 如果是 00:00:00，说明是日级别数据，必须强制 +1 天以防泄露
+                is_daily_res = (ts_utc.dt.hour == 0) & (ts_utc.dt.minute == 0) & (ts_utc.dt.second == 0)
+                
+                # 仅打印一次提示
+                if is_daily_res.mean() > 0.9 and not has_warned_resolution:
+                    print("\n[INFO] 检测到数据主要是日级别精度 (00:00:00)。")
+                    print("       >>> 已启动【保守型防泄露策略】：强制将此类新闻归入 T+1 日。")
+                    has_warned_resolution = True
+
+                # 2. 转美东时间
                 ts_et = ts_utc.dt.tz_convert("US/Eastern")
 
-                # 16:00 cut-off（基于美东时间，包含秒级，且 16:00:00 归入当日）
+                # 3. 计算 16:00 Cut-off
                 cutoff_seconds = int(CUTOFF_HOUR) * 3600 + int(CUTOFF_MINUTE) * 60
                 secs = (
                     ts_et.dt.hour * 3600
@@ -210,11 +226,18 @@ def process_huge_news_file(valid_tickers):
                 )
                 is_before_cutoff = secs <= cutoff_seconds
 
+                # 4. 对齐逻辑
                 aligned_day_et = ts_et.dt.normalize()
+                # 正常逻辑：收盘后 -> T+1
                 aligned_day_et = aligned_day_et.where(is_before_cutoff, aligned_day_et + pd.Timedelta(days=1))
-                aligned_day = aligned_day_et.dt.tz_localize(None)  # tz-aware -> tz-naive，便于后续 merge
+                
+                # 【Plan B 修正】：对于 00:00:00 的数据，强制再加一天
+                # 这样即使该新闻是当天盘后发生的，也会被安全地归入明天
+                aligned_day_et[is_daily_res] += pd.Timedelta(days=1)
 
-                # 周末/假期对齐到下一交易日（如果交易日历可用）
+                aligned_day = aligned_day_et.dt.tz_localize(None)
+
+                # 5. 交易日历对齐
                 if trading_days is not None and len(trading_days) > 0:
                     idx = np.searchsorted(trading_days, aligned_day.values.astype("datetime64[ns]"), side="left")
                     out = np.full(shape=idx.shape, fill_value=np.datetime64("NaT"), dtype="datetime64[ns]")
@@ -224,50 +247,31 @@ def process_huge_news_file(valid_tickers):
                 else:
                     chunk["Date"] = aligned_day.values.astype("datetime64[ns]")
 
-                # 只保留指定时间范围内的数据（使用对齐后的交易日）
                 chunk = chunk.dropna(subset=["Date"])
                 chunk = chunk[(chunk["Date"] >= START_DATE) & (chunk["Date"] <= END_DATE)]
             else:
                 chunk = chunk.iloc[0:0]
         
-        # 2. 股票代码处理：只保留有对应股价数据的股票新闻
+        # 股票代码过滤
         if 'Stock_symbol' in chunk.columns and valid_tickers:
-            # 统一股票代码为大写格式（与股价数据中的格式一致）
             chunk['Stock_symbol'] = chunk['Stock_symbol'].astype(str).str.upper().str.replace("-", ".", regex=False)
-            # 只保留在有效股票代码列表中的新闻
             chunk = chunk[chunk['Stock_symbol'].isin(valid_tickers)]
-            # 重命名为 Ticker，与股价数据保持一致
             chunk = chunk.rename(columns={'Stock_symbol': 'Ticker'})
             
-        # 3. 保存清洗后的数据块
         if not chunk.empty:
-            # 【优化】: 这里的列名需要对应原始CSV里的列名
-            # 如果原始列名是 Article_title，这里就要写 Article_title
-            # 只保留关键列，丢弃全文内容以节省存储空间
             keep_cols = ['Date', 'Ticker', 'Article_title', 'Publisher'] 
-            # 只选择实际存在的列（防止某些列不存在）
             actual_cols = [c for c in keep_cols if c in chunk.columns]
-            
-            # 创建临时数据框副本，避免修改原始chunk
             temp_df = chunk[actual_cols].copy()
-            # 【关键】: 重命名 Article_title -> Headline，为了对接后续分析代码
-            # 统一列名便于后续处理和分析
             if 'Article_title' in temp_df.columns:
                 temp_df = temp_df.rename(columns={'Article_title': 'Headline'})
-            
-            # 将清洗后的数据块添加到列表
             cleaned_chunks.append(temp_df)
             
-        # 每处理10个数据块，打印一次进度（使用\r实现同一行更新）
         if i % 10 == 0:
             print(f"已处理 {i * CHUNK_SIZE} 行...", end='\r')
 
-    # 合并所有清洗后的数据块
     if cleaned_chunks:
-        # 使用 concat 合并所有数据块，ignore_index=True 重新生成索引
         full_news_df = pd.concat(cleaned_chunks, ignore_index=True)
         output_path = os.path.join(OUTPUT_DIR, 'Stock_News.csv')
-        # 保存为CSV文件，不包含行索引
         full_news_df.to_csv(output_path, index=False)
         print(f"\n✅ 新闻清洗完成！已保存至: {output_path}")
         print(f"提取新闻条数: {len(full_news_df)}")

@@ -240,6 +240,17 @@ def build_feature_file(
     use_pandas_ta: bool = True,
     windows: List[int] | None = None,
 ) -> Tuple[str, List[str]]:
+    # 如果用户指定的 prices_csv 不存在，则回退到项目内的 data/processed/Stock_Prices.csv
+    if not os.path.exists(prices_csv):
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.dirname(script_dir)
+        fallback = os.path.join(project_root, "data", "processed", "Stock_Prices.csv")
+        if os.path.exists(fallback):
+            print(f"[WARN] 未找到指定文件 {prices_csv}，回退使用 {fallback}")
+            prices_csv = fallback
+        else:
+            raise FileNotFoundError(f"未找到指定的 prices_csv: {prices_csv}，且回退文件不存在: {fallback}")
+
     df = pd.read_csv(prices_csv, low_memory=False)
     windows = windows or DEFAULT_WINDOWS
 
@@ -259,6 +270,9 @@ def build_feature_file(
         feat_cols = feat_cols[: int(n_features)]
         keep = ["Date", "Ticker"] + feat_cols
         feat_df = feat_df[keep].copy()
+
+    # 在写入前填充缺失值：先向前填充，再将剩余 NaN 置为 0，避免 downstream 出现 NaN 导致加载或训练失败
+    feat_df = feat_df.fillna(method="ffill").fillna(0.0)
 
     os.makedirs(os.path.dirname(output_parquet) or ".", exist_ok=True)
     _write_parquet_or_raise(feat_df, output_parquet)

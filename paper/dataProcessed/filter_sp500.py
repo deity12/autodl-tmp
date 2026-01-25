@@ -166,13 +166,13 @@ def default_sp500_list_path() -> Optional[str]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Filter FNSPID data to S&P 500 static intersection.")
-    parser.add_argument("--prices_in", type=str, default="./data/processed/Stock_Prices.csv")
-    parser.add_argument("--news_in", type=str, default="./data/processed/Stock_News.csv")
-    parser.add_argument("--prices_out", type=str, default="./data/processed/Stock_Prices_sp500.csv")
-    parser.add_argument("--news_out", type=str, default="./data/processed/Stock_News_sp500.csv")
+    parser.add_argument("--prices_in", type=str, default="./paper/data/processed/Stock_Prices.csv")
+    parser.add_argument("--news_in", type=str, default="./paper/data/processed/Stock_News.csv")
+    parser.add_argument("--prices_out", type=str, default="./paper/data/processed/Stock_Prices_sp500.csv")
+    parser.add_argument("--news_out", type=str, default="./paper/data/processed/Stock_News_sp500.csv")
     parser.add_argument("--sp500_list", type=str, default=None, help="Local sp500_list.txt path (preferred).")
     parser.add_argument("--sp500_source", type=str, default="auto", choices=["auto", "file", "wikipedia"])
-    parser.add_argument("--universe_out", type=str, default="./data/processed/sp500_universe_tickers.txt")
+    parser.add_argument("--universe_out", type=str, default="./paper/data/processed/sp500_universe_tickers.txt")
     args = parser.parse_args()
 
     sp500_list = args.sp500_list or default_sp500_list_path()
