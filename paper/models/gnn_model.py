@@ -39,6 +39,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from typing import Optional
 
 try:
     from torch_geometric.nn import GATv2Conv
@@ -54,21 +55,9 @@ from .base_model import GraphRWKV_Model, QL_MATCC_Model, RWKV_TimeMixing, RNN_Te
 # ================= 1. 图注意力层 GAT (优化版) =================
 class GraphAttentionLayer(nn.Module):
     """
-    优化的 GAT 层：利用注意力机制聚合邻居特征。
-    对应论文：基于 LLM 构建的图谱进行空间特征聚合。
-
-    【优化 #1 - 基于 ICLR 2024 "Sparse Graph Attention" 论文】
-    使用稀疏注意力计算，避免 O(N^2) 的全图注意力矩阵构建
-    仅对邻接矩阵中的边计算注意力，大幅降低内存占用和计算量
-
-    【优化 #2 - 基于 KDD 2024 "Multi-head GAT for Finance" 论文】
-    添加多头注意力机制，增强模型对不同关系类型的建模能力
-
-    【设计选择】使用2个注意力头的理由：
-    1. 金融图谱主要包含两类关系：协同关系（供应链、合作、投资）和对抗关系（竞争、诉讼）
-    2. 2头配置在保持表达能力的同时，每个头的维度更大（out_features/2），提升单头建模能力
-    3. 内存占用降低50-60%，训练速度提升40%（相比4头配置）
-    4. 消融实验表明2头与4头性能相当（IC差异<0.002），但效率显著提升
+    广播优化版 GAT：使用拆分注意力向量（a_src/a_dst）并通过广播计算注意力得分，
+    避免构造 (N, N, 2*D) 的中间大张量，从而明显降低内存峰值。
+    注意：仍会构造 (heads, N, N) 的 attention 矩阵，对于非常大尺寸图应考虑 edge-wise 实现。
     """
 
     def __init__(self, in_features, out_features, dropout=0.1, alpha=0.2, concat=True, num_heads=2):
@@ -78,67 +67,63 @@ class GraphAttentionLayer(nn.Module):
         self.out_features = out_features
         self.alpha = alpha
         self.concat = concat
-        self.num_heads = num_heads  # 【新增】多头注意力
+        self.num_heads = num_heads
 
         assert out_features % num_heads == 0, "out_features must be divisible by num_heads"
         self.head_dim = out_features // num_heads
 
-        # 【优化 #1】多头线性变换
+        # 多头线性变换 (num_heads, in_features, head_dim)
         self.W = nn.Parameter(torch.empty(size=(num_heads, in_features, self.head_dim)))
         nn.init.xavier_uniform_(self.W.data, gain=1.414)
 
-        # 【优化 #2】每个头独立的注意力系数
-        self.a = nn.Parameter(torch.empty(size=(num_heads, 2 * self.head_dim, 1)))
-        nn.init.xavier_uniform_(self.a.data, gain=1.414)
+        # 拆分注意力向量以利用广播：a^T [h_i || h_j] = a_src^T h_i + a_dst^T h_j
+        self.a_src = nn.Parameter(torch.empty(size=(num_heads, self.head_dim, 1)))
+        self.a_dst = nn.Parameter(torch.empty(size=(num_heads, self.head_dim, 1)))
+        nn.init.xavier_uniform_(self.a_src.data, gain=1.414)
+        nn.init.xavier_uniform_(self.a_dst.data, gain=1.414)
+
         self.leakyrelu = nn.LeakyReLU(self.alpha)
 
     def forward(self, h, adj):
         """
-        h: (N, in_features) 节点特征，N=当前 batch 的节点数（或全图节点数）
-        adj: (N, N) 邻接矩阵，>0 表示有边；用于掩码注意力，只对有边的节点对计算注意力
-
-        【优化】使用多头注意力并行计算，提升表达能力
+        h: (N, in_features)
+        adj: (N, N) 或 None
+        返回: (N, out_features)
         """
         N = h.size(0)
 
-        # 【优化 #1】多头并行变换: (N, in_features) -> (num_heads, N, head_dim)
-        Wh = torch.einsum('ni,hid->hnd', h, self.W)  # (num_heads, N, head_dim)
+        # (num_heads, N, head_dim)
+        Wh = torch.einsum('ni,hid->hnd', h, self.W)
 
-        # 【优化 #2】为每个头计算注意力
-        h_prime_heads = []
-        for head_idx in range(self.num_heads):
-            Wh_head = Wh[head_idx]  # (N, head_dim)
-            a_input = self._prepare_attentional_mechanism_input(Wh_head)  # (N, N, 2*head_dim)
-            e = self.leakyrelu(torch.matmul(a_input, self.a[head_idx]).squeeze(2))  # (N, N)
+        # attn_src: (heads, N, 1)
+        attn_src = torch.matmul(Wh, self.a_src)
+        # attn_dst: (heads, N, 1)
+        attn_dst = torch.matmul(Wh, self.a_dst)
 
-            # 支持边权重：将权重作为注意力先验
-            if adj is not None:
-                e = e + torch.log(adj.clamp(min=1e-6))
+        # 广播相加 -> (heads, N, N)
+        attn_logits = attn_src + attn_dst.transpose(-1, -2)
+        e = self.leakyrelu(attn_logits)
 
-            # 【优化 #3】稀疏掩码：只对有边的位置计算注意力
+        if adj is not None:
+            if adj.dim() == 2:
+                adj = adj.unsqueeze(0)
+            # 数值稳定性：防止 log(0)
+            adj_safe = adj.clamp(min=1e-6)
             zero_vec = -9e15 * torch.ones_like(e)
-            attention = torch.where(adj > 0, e, zero_vec)
-            attention = F.softmax(attention, dim=1)
-            attention = F.dropout(attention, self.dropout, training=self.training)
-
-            h_prime_head = torch.matmul(attention, Wh_head)  # (N, head_dim)
-            h_prime_heads.append(h_prime_head)
-
-        # 【优化 #4】拼接多头输出
-        h_prime = torch.cat(h_prime_heads, dim=1)  # (N, out_features)
-
-        if self.concat:
-            return F.elu(h_prime)
+            attention = torch.where(adj > 0, e + torch.log(adj_safe), zero_vec)
         else:
-            return h_prime
+            attention = e
 
-    def _prepare_attentional_mechanism_input(self, Wh):
-        """ 构造 (i,j) 对的 [Wh_i || Wh_j]，输出 (N, N, 2*head_dim)。 """
-        N = Wh.size()[0]
-        Wh_repeated_in_chunks = Wh.repeat_interleave(N, dim=0)
-        Wh_repeated_alternating = Wh.repeat(N, 1)
-        all_combinations_matrix = torch.cat([Wh_repeated_in_chunks, Wh_repeated_alternating], dim=1)
-        return all_combinations_matrix.view(N, N, 2 * self.head_dim)
+        attention = F.softmax(attention, dim=-1)
+        attention = F.dropout(attention, self.dropout, training=self.training)
+
+        # (heads, N, dim)
+        h_prime = torch.matmul(attention, Wh)
+
+        # (N, heads*dim)
+        h_prime = h_prime.permute(1, 0, 2).contiguous().view(N, -1)
+
+        return F.elu(h_prime) if self.concat else h_prime
 
 
 # ================= 2. Graph-RWKV 完整模型（新方向核心模型）=================
@@ -169,8 +154,8 @@ class GraphRWKV_GNN_Model(nn.Module):
         adj_matrix=None,
         gnn_embd=None,
         dropout=0.1,
-        max_neighbors: int = 32,
-        use_pyg: bool | None = None,
+        max_neighbors: int = 128,
+        use_pyg: Optional[bool] = None,
         temporal_backend: str = "rwkv",
     ):
         super().__init__()
@@ -290,15 +275,25 @@ class GraphRWKV_GNN_Model(nn.Module):
 
         # 在 CPU 上构建更稳（一次性成本），随后作为 buffer 随模型迁移到 GPU
         adj_cpu = adj.detach().cpu()
+        if adj_cpu.is_leaf:
+            adj_cpu = adj_cpu.clone()
+        # 移除自环
+        try:
+            adj_cpu.fill_diagonal_(0)
+        except Exception:
+            pass
+
+        # 使用 topk 获取权重最大的 K 个邻居 (对于二值图，相当于前 K 个非零)
+        # values: (N, K), indices: (N, K)
+        values, indices = torch.topk(adj_cpu, k=K, dim=1)
+
+        # 掩码处理：若权重 <= eps 则视为不存在
+        mask = values > 1e-6
+
         neigh = torch.full((N, K), -1, dtype=torch.long)
-        for i in range(N):
-            idx = torch.nonzero(adj_cpu[i] > 0, as_tuple=False).view(-1)
-            # 去掉自环
-            idx = idx[idx != i]
-            if idx.numel() > K:
-                idx = idx[:K]
-            if idx.numel() > 0:
-                neigh[i, : idx.numel()] = idx
+        if mask.any():
+            neigh[mask] = indices[mask]
+
         return neigh
 
     def forward(self, x, vol=None, node_indices=None):
@@ -317,7 +312,19 @@ class GraphRWKV_GNN_Model(nn.Module):
         # Step 3: 图聚合（mini-batch + 邻居扩展）
         # 关键修复：不要把 batch 的每条样本都当作“不同节点”直接做 GAT，
         # 否则当 batch 里出现同一 ticker 的多个样本时，会被当成多个节点，语义错误。
-        if node_indices is None or self.adj is None:
+        if node_indices is None:
+            if self.adj is None:
+                h_graph = h_gnn_in
+            else:
+                adj = self.adj
+                if self.use_pyg:
+                    edge_index = (adj > 0).nonzero(as_tuple=False).t().contiguous()
+                    edge_attr = adj[edge_index[0], edge_index[1]].view(-1, 1)
+                    h_graph = self.gnn(h_gnn_in, edge_index, edge_attr)
+                else:
+                    h_graph = self.gnn(h_gnn_in, adj)
+                h_graph = self.gnn_ln(h_graph)
+        elif self.adj is None:
             h_graph = h_gnn_in
         else:
             device = x.device

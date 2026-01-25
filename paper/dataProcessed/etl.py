@@ -170,6 +170,7 @@ def process_huge_news_file(valid_tickers):
     cleaned_chunks = []  # 存储所有清洗后的数据块
     
     # 创建分块读取器：chunksize指定每块大小，on_bad_lines='skip'跳过格式错误的行
+    warned_missing_time = False
     reader = pd.read_csv(RAW_NEWS_FILE, chunksize=CHUNK_SIZE, on_bad_lines='skip')
     
     # 逐块处理数据
@@ -180,6 +181,19 @@ def process_huge_news_file(valid_tickers):
             # 严禁在 UTC 上直接按 16:00 截断，否则会产生系统性日期错配（尤其是夏令时/DST）。
             ts_utc = pd.to_datetime(chunk["Date"], errors="coerce", utc=True)
             valid_ts = ts_utc.notna()
+            if not warned_missing_time and valid_ts.any():
+                ts_valid = ts_utc.loc[valid_ts]
+                zero_time = (
+                    (ts_valid.dt.hour == 0)
+                    & (ts_valid.dt.minute == 0)
+                    & (ts_valid.dt.second == 0)
+                )
+                if zero_time.mean() > 0.9:
+                    print(
+                        "\033[91m[CRITICAL WARN] Source data lacks specific time (HH:MM:SS). "
+                        "16:00 cut-off strategy might fail!\033[0m"
+                    )
+                    warned_missing_time = True
             if valid_ts.any():
                 chunk = chunk.loc[valid_ts].copy()
                 ts_utc = ts_utc.loc[valid_ts]

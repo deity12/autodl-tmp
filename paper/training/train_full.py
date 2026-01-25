@@ -46,6 +46,7 @@ import pandas as pd
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from scipy.stats import pearsonr, spearmanr
 from collections import defaultdict
+import random
 
 # ================= 0. 性能开关（针对 48GB GPU + 12 vCPU 优化）=================
 def _apply_perf_settings(enable: bool = True) -> None:
@@ -81,6 +82,24 @@ def _apply_perf_settings(enable: bool = True) -> None:
             os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
         except Exception:
             pass
+
+
+# ================= reproducibility helpers =================
+def seed_everything(seed: int = 42):
+    """
+    固定所有随机种子以提高可复现性。
+    """
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    # 权衡：deterministic 有助于复现但可能影响性能
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    print(f">>> [Reproducibility] Random seed set to {seed}")
 
 
 def _json_dump(path: str, obj) -> None:
@@ -141,6 +160,18 @@ def _save_run_artifacts(output_dir: str, experiment_name: str, train_dataset, co
             except Exception:
                 pass
 
+    # 7) RNG 状态快照 (新增：确保完全可复现)
+    try:
+        rng_state = {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+            "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        }
+        torch.save(rng_state, os.path.join(run_dir, "rng_state.pth"))
+    except Exception as e:
+        print(f"[WARN] 无法保存 RNG 状态: {e}")
+
     return run_dir
 
 # ================= 1. 环境与路径 =================
@@ -199,7 +230,7 @@ PAPER_CONFIG = {
     'persistent_workers': True,
     'use_date_grouped_batch': True,
     'use_rank_loss': True,
-    'rank_loss_weight': 0.1,
+    'rank_loss_weight': 1.0,
     'rank_loss_max_pairs': 4096,
     'rank_loss_type': 'rankic',  # pairwise | rankic
     'rankic_tau': 1.0,
@@ -210,6 +241,7 @@ PAPER_CONFIG = {
     # 运行配置
     'output_dir': OUTPUT_DIR,
     'graph_path': GRAPH_PATH,
+    'graph_split_date': '2020-12-31',
     'graph_tickers_path': GRAPH_TICKERS_PATH,
     'use_graph': True,
     'experiment_name': 'full',
@@ -223,7 +255,7 @@ PAPER_CONFIG = {
     'walk_forward_freq': 'Q',
     # 训练/评估日期范围（由 walk-forward 覆盖）
     'train_start': None,
-    'train_end': None,
+    'train_end': '2020-12-31',
     'test_start': None,
     'test_end': None,
     'use_date_split': True,
@@ -380,6 +412,9 @@ def _train_once():
     
     【注意】新方向不使用 Quantum、MATCC、MarketGuidance 组件
     """
+    # 固定随机种子以提高可复现性
+    seed_everything(42)
+
     # 应用性能设置（TF32 / benchmark 等）
     _apply_perf_settings(bool(CONFIG.get("enable_perf_flags", True)))
 
