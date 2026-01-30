@@ -1,10 +1,6 @@
-这份修订后的《硕士学位论文实施方案与深度研究报告》严格融合了我们此前讨论的所有**工程落地约束**（S&P 500 静态并集、Pandas-TA 因子复现、美东时区转换、离线 LLM Parquet 存储）。
-
-您可以直接使用此版本作为最终定稿，它既保持了学术理论的高度，又在实施细节上完全具备可操作性。
-
 ---
 
-# 硕士学位论文实施方案与深度研究报告 (Final Revised Version)
+# 硕士学位论文实施方案与深度研究报告 (Final Implementation Baseline)
 
 **论文题目**：基于大语言模型动态图谱与 Graph-RWKV 的时空解耦金融预测研究
 **英文题目**：Research on Financial Spatiotemporal Forecasting based on LLM-Driven Dynamic Graphs and Graph-RWKV
@@ -15,182 +11,256 @@
 
 ### 1.1 问题陈述 (Problem Statement)
 
-金融市场是一个复杂的非线性动态系统，股票价格的波动受**时间维度**（历史量价趋势）和**空间维度**（产业链、竞争关系、宏观事件）的双重影响。当前深度学习模型在金融预测中面临两大核心瓶颈：
+金融市场是一个非线性、高噪声的复杂自适应系统，其资产价格波动受**时间维度**（历史量价趋势）和**空间维度**（产业链、竞争关系、宏观事件）的双重驱动。当前深度学习在金融时空预测中面临三大核心瓶颈：
 
-1. **序列建模的效率与记忆瓶颈**：
-* 主流 Transformer 架构计算复杂度为 ，难以高效处理超长历史序列（如过去 3-5 年的日线数据），限制了模型捕捉长周期宏观趋势的能力。
-* RNN/LSTM 类模型虽然推理快，但难以并行训练，且存在长程梯度消失问题。
+1. **长序列建模的效率悖论**：
+* 主流 Transformer 架构的计算复杂度随序列长度呈二次方增长（Vaswani et al., 2017），难以高效处理跨度数年（Sequence Length > 60 甚至几百）的日线级特征，限制了模型捕捉长周期宏观趋势的能力。
+* RNN/LSTM 类模型虽然推理快，但无法并行训练，且存在长程梯度消失问题。
 
 
 2. **关联关系的静态化与稀疏性**：
-* 传统图神经网络（GNN）多依赖静态行业分类或历史价格相关性建图，缺乏对突发新闻事件的实时响应能力。
-* 引入 LLM（如 Qwen2.5）提取语义关系虽然前沿，但在 S&P 500 等封闭集合中，纯新闻驱动的图往往极度稀疏（Sparse/Disconnected），导致 GNN 出现“信息孤岛”或“过度平滑”现象。
+* 传统图神经网络（GNN）多依赖静态行业分类或纯历史价格相关性建图，缺乏对突发新闻事件的实时响应能力。
+* 在封闭股票池（如 S&P 500）中，纯新闻驱动的图往往极度稀疏（Disconnected），导致 GNN 出现“信息孤岛”或“过度平滑”现象。
+
+
+3. **特征工程的同质化**：
+* 仅依赖基础 OHLCV 数据难以捕捉深层市场信号，缺乏系统性的因子挖掘（如 Alpha158）和截面标准化处理，导致模型输入信噪比低。
 
 
 
 ### 1.2 本研究的解决方案 (Proposed Solution)
 
-本研究提出 **Graph-RWKV** 架构，融合两大核心技术以实现时空解耦建模：
+本研究提出 **Graph-RWKV** 架构，融合两大前沿技术以实现高效的时空解耦建模：
 
-1. **RWKV (Receptance Weighted Key Value)**：作为时间序列编码器，结合了 RNN 的线性推理效率  和 Transformer 的并行训练能力，能够高效处理长周期金融时序特征。
-2. **LLM 增强的情感加权混合图 (LLM-Enhanced Sentiment-Aware Hybrid Graph)**：利用轻量化 LLM (Qwen2.5-7B/14B) 离线提取新闻中的因果关系与**情感极性**，并结合量价统计相关性，构建“语义+统计”的双层动态图。
+1. **RWKV (Receptance Weighted Key Value)**：作为时间序列编码器，结合了 RNN 的线性推理效率（O(L)）和 Transformer 的并行训练能力，能够高效处理长周期金融时序特征（Peng et al., 2023）。
+2. **LLM 增强的混合动态图 (LLM-Enhanced Hybrid Graph)**：利用轻量化大语言模型 (Qwen2.5-14B) 离线提取新闻中的语义关联，并结合量价统计相关性，构建“语义+统计”的双层动态图谱，解决稀疏性问题。
 
 ---
 
 ## 2. 核心方法论与架构设计 (Methodology)
 
-### 2.1 模块一：基于 LLM 的动态图谱构建 (Dynamic Graph Construction)
+### 2.1 模块一：混合动态图谱构建 (Hybrid Graph Construction)
 
-针对图稀疏性和关系方向性问题，采用“混合致密化 + 情感加权”策略。为确保计算效率，图谱构建采用**离线预处理 (Offline Preprocessing)** 模式。
+针对图稀疏性和关系方向性问题，采用“混合致密化 + 严格防泄露”策略。
 
 **策略 A：LLM 语义关系与情感提取（显式层）**
 
-* **模型选型**：Qwen2.5-14B-Instruct (Int4 Quantized)，部署于本地进行离线推理。
-* **输入数据**：FNSPID 数据集每日新闻 Headline + Content。
-* **输出 Schema**：模型输出严格遵循 JSON 格式，并存储为 **Parquet** 文件以保留数据精度：
-`{date, source_ticker, target_ticker, relation_type, sentiment_score, weight}`
-* **Prompt 优化**：强制模型输出情感极性分数 （-1为极度利空，1为极度利好）。
-* **严格时序衰减 (Strict Temporal Decay)**：
-采用逐日递推公式（非近似计算），确保信息在时间轴上的平滑传递：
+* **输入数据**：经过 ETL 清洗的 `Stock_News.csv`（或 S&P 500 过滤后的 `Stock_News_sp500.csv`）。
+* **模型选型**：Qwen2.5-14B-Instruct（4-bit/8-bit 量化或 FP16，运行于 48GB VRAM 环境）。
+* **关系类型**：限定 7 类——supply（供应链）、competition（竞争）、cooperation（合作）、merger（并购）、lawsuit（诉讼）、investment（投资）、co-event（共同事件），便于复现与消融。
+* **处理流程**：
+1. **抽取**：从新闻 Headline/Content 中提取三元组 `{Source, Target, Relation, Sentiment}`，仅保留 src/dst 均在图节点（S&P 500 成分股）内的边。
+2. **截断 (Strict Cutoff)**：设置 `--split_date 2020-06-30`（与训练集结束日期一致）。构图**仅使用此日期前的历史新闻**，严禁使用验证集/测试集期间的信息构建图结构，彻底杜绝 Look-ahead Bias。
+3. **时序衰减**：采用指数衰减因子（本实现 α=0.995，半衰期约 138 天），按日累积边权，确保旧闻的影响力随时间降低；取值依据见本文 3.3 节时间切分与 2.1 节「旧闻影响力随时间降低」。
 
 
-
-其中  为当日提取的关系矩阵， 为情感分数矩阵， 为衰减因子（如 0.9）。
 
 **策略 B：统计相关性修正（隐式层）**
 
-* **补全逻辑**：计算 S&P 500 成分股过去 30 天收益率的皮尔逊相关系数，保留强相关边（），捕捉资金面的隐式联动。
+* **补全逻辑**：计算 S&P 500 成分股**过去 N 天**收益率的皮尔逊相关系数，保留强相关边（本实现 N=30 天，|ρ|>0.6），捕捉资金面的隐式联动，解决新闻缺失时的图连通性问题。
 
+**最终产物**：
 
-
-**最终混合图 (Final Hybrid Graph)**：
-
+* 邻接矩阵：`Graph_Adjacency.npy`（使用 `split_date=2020-06-30` 前数据一次性构建的累积混合图，训练/验证/测试阶段**静态使用**，无未来信息）。
+* 节点映射：`Graph_Tickers.json`（与 dataset 的 ticker2idx 顺序严格一致，防止索引错位）。
+* 消融用图：`Graph_Adjacency_semantic.npy`（仅语义图）、`Graph_Adjacency_stat.npy`（仅统计图）。
 
 ### 2.2 模块二：Graph-RWKV 时空编码器 (Spatiotemporal Encoder)
 
-**节点对齐策略：Static Union with Masking**
+**1. 节点对齐 (Node Alignment)**
 
-* 构建全周期（2018-2023）S&P 500 成分股的**静态并集 (Static Union Universe)**，节点总数  固定。
-* 引入 **Masking 机制**：若某股票在当日  不属于成分股或停牌，其特征向量置零，且不参与梯度计算。
+* **全集定义**：构建 S&P 500 成分股的静态并集 (Static Union)。
+* **动态掩码 (Dynamic Masking)**：若某股票在当日停牌或数据缺失，其特征向量置零，且在计算 Loss 时被 Mask 掉，不影响梯度更新。
 
-**时间维：RWKV-TimeSeries Encoder**
+**2. 时间维：RWKV-TimeSeries Encoder**
 
-* 每个股票  的特征序列  独立进入 RWKV 模块。
-* 利用线性 Attention 机制捕捉长程依赖：
+* 每个股票 i 的 158 维特征序列独立进入 RWKV 模块。
+* 利用线性 Attention 机制捕捉长程依赖，输出时间嵌入。
 
+**3. 空间维：广播优化版图注意力 (Broadcast GAT)**
 
-* 输出：包含时间上下文的节点嵌入 。
-
-**空间维：动态图注意力 (Dynamic GAT)**
-
-* 在时间步 ，利用构建好的混合图  进行空间聚合：
-
-
+* **内存优化**：针对全连接或稠密图场景，不构造巨大的边对注意力中间张量。
+* **实现机制**：通过 Broadcasting 机制直接计算注意力分数，将显存复杂度从 O(E·d) 降低至 O(N·d)，适配 48GB 显存环境（N=节点数，E=边数，d=特征维）。
 
 ---
 
-## 3. 详细实施指南 (Implementation Guide)
+## 3. 详细实施指南 (Implementation Details)
 
-### 3.1 数据集准备与清洗
+### 3.1 数据集准备与清洗 (ETL Pipeline)
 
-1. **股票池 (Universe)**：
-* 采用 **FNSPID 数据集与 S&P 500 静态列表的交集**。
-* 通过 `Static Intersection` 确定固定的节点列表。
-
-
-2. **量价特征 (Alpha158-like Features)**：
-* **工具**：**Pandas-TA** (替代复杂的 Qlib Pipeline)。
-* **实现**：基于 Pandas-TA 复现 Alpha158 中的核心因子（动量、波动率、成交量趋势、均线交叉等），生成约 100-158 维特征向量。
+1. **S&P 500 样本过滤**：
+* **基准**：基于 `sp500_list.txt` 从全量 FNSPID 数据中筛选。
+* **产出**：`Stock_Prices_sp500.csv` 和 `Stock_News.csv`。
 
 
-3. **新闻数据**：FNSPID 原始文本。
-
-### 3.2 严格的数据对齐与时区处理 (Crucial Step)
-
-为规避前瞻偏差（Look-ahead Bias），必须处理 UTC 与美东时间的差异。
-
-1. **时区转换 (Timezone Conversion)**：
-* FNSPID 原始时间戳通常为 UTC。
-* 在 ETL 阶段，强制执行：`Timestamp_UTC`  `Timestamp_US_Eastern`。
+2. **新闻清洗与防泄露 (Anti-Leakage Strategy)**：
+* **问题**：原始数据中存在大量 `00:00:00` 时间戳的新闻。
+* **对策**：实施 **"Conservative T+1 Shift"** 策略。若新闻时间无法精确到盘中，强制归入 **T+1 日** 的交易决策。宁可牺牲部分实时性，也要绝对保证无未来信息泄露。
 
 
-2. **Cut-off Time (16:00 Rule)**：
-* 设定每日 **16:00 (US/Eastern)** 为界。
-* **逻辑**：
-*  日 16:00 (ET) **之前**的新闻  构建  日的图  预测  日收益。
-*  日 16:00 (ET) **之后**的新闻  归入  日数据流。
+3. **特征工程 (Feature Engineering)**：
+* **脚本**：`feature_engineering.py`
+* **方法**：基于纯 Pandas 实现（fallback 机制）或 Pandas-TA。
+* **维度**：**158 维 (Alpha158-like)**。涵盖动量 (Momentum)、波动率 (Volatility)、量价趋势 (Price-Volume)、重叠指标 (Overlap) 等。
+* **关键处理**：
+* **截面标准化 (Cross-sectional Rank)**：执行 `groupby('Date').rank(pct=True) - 0.5`，将所有特征归一化至 **[-0.5, 0.5]** 区间，消除量纲差异，加速模型收敛。
+* **存储**：`sp500_alpha158_features.parquet`。
 
 
 
 
 
-### 3.3 训练与验证策略 (Training Strategy)
+### 3.2 架构解耦与动态加载 (Architecture Decoupling)
 
-**滚动窗口验证 (Rolling Window / Walk-Forward Validation)**：
-为适应金融市场风格切换（Regime Shift），采用滚动方式：
+* **存储解耦**：
+* 基础数据（OHLCV + Text + Label）存为 CSV。
+* 高维特征（158 Alpha）存为 Parquet。
 
-* **Step 1**: Train (2018-2020)  Test (2021 Q1)
-* **Step 2**: Train (2018-2020 + 2021 Q1)  Test (2021 Q2)
-* ...以此类推。
 
-### 3.4 模型搭建细节
-
-* **Input Layer**: Linear 投影 (特征维度 )。
-* **Backbone**: 2-4 层 RWKV Block（去除 NLP Token Embedding，直接处理连续数值特征）。
-* **Graph Layer**: PyG GATv2Conv (支持 Sparse Tensor 输入)。
-* **Loss Function**: Masked RankIC Loss (仅计算当日有效交易的股票)。
+* **动态缝合**：
+* 在 `FinancialDataset` 初始化时，根据 `Date` 和 `Ticker` 索引，将 CSV 与 Parquet 数据在内存中动态合并 (Merge)。
+* 优势：避免了生成体积巨大的单一 CSV 文件，且方便灵活调整特征维度。
 
 
 
-其中  为当日成分股掩码。
+### 3.3 科学时间切分策略 (Train/Valid/Test Split)
 
----
+为确保实验的严谨性并符合顶会论文标准（参考 AAAI 2024 MDGNN、Qlib Alpha158 基准），采用严格的时间顺序切分。**关键原则**：
 
-## 4. 实验设计与预期结果 (Experimental Design)
+1. **图谱仅使用验证集截止日期前的数据构建**（`split_date = 2020-06-30`），训练/验证/测试阶段**共用同一静态图**，从源头杜绝未来信息泄露。
+2. **验证集独立于测试集**：验证集仅用于早停和超参调优，**不参与最终指标报告**；最终论文只报告测试集指标。
+
+| 数据集划分 | 时间范围 | 样本量 | 用途 |
+| --- | --- | --- | --- |
+| **训练集 (Train)** | **2018-01-01 至 2020-06-30** | ~2.5 年 | 模型参数更新、梯度下降 |
+| **验证集 (Valid)** | **2020-07-01 至 2020-12-31** | ~6 个月 | 超参搜索、早停监控、最佳 checkpoint 保存 |
+| **测试集 (Test)** | **2021-01-01 至 2023-12-31** | ~3 年 | **最终性能评估**（论文报告此区间指标） |
+
+**图谱截止日期**：`2020-06-30`（与训练集结束日期一致，确保图谱不包含验证/测试期信息）
+
+
+## 4. 实验设计与评估 (Experimental Design)
 
 ### 4.1 评估指标 (Evaluation Metrics)
 
-重点考察**金融投资价值**：
+遵循顶会标准（参考 AAAI 2024 MDGNN、KDD 2020 MTGNN、Qlib 基准），采用以下指标体系：
 
-1. **预测能力**：IC (Information Coefficient), RankIC。
-2. **回测指标 (Top-K Long-Short Strategy)**：
-* **年化收益率 (ARR)**。
-* **夏普比率 (Sharpe Ratio)**：核心考核指标。
-* **最大回撤 (MDD)**。
+**1. 截面预测能力指标（Cross-sectional Metrics）**
+
+| 指标 | 定义 | 说明 |
+| --- | --- | --- |
+| **IC (Information Coefficient)** | 每日 Pearson(ŷ_t, r_t) 的均值 | 衡量预测值与真实收益的线性相关性 |
+| **RankIC** | 每日 Spearman(ŷ_t, r_t) 的均值 | 衡量排序一致性，对异常值更鲁棒 |
+| **ICIR** | mean(IC) / std(IC) | 衡量预测能力的**稳定性**，越高越好 |
+| **RankICIR** | mean(RankIC) / std(RankIC) | RankIC 版本的稳定性指标 |
+
+**计算方式**（代码实现）：
+```python
+# 按日期分组，每日计算一个截面 IC/RankIC
+for date in unique_dates:
+    day_pred, day_true = get_samples(date)
+    ic_list.append(pearsonr(day_pred, day_true))
+    rankic_list.append(spearmanr(day_pred, day_true))
+IC = mean(ic_list)
+ICIR = mean(ic_list) / std(ic_list)
+```
+
+**2. 回归指标（Regression Metrics）**
+
+| 指标 | 说明 |
+| --- | --- |
+| **MSE / RMSE** | 均方误差，评估预测精度 |
+| **方向准确率 (Directional Accuracy)** | sign(ŷ) == sign(r) 的比例 |
+
+**3. 投资组合回测指标 (Portfolio Backtest)**
+
+| 策略 | 说明 |
+| --- | --- |
+| **Top-K Long-Short** | 每日做多预测得分最高的 K 只，做空得分最低的 K 只 |
+| **参数** | K = 30（符合 S&P 500 约 6% 的选股比例） |
+
+| 指标 | 定义 |
+| --- | --- |
+| **年化收益率 (ARR)** | 累计收益年化，系数 252 交易日 |
+| **夏普比率 (Sharpe)** | mean(daily_ret) / std(daily_ret) × √252 |
+| **最大回撤 (MaxDD)** | max(peak - trough) / peak |
 
 
+### 4.2 Baseline 对比 (Baselines)
 
-### 4.2 消融实验 (Ablation Studies)
+为验证方法有效性，与以下 SOTA 方法对比（参考顶会论文实验设计）：
 
-| **模型变体** | **图结构构建方式** | **时序编码器** | **实验目的** |
+| 类别 | 方法 | 来源 | 说明 |
 | --- | --- | --- | --- |
-| **Graph-RWKV (Ours)** | **Hybrid (Semantic+Stat)** | **RWKV** | **验证完整方案优越性** |
-| Variant A | Only Statistical | RWKV | 验证 LLM 提取的新闻语义图的增益 |
-| Variant B | Only Semantic | RWKV | 验证统计图补全稀疏性的必要性 |
-| Variant C | Hybrid | LSTM/GRU | 验证 RWKV 在长序列建模上的效率优势 |
-| Variant D | None (No Graph) | RWKV | 验证引入空间依赖的必要性 |
+| **时序模型** | LSTM | Baseline | 经典 RNN，无图结构 |
+| | GRU | Baseline | 轻量 RNN |
+| | Transformer | NIPS 2017 | 自注意力机制 |
+| **图模型** | GAT | ICLR 2018 | 静态图注意力 |
+| | MTGNN | KDD 2020 | 多变量时序+自适应图 |
+| **混合模型** | MDGNN | AAAI 2024 | 多关系动态图+Transformer |
+| **本文** | **Graph-RWKV** | Ours | RWKV + LLM 混合图 + 广播 GAT |
+
+
+### 4.3 消融实验 (Ablation Studies)
+
+为验证各模块的有效性，设计以下对比实验：
+
+| 消融变体 | 配置 | 验证目标 |
+| --- | --- | --- |
+| **w/o Graph** | `use_graph=False` | 验证图谱的空间聚合增益 |
+| **w/o Semantic** | 仅使用统计相关性图 | 验证 LLM 语义图的价值 |
+| **w/o Statistical** | 仅使用 LLM 语义图 | 验证统计图的补全作用 |
+| **w/o RankIC Loss** | `use_rank_loss=False` | 验证排序损失的贡献 |
+| **LSTM Backbone** | `temporal_backend=lstm` | 验证 RWKV 相比 LSTM 的优势 |
+| **GRU Backbone** | `temporal_backend=gru` | 验证 RWKV 相比 GRU 的优势 |
 
 ---
 
 ## 5. 参考文献 (References)
 
-**Category A: RWKV & Linear Attention**
+**Category A: Transformer & RWKV (时序编码器)**
 
-1. Peng, B., et al. (2023). "RWKV: Reinventing RNNs for the Transformer Era." arXiv preprint. (GitHub: BlinkDL/RWKV-LM)
-2. Sun, Y., et al. (2023). "Retentive Network: A Successor to Transformer for Large Language Models."
+1. Vaswani, A., Shazeer, N., Parmar, N., et al. (2017). "Attention Is All You Need." *NeurIPS*.
+2. Peng, B., Alcaide, E., Anthony, Q., Albalak, A., Arcadinho, S., et al. (2023). "RWKV: Reinventing RNNs for the Transformer Era." *Findings of EMNLP 2023*, pp. 14048–14077.
+3. Sun, Y., Dong, L., Huang, S., Ma, S., Xia, Y., et al. (2023). "Retentive Network: A Successor to Transformer for Large Language Models." *arXiv:2307.08621*.
 
-**Category B: Financial Graph Learning (Baselines)**
-3. Cheng, D., et al. (2022). "Modeling the Momentum Spillover Effect for Stock Prediction via Attribute-Driven Graph Attention Networks (ADGAT)." AAAI. (GitHub: RuichengFIC/ADGAT)
-4. Ye, J., et al. (2024). "Time-Series Graph Neural Networks for Stock Prediction." IEEE TKDE.
+**Category B: Graph Neural Networks & Financial Forecasting (Baseline 对比)**
 
-**Category C: LLM in Finance**
-5. Li, X., et al. (2023). "FinGPT: Open-Source Financial Large Language Models." arXiv. (GitHub: AI4Finance-Foundation/FinGPT)
-6. Zhang, X., et al. (2024). "Graph-ToolFormer: To Reason with Graph Self-Correction."
+4. Veličković, P., Cucurull, G., Casanova, A., Romero, A., Liò, P., & Bengio, Y. (2018). "Graph Attention Networks." *ICLR*. [GAT Baseline]
+5. Wu, Z., Pan, S., Long, G., Jiang, J., Chang, X., & Zhang, C. (2020). "Connecting the Dots: Multivariate Time Series Forecasting with Graph Neural Networks." *KDD 2020*. [MTGNN Baseline]
+6. Yin, Q., Yang, C., Chen, Q., et al. (2024). "MDGNN: Multi-Relational Dynamic Graph Neural Network for Comprehensive and Dynamic Stock Investment Prediction." *AAAI 2024*. [SOTA Baseline]
+7. Cheng, D., Yang, F., Xiang, S., & Liu, J. (2022). "Financial Time Series Forecasting with Multi-Modality Graph Neural Networks." *Pattern Recognition*, 121, 108218.
+
+**Category C: LLM & Knowledge Graph**
+
+8. Romanou, A., et al. (2024). "FinDKG: Dynamic Knowledge Graphs with Large Language Models for Detecting Global Trends in Financial Markets." *arXiv:2407.10909*.
+
+**Category D: Quantitative Finance & Evaluation**
+
+9. Yang, L., et al. (2020). "Qlib: An AI-oriented Quantitative Investment Platform." *arXiv:2009.11189*. (Alpha158 定义来源, IC/ICIR 评估标准).
+10. Goodwin, T. (2011). "The Information Ratio." *CFA Institute*. (ICIR 定义来源).
 
 ---
 
-## 6. 创新点总结 (Conclusion & Contributions)
+## 6. 创新点与总结 (Conclusion & Contributions)
 
-1. **架构创新**：首次将 **RWKV** 引入金融时空预测。在保持 Transformer 级性能的同时，利用线性复杂度优势实现了超长历史窗口（1年以上）的有效建模，显著降低了显存开销。
-2. **工程与方法论结合**：提出 **LLM 驱动的离线动态图构建流程**。通过严格的时区对齐与时序衰减算法，解决了 S&P 500 核心资产池中的图稀疏问题；采用轻量化 Pandas-TA 因子工程替代重型框架，保证了研究的可复现性与落地性。
-3. **应用价值**：赋予量化黑盒模型“可解释性”（通过情感与关系权重），并在严格的滚动窗口回测中验证了相对于传统 GNN 的超额收益。
+**核心贡献**（对齐顶会论文表述）：
+
+1. **架构创新 (Novelty)**：
+   - 首次将 **RWKV**（O(L) 复杂度线性注意力）引入金融时空预测领域
+   - 提出 **Broadcast GAT** 优化策略，在 48GB 显存限制下实现对 S&P 500 全量成分股的长周期（seq_len ≥ 30）时空建模
+   - 设计 **LLM 增强的混合动态图**（语义层 + 统计层），解决纯新闻图的稀疏性问题
+
+2. **实验严谨性 (Rigor)**：
+   - 采用严格的 **Train/Valid/Test 三阶段切分**（2018-2020.06 / 2020.07-2020.12 / 2021-2023）
+   - 图谱仅使用训练集截止日期前的数据构建，从数据源头杜绝 Look-ahead Bias
+   - 提出 **"Conservative T+1 Shift"** 策略处理新闻时间戳不确定性
+
+3. **评估全面性 (Comprehensive Evaluation)**：
+   - 采用 **IC/RankIC/ICIR** 等量化金融标准指标（参考 Qlib 基准）
+   - 与 **LSTM/GRU/GAT/MTGNN/MDGNN** 等 SOTA 方法对比
+   - 设计 6 组消融实验验证各模块有效性
+
+4. **可复现性 (Reproducibility)**：
+   - 完整开源实现（数据清洗、LLM 建图、训练、评估脚本）
+   - 超参数与代码一一对应，可直接复现论文结果

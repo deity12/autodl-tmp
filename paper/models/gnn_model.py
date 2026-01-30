@@ -27,7 +27,7 @@ Graph-RWKV 模型：基于大语言模型动态图谱与 Graph-RWKV 的时空解
 
 依赖：
     - base_model：GraphRWKV_Model（新方向核心时序编码器）, RWKV_TimeMixing
-    - 邻接矩阵：./data/processed/Graph_Adjacency.npy（由 build_graph.py 生成，包含情感加权混合图）
+    - 邻接矩阵：./paper/data/processed/Graph_Adjacency.npy（由 build_graph.py 生成，包含情感加权混合图）
     
 【注意】以下组件在新方向中不使用，已注释：
     - Quantum 量子计算相关代码

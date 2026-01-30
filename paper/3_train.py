@@ -5,8 +5,8 @@
 
 用法：
   方式1：直接运行（默认配置）
-  方式2：命令行覆盖参数
-    python 3_train.py --data ./data/processed/Final_Model_Data.csv --graph ./data/processed/Graph_Adjacency.npy --output ./outputs
+ 方式2：命令行覆盖参数
+    python 3_train.py --data ./paper/data/processed/Final_Model_Data.csv --graph ./paper/data/processed/Graph_Adjacency.npy --output ./outputs
 """
 
 from __future__ import annotations
@@ -18,11 +18,11 @@ import sys
 from utils.logging_utils import setup_logging
 
 # ================= 配置（可直接修改）=================
-DATA_CSV_PATH = "./data/processed/Final_Model_Data.csv"
-GRAPH_PATH = "./data/processed/Graph_Adjacency.npy"
-GRAPH_TICKERS_PATH = "./data/processed/Graph_Tickers.json"
-
-OUTPUT_DIR = "./outputs"
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_CSV_PATH = os.path.join(_SCRIPT_DIR, "data", "processed", "Final_Model_Data.csv")
+GRAPH_PATH = os.path.join(_SCRIPT_DIR, "data", "processed", "Graph_Adjacency.npy")
+GRAPH_TICKERS_PATH = os.path.join(_SCRIPT_DIR, "data", "processed", "Graph_Tickers.json")
+OUTPUT_DIR = os.path.join(_SCRIPT_DIR, "outputs")
 
 # 模型配置
 MODEL_N_EMBD = 256
@@ -42,7 +42,7 @@ USE_AMP = True
 USE_COMPILE = True
 TEMPORAL_BACKEND = "rwkv"
 USE_RANK_LOSS = True
-RANK_LOSS_WEIGHT = 0.1
+RANK_LOSS_WEIGHT = 1.0
 RANK_LOSS_MAX_PAIRS = 4096
 RANK_LOSS_TYPE = "rankic"
 RANKIC_TAU = 1.0

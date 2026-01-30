@@ -9,8 +9,8 @@
 
 用法：
   方式1：直接运行（使用默认配置）
-  方式2：命令行覆盖参数
-    python 1_preprocess_data.py --input_dir ./data/raw/FNSPID/full_history --news_file ./data/raw/FNSPID/nasdaq_exteral_data.csv
+ 方式2：命令行覆盖参数
+    python 1_preprocess_data.py --input_dir ./paper/data/raw/FNSPID/full_history --news_file ./paper/data/raw/FNSPID/nasdaq_exteral_data.csv
 """
 
 from __future__ import annotations
@@ -22,13 +22,15 @@ import sys
 from utils.logging_utils import setup_logging
 
 # ================= 配置（可直接修改）=================
-RAW_PRICES_DIR = "./data/raw/FNSPID/full_history/"
-RAW_NEWS_FILE = "./data/raw/FNSPID/nasdaq_exteral_data.csv"
-OUTPUT_DIR = "./data/processed/"
-MARKET_INDEX_PATH = "./data/raw/FNSPID/SP500_Index.csv"
-FINAL_OUTPUT_FILE = "./data/processed/Final_Model_Data.csv"
-ALPHA_OUTPUT_FILE = "./data/processed/sp500_alpha158_features.parquet"
-FEATURE_COLUMNS_PATH = "./data/processed/feature_columns.json"
+# 使用脚本所在目录，使从 paper/ 或项目根运行都能正确找到 data/
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+RAW_PRICES_DIR = os.path.join(_SCRIPT_DIR, "data", "raw", "FNSPID", "full_history") + os.sep
+RAW_NEWS_FILE = os.path.join(_SCRIPT_DIR, "data", "raw", "FNSPID", "nasdaq_exteral_data.csv")
+OUTPUT_DIR = os.path.join(_SCRIPT_DIR, "data", "processed") + os.sep
+MARKET_INDEX_PATH = os.path.join(_SCRIPT_DIR, "data", "processed", "SP500_Index.csv")
+FINAL_OUTPUT_FILE = os.path.join(_SCRIPT_DIR, "data", "processed", "Final_Model_Data.csv")
+ALPHA_OUTPUT_FILE = os.path.join(_SCRIPT_DIR, "data", "processed", "sp500_alpha158_features.parquet")
+FEATURE_COLUMNS_PATH = os.path.join(_SCRIPT_DIR, "data", "processed", "feature_columns.json")
 
 START_DATE = "2018-01-01"
 END_DATE = "2023-12-31"

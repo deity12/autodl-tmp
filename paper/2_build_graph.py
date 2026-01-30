@@ -9,7 +9,7 @@
 用法：
   方式1：直接运行（默认配置）
   方式2：命令行覆盖参数
-    python 2_build_graph.py --news ./data/processed/Stock_News.csv --model_data ./data/processed/Final_Model_Data.csv
+    python 2_build_graph.py --news ./paper/data/processed/Stock_News_sp500.csv --model_data ./paper/data/processed/Final_Model_Data.csv
 """
 
 from __future__ import annotations
@@ -23,9 +23,10 @@ import pandas as pd
 from utils.logging_utils import setup_logging
 
 # ================= 配置（可直接修改）=================
-NEWS_FILE = "./data/processed/Stock_News.csv"
-MODEL_DATA_FILE = "./data/processed/Final_Model_Data.csv"
-OUTPUT_DIR = "./data/processed/"
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+NEWS_FILE = os.path.join(_SCRIPT_DIR, "data", "processed", "Stock_News_sp500.csv")
+MODEL_DATA_FILE = os.path.join(_SCRIPT_DIR, "data", "processed", "Final_Model_Data.csv")
+OUTPUT_DIR = os.path.join(_SCRIPT_DIR, "data", "processed") + os.sep
 
 USE_LLM = True
 MAX_PER_TICKER = 200

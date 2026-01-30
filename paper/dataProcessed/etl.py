@@ -29,37 +29,6 @@ if not os.path.exists(OUTPUT_DIR):
     os.makedirs(OUTPUT_DIR)
 
 # ================= 时间范围配置 =================
-"""
-ETL脚本：股票价格和新闻数据清洗与合并
-
-功能：
-1. 合并数千个个股CSV文件为统一的股价数据文件
-2. 流式处理23GB新闻大文件，提取指定时间范围和股票代码的新闻
-
-输出：
-- Stock_Prices.csv: 合并后的股价数据（包含Date, Ticker, Open, Close, High, Low, Volume）
-- Stock_News.csv: 清洗后的新闻数据（包含Date, Ticker, Headline, Publisher）
-"""
-
-import pandas as pd
-import numpy as np
-import os
-import glob
-from tqdm import tqdm
-
-# ================= 配置路径 =================
-# 使用基于脚本位置的路径，避免依赖当前工作目录导致的路径不一致
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
-RAW_PRICES_DIR = os.path.join(PROJECT_ROOT, 'data', 'raw', 'FNSPID', 'full_history')  # 股价CSV文件所在目录
-RAW_NEWS_FILE = os.path.join(PROJECT_ROOT, 'data', 'raw', 'FNSPID', 'nasdaq_exteral_data.csv')  # 新闻数据大文件路径
-OUTPUT_DIR = os.path.join(PROJECT_ROOT, 'data', 'processed')  # 处理后的数据输出目录
-
-# 自动创建输出目录（如果不存在）
-if not os.path.exists(OUTPUT_DIR):
-    os.makedirs(OUTPUT_DIR)
-
-# ================= 时间范围配置 =================
 # 设定数据提取的时间范围（与论文研究期间一致）
 START_DATE = '2018-01-01'  # 起始日期
 END_DATE = '2023-12-31'    # 结束日期

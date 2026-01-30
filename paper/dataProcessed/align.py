@@ -6,10 +6,10 @@
   将 ETL 阶段生成的个股行情与新闻数据，与 S&P 500 指数数据按日期对齐，
   生成训练/测试通用的模型输入表 `Final_Model_Data.csv`。
 
-输入：
-  - `data/processed/Stock_Prices.csv`（来自 `dataProcessed/etl.py`）
-  - `data/processed/Stock_News.csv`（来自 `dataProcessed/etl.py`，可选）
-  - `data/raw/FNSPID/SP500_Index.csv`（来自 `dataProcessed/download_market_index.py` 或手动准备）
+输入（本仓库统一放在 paper/data/processed/ 下）：
+  - `paper/data/processed/Stock_Prices_sp500.csv`（S&P500 过滤后的价格）
+  - `paper/data/processed/Stock_News_sp500.csv`（S&P500 过滤后的新闻）
+  - `paper/data/processed/SP500_Index.csv`（大盘指数：Date, Market_Close, Market_Vol）
 
 输出：
   - `data/processed/Final_Model_Data.csv`
@@ -27,24 +27,31 @@
 import pandas as pd
 import numpy as np
 import os
+import sys
 from tqdm import tqdm
 
-# ================= 配置路径 (根据你之前的运行结果修改) =================
-# 1. 之前 etl.py 生成的文件路径
-PROCESSED_PRICE_PATH = './data/processed/Stock_Prices.csv'
-PROCESSED_NEWS_PATH = './data/processed/Stock_News.csv'
+# 保证以绝对路径直接运行 align.py 时也能找到 dataProcessed 包
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_PAPER_ROOT = os.path.dirname(_SCRIPT_DIR)
+if _PAPER_ROOT not in sys.path:
+    sys.path.insert(0, _PAPER_ROOT)
 
-# 2. 刚刚下载成功的大盘指数路径
-MARKET_INDEX_PATH = './data/raw/FNSPID/SP500_Index.csv'
+# ================= 配置路径 (根据你之前的运行结果修改) =================
+# 1. 价格与新闻：均使用 paper/data/processed/ 下的过滤后文件
+PROCESSED_PRICE_PATH = "./paper/data/processed/Stock_Prices_sp500.csv"
+PROCESSED_NEWS_PATH = "./paper/data/processed/Stock_News_sp500.csv"
+
+# 2. 大盘指数路径（你当前已放在 paper/data/processed/）
+MARKET_INDEX_PATH = "./paper/data/processed/SP500_Index.csv"
 
 # 3. 最终输出路径
-OUTPUT_FILE = './data/processed/Final_Model_Data.csv'
+OUTPUT_FILE = "./paper/data/processed/Final_Model_Data.csv"
 
-# Alpha158（轻量）特征配置
-USE_ALPHA158 = False
-ALPHA_OUTPUT_FILE = './data/processed/sp500_alpha158_features.parquet'
-FEATURE_COLUMNS_PATH = './data/processed/feature_columns.json'
-FEATURE_TARGET_DIM = 100  # 论文规范：50~100 个 Alpha158-like 因子即可（不强求 158）
+# Alpha158（轻量）特征配置（默认启用）
+USE_ALPHA158 = True
+ALPHA_OUTPUT_FILE = "./paper/data/processed/sp500_alpha158_features.parquet"
+FEATURE_COLUMNS_PATH = "./paper/data/processed/feature_columns.json"
+FEATURE_TARGET_DIM = 158  # 默认输出 158 个 Alpha158-like 因子
 
 # ================= 主逻辑：数据对齐 =================
 def align_all_data():

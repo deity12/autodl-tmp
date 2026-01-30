@@ -5,8 +5,8 @@
 
 用法：
   方式1：直接运行（默认配置）
-  方式2：命令行覆盖参数
-    python 4_evaluate.py --checkpoint ./outputs/checkpoints/best_model.pth --test_data ./data/processed/Final_Model_Data.csv
+ 方式2：命令行覆盖参数
+    python 4_evaluate.py --checkpoint ./outputs/checkpoints/best_model.pth --test_data ./paper/data/processed/Final_Model_Data.csv
 """
 
 from __future__ import annotations
@@ -25,14 +25,15 @@ from scipy.stats import pearsonr, spearmanr
 from utils.logging_utils import setup_logging
 
 # ================= 配置（可直接修改）=================
-CHECKPOINT_PATH = "./outputs/checkpoints/best_model.pth"
-DATA_CSV_PATH = "./data/processed/Final_Model_Data.csv"
-GRAPH_PATH = "./data/processed/Graph_Adjacency.npy"
-GRAPH_TICKERS_PATH = "./data/processed/Graph_Tickers.json"
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CHECKPOINT_PATH = os.path.join(_SCRIPT_DIR, "outputs", "checkpoints", "best_model.pth")
+DATA_CSV_PATH = os.path.join(_SCRIPT_DIR, "data", "processed", "Final_Model_Data.csv")
+GRAPH_PATH = os.path.join(_SCRIPT_DIR, "data", "processed", "Graph_Adjacency.npy")
+GRAPH_TICKERS_PATH = os.path.join(_SCRIPT_DIR, "data", "processed", "Graph_Tickers.json")
 
 BATCH_SIZE = 2048
 USE_GRAPH = True
-TOP_K = 10
+TOP_K = 30  # 与论文一致：Top-30 Long-Short
 ANNUALIZATION = 252
 
 MODEL_N_EMBD = 256
@@ -55,7 +56,10 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _calc_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
+def _calc_metrics(y_true: np.ndarray, y_pred: np.ndarray, dates: list[str] = None) -> dict:
+    """计算评估指标，包括每日 IC/RankIC 和 ICIR/RankICIR（符合顶会标准）"""
+    from collections import defaultdict
+    
     y_true = y_true.flatten()
     y_pred = y_pred.flatten()
 
@@ -68,6 +72,7 @@ def _calc_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     pred_dir = np.sign(y_pred)
     dir_acc = float(np.mean(true_dir == pred_dir))
 
+    # 计算整体 IC/RankIC
     ic = None
     rank_ic = None
     try:
@@ -81,6 +86,47 @@ def _calc_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     except Exception:
         pass
 
+    # 计算每日 IC/RankIC，然后聚合为 ICIR/RankICIR（顶会标准做法）
+    icir = None
+    rank_icir = None
+    daily_ic = None
+    daily_rankic = None
+    
+    if dates is not None and len(dates) == len(y_true):
+        buckets_true = defaultdict(list)
+        buckets_pred = defaultdict(list)
+        for t, p, d in zip(y_true, y_pred, dates):
+            buckets_true[d].append(float(t))
+            buckets_pred[d].append(float(p))
+        
+        ic_list = []
+        rankic_list = []
+        for d in buckets_true.keys():
+            yt = np.asarray(buckets_true[d], dtype=np.float64)
+            yp = np.asarray(buckets_pred[d], dtype=np.float64)
+            if yt.size < 2:
+                continue
+            try:
+                ic_val, _ = pearsonr(yp, yt)
+                ic_list.append(float(ic_val))
+            except Exception:
+                pass
+            try:
+                ric_val, _ = spearmanr(yp, yt)
+                rankic_list.append(float(ric_val))
+            except Exception:
+                pass
+        
+        if ic_list:
+            daily_ic = float(np.mean(ic_list))
+            if np.std(ic_list) > 1e-8:
+                icir = float(np.mean(ic_list) / np.std(ic_list))
+        
+        if rankic_list:
+            daily_rankic = float(np.mean(rankic_list))
+            if np.std(rankic_list) > 1e-8:
+                rank_icir = float(np.mean(rankic_list) / np.std(rankic_list))
+
     return {
         "mse": float(mse),
         "mae": float(mae),
@@ -89,6 +135,10 @@ def _calc_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
         "dir_acc": dir_acc,
         "ic": ic,
         "rank_ic": rank_ic,
+        "daily_ic": daily_ic,        # 每日 IC 均值
+        "daily_rankic": daily_rankic, # 每日 RankIC 均值
+        "icir": icir,                # IC 稳定性指标
+        "rank_icir": rank_icir,      # RankIC 稳定性指标
         "n_samples": int(len(y_true)),
     }
 
@@ -265,7 +315,7 @@ def main() -> None:
 
         y_pred = np.concatenate(all_preds, axis=0)
         y_true = np.concatenate(all_labels, axis=0)
-        metrics = _calc_metrics(y_true, y_pred)
+        metrics = _calc_metrics(y_true, y_pred, all_dates)  # 传入 dates 以计算 ICIR
         backtest = _calc_backtest_metrics(
             y_true,
             y_pred,
@@ -274,6 +324,31 @@ def main() -> None:
             annualization=args.annualization,
         )
 
+        # 格式化输出（符合顶会论文表格格式）
+        print("\n" + "=" * 60)
+        print("📊 Graph-RWKV 模型评估结果（测试集）")
+        print("=" * 60)
+        print(f"\n【预测能力指标】")
+        print(f"  IC (每日均值):        {metrics.get('daily_ic', 'N/A'):.4f}" if metrics.get('daily_ic') else "  IC (每日均值):        N/A")
+        print(f"  RankIC (每日均值):    {metrics.get('daily_rankic', 'N/A'):.4f}" if metrics.get('daily_rankic') else "  RankIC (每日均值):    N/A")
+        print(f"  ICIR:                 {metrics.get('icir', 'N/A'):.4f}" if metrics.get('icir') else "  ICIR:                 N/A")
+        print(f"  RankICIR:             {metrics.get('rank_icir', 'N/A'):.4f}" if metrics.get('rank_icir') else "  RankICIR:             N/A")
+        print(f"\n【回归指标】")
+        print(f"  MSE:                  {metrics['mse']:.6f}")
+        print(f"  RMSE:                 {metrics['rmse']:.6f}")
+        print(f"  R²:                   {metrics['r2']:.4f}")
+        print(f"  方向准确率:           {metrics['dir_acc']:.2%}")
+        print(f"  样本数:               {metrics['n_samples']}")
+        
+        if backtest:
+            print(f"\n【Top-{args.top_k} Long-Short 回测】")
+            print(f"  年化收益率:           {backtest.get('annual_return', 'N/A'):.2%}" if backtest.get('annual_return') is not None else "  年化收益率:           N/A")
+            print(f"  夏普比率:             {backtest.get('sharpe', 'N/A'):.4f}" if backtest.get('sharpe') else "  夏普比率:             N/A")
+            print(f"  最大回撤:             {backtest.get('max_drawdown', 'N/A'):.2%}" if backtest.get('max_drawdown') is not None else "  最大回撤:             N/A")
+            print(f"  交易天数:             {backtest.get('n_days', 'N/A')}")
+        
+        print("=" * 60)
+        
         logger.info("评估完成: %s", metrics)
         if backtest:
             logger.info("回测指标: %s", backtest)

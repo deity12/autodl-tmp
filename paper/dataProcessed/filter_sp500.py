@@ -155,7 +155,6 @@ def filter_sp500(
 def default_sp500_list_path() -> Optional[str]:
     candidates = [
         "./sp500_list.txt",
-        "./data/raw/FNSPID/sp500_list.txt",
         "./paper/data/raw/FNSPID/sp500_list.txt",
     ]
     for p in candidates:

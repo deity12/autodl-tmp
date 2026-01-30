@@ -1,31 +1,23 @@
 # -*- coding: utf-8 -*-
 """
-Graph-RWKV 模型训练脚本（基于大语言模型动态图谱与 Graph-RWKV 的时空解耦金融预测）
+Graph-RWKV 模型训练脚本（基于动态图谱与 Graph-RWKV 的时空解耦金融预测）
 ========================================================================
-【核心创新点】根据新研究方向实现：
 
-训练策略：
-    1. **滚动窗口验证（Rolling Window / Walk-Forward Validation）**：
-       - 为适应金融市场风格切换（Regime Shift），不采用静态划分
-       - 阶段 1：Train (2018-2020) → Test (2021 Q1)
-       - 阶段 2：Train (2018-2020 + 2021 Q1) → Test (2021 Q2)
-       - 阶段 3：...以此类推
-       - 【注意】当前实现为静态 80/20 划分，完整滚动窗口验证需在评估脚本中实现
+本脚本是论文实现中的**训练主入口**，与 `new.md` 中的实现说明严格对应，核心要点如下：
 
-    2. **Loss Function**：RankIC Loss（侧重排序能力）
-       Loss = -PearsonCorr(Pred_rank, Target_rank)
+- **模型架构**：Graph-RWKV（时间维为 RWKV / LSTM / GRU，可选；空间维为 Broadcast GAT 或退化为无图的纯时序模型）。
+- **图谱输入**：使用 `Graph_Adjacency.npy` 与 `Graph_Tickers.json`（由 `2_build_graph.py` 生成），在训练前做节点数与 ticker 顺序的严格一致性校验，防止“静默错位”。
+- **损失函数**：
+  - 基础回归损失：MSE 回归 `Log_Ret`。
+  - 排序损失：基于可微近似排序（soft-rank）的 **RankIC Loss**，默认权重由 `rank_loss_weight` 控制（在 `PAPER_CONFIG` 中为 1.0，经 `3_train.py` 覆盖后默认 0.1）。
+- **批采样策略**：默认启用 `DateGroupedBatchSampler`，即**按日期成批**，保证每个 batch 主要来自同一交易日，以便在该日截面上计算排序损失（RankIC / RankNet）。
+- **验证方式**：
+  - 默认采用固定训练区间（2018-01-01 ~ 2020-12-31）与测试区间（2021-01-01 之后），配置见 `CONFIG`。
+  - 可选启用滚动窗口验证（Walk-Forward Validation）：由 `CONFIG['use_walk_forward']` 控制，入口在 `main()` 中。
 
-核心改进：
-    1. 降低模型复杂度（n_embd 512->256, n_layers 4->3）
-    2. 降低 batch_size（3072->512），增加梯度更新次数
-    3. 增加 epoch 数量（10->20），给复杂模型更多训练时间
-    4. 使用差异化学习率：量子层用更小的学习率（经典层 3e-4，量子层 3e-5）
-    5. 动态设置量子阈值：基于训练数据的 70% 分位数
-    6. 添加权重衰减和更强的 Dropout 正则化
-
-【论文对应】：
-    - 对应论文 3.3 训练与验证策略
-    - 模型架构：Graph-RWKV（RWKV 时间编码器 + 动态 GAT 空间聚合）
+说明：
+- 早期版本中的量子相关模块（Quantum/MATCC）已完全移除，本脚本不再使用量子层或差异化学习率；若论文中仍保留相关表述，请以本文件与 `gnn_model.py` 为准。
+- 若你需要进行消融实验（如“无图”、“仅统计图”、“不同时间编码器”等），可通过修改 `CONFIG` 或使用 `3_train_ablation.py` 入口脚本。
 """
 
 import sys
@@ -241,7 +233,7 @@ PAPER_CONFIG = {
     # 运行配置
     'output_dir': OUTPUT_DIR,
     'graph_path': GRAPH_PATH,
-    'graph_split_date': '2020-12-31',
+    'graph_split_date': '2020-06-30',  # 与训练集结束日期一致，防泄露
     'graph_tickers_path': GRAPH_TICKERS_PATH,
     'use_graph': True,
     'experiment_name': 'full',
@@ -249,15 +241,17 @@ PAPER_CONFIG = {
     # Walk-forward 配置
     'use_walk_forward': False,
     'walk_forward_train_start': '2018-01-01',
-    'walk_forward_train_end': '2020-12-31',
+    'walk_forward_train_end': '2020-06-30',
     'walk_forward_test_start': '2021-01-01',
     'walk_forward_test_end': '2023-12-31',
     'walk_forward_freq': 'Q',
-    # 训练/评估日期范围（由 walk-forward 覆盖）
+    # 训练/验证/测试日期范围（符合顶会标准的三阶段切分）
     'train_start': '2018-01-01',
-    'train_end': '2020-12-31',
-    'test_start': None,
-    'test_end': None,
+    'train_end': '2020-06-30',      # 训练集：~2.5年
+    'val_start': '2020-07-01',      # 验证集：用于早停和超参调优
+    'val_end': '2020-12-31',        # 验证集：~6个月
+    'test_start': '2021-01-01',     # 测试集：最终评估
+    'test_end': '2023-12-31',       # 测试集：~3年
     'use_date_split': True,
     # 时间编码器类型
     'temporal_backend': 'rwkv',  # rwkv | lstm | gru
@@ -440,10 +434,12 @@ def _train_once():
         print(f"   显存: {gpu_memory:.1f} GB")
         print(f"   Batch Size: {CONFIG['batch_size']}")
 
-    # ================= 3. 数据加载 =================
+    # ================= 3. 数据加载（三阶段切分：Train/Valid/Test）=================
     print("\n>>> Loading Datasets...")
     try:
         use_date_split = bool(CONFIG.get('use_date_split', True))
+        
+        # 训练集：2018-01-01 ~ 2020-06-30
         train_dataset = FinancialDataset(
             CONFIG['csv_path'],
             seq_len=CONFIG['seq_len'],
@@ -453,17 +449,34 @@ def _train_once():
             use_date_split=use_date_split,
             feature_columns_path=CONFIG.get('feature_columns_path'),
         )
-        test_dataset = FinancialDataset(
-            CONFIG['csv_path'], seq_len=CONFIG['seq_len'], mode='test', 
+        
+        # 验证集：2020-07-01 ~ 2020-12-31（用于早停和超参调优）
+        val_dataset = FinancialDataset(
+            CONFIG['csv_path'],
+            seq_len=CONFIG['seq_len'],
+            mode='test',  # 使用 test 模式以使用 train 的 scaler
             scaler=train_dataset.scaler,
-            # 【注意】新方向不使用 vol_stats，但保留参数以兼容接口
+            vol_stats=train_dataset.vol_stats if hasattr(train_dataset, 'vol_stats') else None,
+            start_date=CONFIG.get('val_start'),
+            end_date=CONFIG.get('val_end'),
+            use_date_split=use_date_split,
+            feature_columns_path=CONFIG.get('feature_columns_path'),
+        )
+        
+        # 测试集：2021-01-01 ~ 2023-12-31（最终评估，不参与训练/早停）
+        test_dataset = FinancialDataset(
+            CONFIG['csv_path'],
+            seq_len=CONFIG['seq_len'],
+            mode='test',
+            scaler=train_dataset.scaler,
             vol_stats=train_dataset.vol_stats if hasattr(train_dataset, 'vol_stats') else None,
             start_date=CONFIG.get('test_start'),
             end_date=CONFIG.get('test_end'),
             use_date_split=use_date_split,
             feature_columns_path=CONFIG.get('feature_columns_path'),
         )
-        print(f"   Train: {len(train_dataset)}, Test: {len(test_dataset)}")
+        
+        print(f"   Train: {len(train_dataset)}, Valid: {len(val_dataset)}, Test: {len(test_dataset)}")
         CONFIG['input_dim'] = len(train_dataset.feature_cols)
         print(f"   Input Dim: {CONFIG['input_dim']} (features)")
     except Exception as e:
@@ -569,6 +582,19 @@ def _train_once():
         prefetch_factor=prefetch_factor,
         persistent_workers=persistent_workers,
     )
+    
+    # 验证集 DataLoader（用于早停）
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=CONFIG['batch_size'],
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        prefetch_factor=prefetch_factor,
+        persistent_workers=persistent_workers,
+    )
+    
+    # 测试集 DataLoader（仅用于最终评估）
     test_loader = DataLoader(
         test_dataset,
         batch_size=CONFIG['batch_size'],
@@ -728,7 +754,7 @@ def _train_once():
         avg_train = epoch_train_loss / num_batches
         train_losses.append(avg_train)
 
-        # ---------- 验证 ----------
+        # ---------- 验证（在 val_loader 上，用于早停）----------
         model.eval()
         epoch_val = 0.0
         all_preds = []
@@ -736,7 +762,7 @@ def _train_once():
         all_dates = []
         
         with torch.no_grad():
-            for batch in test_loader:
+            for batch in val_loader:  # 使用验证集而非测试集
                 x = batch['x'].to(CONFIG['device'], non_blocking=True)
                 y = batch['y'].to(CONFIG['device'], non_blocking=True)
                 vol = batch['vol'].to(CONFIG['device'], non_blocking=True)
@@ -757,7 +783,7 @@ def _train_once():
                 if dates is not None:
                     all_dates.extend(list(dates))
         
-        avg_val = epoch_val / len(test_loader)
+        avg_val = epoch_val / len(val_loader)
         val_losses.append(avg_val)
         
         # 计算评估指标
@@ -826,7 +852,100 @@ def _train_once():
             break
         print("-" * 60)
 
-    # ================= 8. 保存结果 =================
+    # ================= 8. 测试集最终评估（论文报告此区间指标）=================
+    print("\n>>> 加载最佳模型并在测试集上评估...")
+    best_model_path = os.path.join(checkpoint_dir, checkpoint_name)
+    if os.path.exists(best_model_path):
+        model.load_state_dict(torch.load(best_model_path, map_location=CONFIG['device']))
+    model.eval()
+    
+    test_preds = []
+    test_targets = []
+    test_dates = []
+    
+    with torch.no_grad():
+        for batch in test_loader:
+            x = batch['x'].to(CONFIG['device'], non_blocking=True)
+            y = batch['y'].to(CONFIG['device'], non_blocking=True)
+            vol = batch['vol'].to(CONFIG['device'], non_blocking=True)
+            dates = batch.get('target_date')
+            node_indices = batch.get('node_indices')
+            if node_indices is not None:
+                node_indices = node_indices.to(CONFIG['device'], non_blocking=True)
+            
+            if use_amp:
+                with torch.cuda.amp.autocast():
+                    preds = model(x, vol, node_indices=node_indices)
+            else:
+                preds = model(x, vol, node_indices=node_indices)
+            
+            test_preds.append(preds.cpu().numpy())
+            test_targets.append(y.cpu().numpy())
+            if dates is not None:
+                test_dates.extend(list(dates))
+    
+    test_preds_np = np.concatenate(test_preds, axis=0).flatten()
+    test_targets_np = np.concatenate(test_targets, axis=0).flatten()
+    
+    # 计算测试集指标（含 ICIR）
+    test_mse = mean_squared_error(test_targets_np, test_preds_np)
+    test_mae = mean_absolute_error(test_targets_np, test_preds_np)
+    test_rmse = np.sqrt(test_mse)
+    test_r2 = r2_score(test_targets_np, test_preds_np)
+    test_dir_acc = np.mean(np.sign(test_targets_np) == np.sign(test_preds_np))
+    
+    # 计算每日 IC/RankIC，然后聚合为 ICIR/RankICIR
+    test_ic, test_rank_ic = daily_ic_rankic(test_targets_np, test_preds_np, test_dates)
+    
+    # 计算 ICIR 和 RankICIR（需要逐日计算）
+    ic_list = []
+    rankic_list = []
+    buckets_true = defaultdict(list)
+    buckets_pred = defaultdict(list)
+    for t, p, d in zip(test_targets_np, test_preds_np, test_dates):
+        buckets_true[d].append(float(t))
+        buckets_pred[d].append(float(p))
+    for d in buckets_true.keys():
+        yt = np.asarray(buckets_true[d], dtype=np.float64)
+        yp = np.asarray(buckets_pred[d], dtype=np.float64)
+        if yt.size < 2:
+            continue
+        try:
+            ic_val, _ = pearsonr(yp, yt)
+            ic_list.append(float(ic_val))
+        except Exception:
+            pass
+        try:
+            ric_val, _ = spearmanr(yp, yt)
+            rankic_list.append(float(ric_val))
+        except Exception:
+            pass
+    
+    test_icir = float(np.mean(ic_list) / np.std(ic_list)) if ic_list and np.std(ic_list) > 1e-8 else None
+    test_rankicir = float(np.mean(rankic_list) / np.std(rankic_list)) if rankic_list and np.std(rankic_list) > 1e-8 else None
+    
+    test_metrics = {
+        'mse': float(test_mse),
+        'mae': float(test_mae),
+        'rmse': float(test_rmse),
+        'r2': float(test_r2),
+        'directional_accuracy': float(test_dir_acc),
+        'ic': test_ic,
+        'rank_ic': test_rank_ic,
+        'icir': test_icir,
+        'rank_icir': test_rankicir,
+        'n_test_samples': len(test_targets_np),
+        'n_test_days': len(set(test_dates)),
+    }
+    
+    print(f"\n📊 测试集最终评估指标（2021-01-01 ~ 2023-12-31）:")
+    print(f"   MSE: {test_mse:.6f}, RMSE: {test_rmse:.6f}")
+    print(f"   R²: {test_r2:.4f}, MAE: {test_mae:.6f}")
+    print(f"   方向准确率: {test_dir_acc:.2%}")
+    print(f"   IC: {test_ic:.4f if test_ic else 'N/A'}, ICIR: {test_icir:.4f if test_icir else 'N/A'}")
+    print(f"   RankIC: {test_rank_ic:.4f if test_rank_ic else 'N/A'}, RankICIR: {test_rankicir:.4f if test_rankicir else 'N/A'}")
+
+    # ================= 9. 保存结果 =================
     curve_path = os.path.join(figure_dir, f"training_curve_{experiment_name}.png")
     plt.figure(figsize=(12, 6))
     plt.plot(range(1, len(train_losses) + 1), train_losses, 'b-', label='Train Loss', lw=2)
@@ -852,7 +971,8 @@ def _train_once():
         'best_val_loss': best_val_loss,
         'best_epoch': val_losses.index(best_val_loss) + 1 if val_losses else 0,
         'total_epochs': len(train_losses),
-        'metrics': best_metrics_epoch,
+        'val_metrics': best_metrics_epoch,  # 验证集指标（用于早停）
+        'test_metrics': test_metrics,       # 测试集指标（论文报告）
         'config': {
             'batch_size': CONFIG['batch_size'],
             'lr': CONFIG['lr'],
@@ -861,12 +981,17 @@ def _train_once():
             'n_layers': CONFIG['n_layers'],
             'gnn_embd': CONFIG.get('gnn_embd'),
             'seq_len': CONFIG.get('seq_len'),
-            # 【注意】新方向不使用以下参数，已移除：
-            # 'n_qubits', 'q_threshold'
+            'train_start': CONFIG.get('train_start'),
+            'train_end': CONFIG.get('train_end'),
+            'val_start': CONFIG.get('val_start'),
+            'val_end': CONFIG.get('val_end'),
+            'test_start': CONFIG.get('test_start'),
+            'test_end': CONFIG.get('test_end'),
             'profile': os.environ.get("QL_PROFILE", "paper"),
             'output_dir': output_dir,
             'checkpoint_name': checkpoint_name,
             'use_graph': CONFIG.get("use_graph", True),
+            'temporal_backend': CONFIG.get('temporal_backend', 'rwkv'),
         }
     }
     with open(loss_data_path, 'w') as f:
@@ -884,7 +1009,8 @@ def _train_once():
         "artifacts_dir": artifacts_dir,
         "best_val_loss": best_val_loss,
         "best_epoch": val_losses.index(best_val_loss) + 1 if val_losses else 0,
-        "metrics": best_metrics_epoch,
+        "val_metrics": best_metrics_epoch,   # 验证集指标
+        "test_metrics": test_metrics,        # 测试集指标（论文报告）
         "config": loss_data.get("config", {}),
         "loss_log": loss_data_path,
     }
@@ -895,15 +1021,13 @@ def _train_once():
     print("\n" + "=" * 60)
     print(">>> Graph-RWKV Model 训练结束")
     print(f"    Best Val Loss: {best_val_loss:.6f}")
-    if best_metrics_epoch:
-        print(f"\n    📊 评估指标:")
-        print(f"      R² Score: {best_metrics_epoch['r2']:.4f}")
-        print(f"      MAE: {best_metrics_epoch['mae']:.6f}")
-        print(f"      Directional Accuracy: {best_metrics_epoch['directional_accuracy']:.2%}")
-        if best_metrics_epoch.get('ic') is not None:
-            print(f"      IC: {best_metrics_epoch['ic']:.4f}")
-        if best_metrics_epoch.get('rank_ic') is not None:
-            print(f"      RankIC: {best_metrics_epoch['rank_ic']:.4f}")
+    print(f"\n    📊 测试集指标（论文报告此区间）:")
+    print(f"      IC: {test_metrics.get('ic', 'N/A'):.4f}" if test_metrics.get('ic') else "      IC: N/A")
+    print(f"      RankIC: {test_metrics.get('rank_ic', 'N/A'):.4f}" if test_metrics.get('rank_ic') else "      RankIC: N/A")
+    print(f"      ICIR: {test_metrics.get('icir', 'N/A'):.4f}" if test_metrics.get('icir') else "      ICIR: N/A")
+    print(f"      RankICIR: {test_metrics.get('rank_icir', 'N/A'):.4f}" if test_metrics.get('rank_icir') else "      RankICIR: N/A")
+    print(f"      R² Score: {test_metrics['r2']:.4f}")
+    print(f"      Directional Accuracy: {test_metrics['directional_accuracy']:.2%}")
     print("=" * 60)
     return summary
 

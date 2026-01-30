@@ -13,7 +13,7 @@ Alpha158-like 特征工程（独立脚本）
       2) feature_columns.json（特征列清单，供 DataLoader 读取）
 
 备注：
-  - 因子数量不强求 158；默认 100（可通过参数调整到 50~100）
+  - 默认输出 158 个 Alpha158-like 因子（与 Alpha158 论文维度更贴近）；如需更少可通过参数调小
   - 输出仅包含 [Date, Ticker, features...]，不重复写入原始 OHLCV
 """
 
@@ -28,7 +28,8 @@ import numpy as np
 import pandas as pd
 
 
-DEFAULT_WINDOWS = [5, 10, 14, 20, 30, 60]
+# 默认窗口（更贴近常见 Alpha158 风格窗口设置）
+DEFAULT_WINDOWS = [5, 10, 20, 30, 40, 50, 60]
 
 
 def _norm_ticker(s: pd.Series) -> pd.Series:
@@ -72,7 +73,8 @@ def _compute_features_pandas(df: pd.DataFrame, windows: List[int]) -> Tuple[pd.D
     vol = out["Volume"].astype(float)
 
     # 基础动量 / 波动（与后续 rolling 特征复用）
-    out["ret_1d"] = g["Close"].pct_change(1).replace([np.inf, -np.inf], np.nan)
+    # 显式指定 fill_method=None，避免未来 Pandas 默认行为变更导致结果漂移
+    out["ret_1d"] = g["Close"].pct_change(1, fill_method=None).replace([np.inf, -np.inf], np.nan)
     out["_log_close"] = g["Close"].transform(lambda x: np.log(x.replace(0, np.nan)))
     out["log_ret_1d"] = g["_log_close"].diff()
     out["hl_range"] = (high - low) / close
@@ -104,6 +106,10 @@ def _compute_features_pandas(df: pd.DataFrame, windows: List[int]) -> Tuple[pd.D
     typical_price = (high + low + close) / 3.0
     out["_tp"] = typical_price
 
+    # 为了减少重复 groupby/rolling 的开销，提前准备一些序列
+    prev_high = g["High"].shift(1)
+    prev_low = g["Low"].shift(1)
+
     for w in windows:
         # Trend
         sma = g["Close"].transform(lambda x: x.rolling(w, min_periods=w).mean())
@@ -114,7 +120,7 @@ def _compute_features_pandas(df: pd.DataFrame, windows: List[int]) -> Tuple[pd.D
         out[f"close_ema_ratio_{w}"] = out["Close"].astype(float) / ema - 1.0
 
         # Momentum
-        out[f"roc_{w}"] = g["Close"].pct_change(w).replace([np.inf, -np.inf], np.nan)
+        out[f"roc_{w}"] = g["Close"].pct_change(w, fill_method=None).replace([np.inf, -np.inf], np.nan)
         out[f"mom_{w}"] = g["Close"].diff(w)
         out[f"rsi_{w}"] = g["Close"].transform(lambda x, _w=w: _rsi(x.astype(float), _w))
 
@@ -138,6 +144,54 @@ def _compute_features_pandas(df: pd.DataFrame, windows: List[int]) -> Tuple[pd.D
         vol_sum = out["Volume"].astype(float).groupby(out["Ticker"], sort=False).transform(lambda x: x.rolling(w, min_periods=w).sum())
         out[f"vwap_{w}"] = tpv_sum / vol_sum.replace(0, np.nan)
 
+        # ========= Alpha158-like 关键增强：更多常见指标（用于补足到 158 维）=========
+        # 1) MFI（Money Flow Index）
+        tp = out["_tp"].astype(float)
+        mf = tp * out["Volume"].astype(float)
+        tp_diff = g["_tp"].diff()
+        pos_mf = mf.where(tp_diff > 0, 0.0)
+        neg_mf = mf.where(tp_diff < 0, 0.0).abs()
+        pos_sum = pos_mf.groupby(out["Ticker"], sort=False).transform(lambda x: x.rolling(w, min_periods=w).sum())
+        neg_sum = neg_mf.groupby(out["Ticker"], sort=False).transform(lambda x: x.rolling(w, min_periods=w).sum())
+        mfr = pos_sum / neg_sum.replace(0, np.nan)
+        out[f"mfi_{w}"] = (100.0 - (100.0 / (1.0 + mfr))).clip(lower=0.0, upper=100.0)
+
+        # 2) CCI（Commodity Channel Index）
+        tp_sma = g["_tp"].transform(lambda x: x.rolling(w, min_periods=w).mean())
+        tp_mad = g["_tp"].transform(
+            lambda x: x.rolling(w, min_periods=w).apply(lambda a: np.mean(np.abs(a - a.mean())), raw=True)
+        )
+        out[f"cci_{w}"] = (tp - tp_sma) / (0.015 * tp_mad.replace(0, np.nan))
+
+        # 3) Williams %R（WILLR）
+        hh = g["High"].transform(lambda x: x.rolling(w, min_periods=w).max())
+        ll = g["Low"].transform(lambda x: x.rolling(w, min_periods=w).min())
+        denom_hl = (hh - ll).replace(0, np.nan)
+        out[f"willr_{w}"] = (-100.0 * (hh - out["Close"].astype(float)) / denom_hl).clip(lower=-100.0, upper=0.0)
+
+        # 4) ADX / DI+ / DI-（简化版：rolling 平滑）
+        up_move = (out["High"].astype(float) - prev_high.astype(float))
+        down_move = (prev_low.astype(float) - out["Low"].astype(float))
+        plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+        minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+        tr_sum = g["_tr"].transform(lambda x: x.rolling(w, min_periods=w).sum()).replace(0, np.nan)
+        plus_dm_sum = plus_dm.groupby(out["Ticker"], sort=False).transform(lambda x: x.rolling(w, min_periods=w).sum())
+        minus_dm_sum = minus_dm.groupby(out["Ticker"], sort=False).transform(lambda x: x.rolling(w, min_periods=w).sum())
+        plus_di = 100.0 * plus_dm_sum / tr_sum
+        minus_di = 100.0 * minus_dm_sum / tr_sum
+        out[f"di_plus_{w}"] = plus_di
+        out[f"di_minus_{w}"] = minus_di
+        dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+        out[f"adx_{w}"] = dx.groupby(out["Ticker"], sort=False).transform(lambda x: x.rolling(w, min_periods=w).mean())
+
+        # 5) CMF（Chaikin Money Flow）
+        high_low = (out["High"].astype(float) - out["Low"].astype(float)).replace(0, np.nan)
+        mfm = ((out["Close"].astype(float) - out["Low"].astype(float)) - (out["High"].astype(float) - out["Close"].astype(float))) / high_low
+        mfv = (mfm.fillna(0.0) * out["Volume"].astype(float))
+        mfv_sum = mfv.groupby(out["Ticker"], sort=False).transform(lambda x: x.rolling(w, min_periods=w).sum())
+        vol_sum2 = out["Volume"].astype(float).groupby(out["Ticker"], sort=False).transform(lambda x: x.rolling(w, min_periods=w).sum())
+        out[f"cmf_{w}"] = mfv_sum / vol_sum2.replace(0, np.nan)
+
         feature_cols.extend(
             [
                 f"close_sma_{w}",
@@ -155,6 +209,13 @@ def _compute_features_pandas(df: pd.DataFrame, windows: List[int]) -> Tuple[pd.D
                 f"vol_mean_{w}",
                 f"vol_std_{w}",
                 f"vwap_{w}",
+                f"mfi_{w}",
+                f"cci_{w}",
+                f"willr_{w}",
+                f"di_plus_{w}",
+                f"di_minus_{w}",
+                f"adx_{w}",
+                f"cmf_{w}",
             ]
         )
 
@@ -195,7 +256,7 @@ def _compute_features_pandas_ta(df: pd.DataFrame, windows: List[int]) -> Tuple[p
     输出列名由 pandas-ta 决定；为便于统一，最终会去除 OHLCV 只保留因子列。
     """
     _require_ohlcv(df)
-    import pandas_ta as ta  # noqa: F401
+    import pandas_ta as ta  # noqa: F401  # type: ignore[import-not-found]
 
     work = df[["Date", "Ticker", "Open", "High", "Low", "Close", "Volume"]].copy()
     work["Date"] = pd.to_datetime(work["Date"], errors="coerce")
@@ -264,15 +325,22 @@ def build_feature_file(
     else:
         feat_df, feat_cols = _compute_features_pandas(df, windows)
 
-    # 控制维度到 50~100（或用户指定），避免强行凑满 158
-    feat_cols = sorted(list(dict.fromkeys(feat_cols)))  # 去重并稳定排序
+    # 控制维度到 n_features（默认 158）
+    # 这里保持“构造顺序”作为默认优先级（不要按字母排序），更符合因子工程的直觉。
+    feat_cols = list(dict.fromkeys(feat_cols))  # 去重并保留顺序
     if n_features > 0:
         feat_cols = feat_cols[: int(n_features)]
         keep = ["Date", "Ticker"] + feat_cols
         feat_df = feat_df[keep].copy()
 
+    # 【关键增强】截面 Rank（Cross-sectional Rank）
+    # 将原始数值转化为每日的百分比排名（pct rank），并中心化到 [-0.5, 0.5]
+    # 这在量化预测中常用于提升不同股票间的可比性，帮助模型更快收敛。
+    if feat_cols:
+        feat_df[feat_cols] = feat_df.groupby("Date", sort=False)[feat_cols].rank(pct=True) - 0.5
+
     # 在写入前填充缺失值：先向前填充，再将剩余 NaN 置为 0，避免 downstream 出现 NaN 导致加载或训练失败
-    feat_df = feat_df.fillna(method="ffill").fillna(0.0)
+    feat_df = feat_df.ffill().fillna(0.0)
 
     os.makedirs(os.path.dirname(output_parquet) or ".", exist_ok=True)
     _write_parquet_or_raise(feat_df, output_parquet)
@@ -286,10 +354,10 @@ def build_feature_file(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Alpha158-like feature engineering (pandas-ta preferred).")
-    parser.add_argument("--prices_csv", type=str, default="./data/processed/Stock_Prices_sp500.csv")
-    parser.add_argument("--output", type=str, default="./data/processed/sp500_alpha158_features.parquet")
-    parser.add_argument("--feature_columns", type=str, default="./data/processed/feature_columns.json")
-    parser.add_argument("--n_features", type=int, default=100)
+    parser.add_argument("--prices_csv", type=str, default="./paper/data/processed/Stock_Prices_sp500.csv")
+    parser.add_argument("--output", type=str, default="./paper/data/processed/sp500_alpha158_features.parquet")
+    parser.add_argument("--feature_columns", type=str, default="./paper/data/processed/feature_columns.json")
+    parser.add_argument("--n_features", type=int, default=158)
     parser.add_argument("--no_pandas_ta", action="store_true", help="强制不用 pandas-ta（使用纯 pandas 实现）")
     args = parser.parse_args()
 

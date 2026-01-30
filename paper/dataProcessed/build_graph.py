@@ -20,8 +20,13 @@ import torch
 import warnings
 import json
 import time
-import traceback
 from collections import Counter, defaultdict
+
+# S&P 500 公司名→代码映射（同目录模块，便于维护与扩充）
+try:
+    from .sp500_name_to_ticker import NAME_TO_TICKER
+except ImportError:
+    from sp500_name_to_ticker import NAME_TO_TICKER
 
 # 关闭与本项目无关/不美观的环境警告（不影响LLM建图结果）
 os.environ.setdefault("TRANSFORMERS_NO_TORCHVISION", "1")
@@ -47,8 +52,10 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 DATA_PROCESSED = os.path.join(PROJECT_ROOT, 'data', 'processed')
 
-INPUT_NEWS = os.path.join(DATA_PROCESSED, 'Stock_News.csv')
-INPUT_MODEL_DATA = os.path.join(DATA_PROCESSED, 'Final_Model_Data.csv')
+# 【默认使用过滤后的 S&P 500 数据】
+INPUT_NEWS = os.path.join(DATA_PROCESSED, 'Stock_News_sp500.csv')  # 默认使用 S&P 500 过滤后的新闻文件
+INPUT_NEWS_FULL = os.path.join(DATA_PROCESSED, 'Stock_News.csv')  # 全量新闻文件（回退选项）
+INPUT_MODEL_DATA = os.path.join(DATA_PROCESSED, 'Final_Model_Data.csv')  # Final_Model_Data.csv 已经是过滤后的
 OUTPUT_GRAPH = os.path.join(DATA_PROCESSED, 'Graph_Adjacency.npy')
 OUTPUT_TICKERS = os.path.join(DATA_PROCESSED, 'Graph_Tickers.json')  # 新增：节点列表文件
 RELATIONS_PARQUET_PATH = os.path.join(DATA_PROCESSED, "llm_relations.parquet")
@@ -73,6 +80,11 @@ MAX_NEWS_PER_TICKER = 200  # 适度采样，确保质量
 # 批处理模式：耗时取决于 batch / 推理参数与GPU吞吐（通常为数小时量级）
 MAX_TOTAL_NEWS = 100000  # 平衡质量与时间
 
+# 调试上限：只处理前 N 条新闻即停止并保存（用于快速验证 Prompt/映射，约 20–30 分钟）
+# 设为 0 表示不限制，跑全量；设为 2000 可先验证再正式长跑
+# 【重要】正式运行时请设为 0！
+DEBUG_MAX_NEWS = 0
+
 # 是否使用 LLM（False 则使用规则匹配）
 # 48GB显存完全够用，启用LLM以获得更准确的关系提取
 USE_LLM_DEFAULT = True  # ⚠️ 确保启用LLM模式
@@ -83,7 +95,8 @@ USE_LLM_DEFAULT = True  # ⚠️ 确保启用LLM模式
 # - 关系抽取只需要很短的 JSON 输出，不需要 256 token + 采样
 LLM_BATCH_SIZE_DEFAULT = int(os.environ.get("LLM_BATCH_SIZE", "64"))
 LLM_MAX_INPUT_TOKENS_DEFAULT = int(os.environ.get("LLM_MAX_INPUT_TOKENS", "1536"))
-LLM_MAX_NEW_TOKENS_DEFAULT = int(os.environ.get("LLM_MAX_NEW_TOKENS", "96"))
+# 从 96 改为 512，避免 LLM 输出被腰斩导致 JSON 不完整
+LLM_MAX_NEW_TOKENS_DEFAULT = int(os.environ.get("LLM_MAX_NEW_TOKENS", "512"))
 LLM_DO_SAMPLE_DEFAULT = os.environ.get("LLM_DO_SAMPLE", "0") == "1"
 
 # ================= S&P 500 成分股（2023年版本，约500只）=================
@@ -202,7 +215,17 @@ USE_SP500_ONLY = True
 
 # ================= 混合图构建配置（核心创新点）=================
 # 时间衰减累积参数（用于语义图的时间连续性）
-TEMPORAL_DECAY_ALPHA = 0.9  # 衰减因子 α，范围 [0, 1]，越大表示历史信息保留越多
+# 公式：A_t = α·A_{t-1} + (1-α)·(当日新边)，按「每日」一步累积。
+#
+# 取值依据（仅依据论文 new.md）：
+# - 2.1 节：采用指数衰减因子，确保「旧闻的影响力随时间降低」；未给出具体数值。
+# - 3.3 节：训练 2018-01-01～2020-06-30，验证 2020-07-01～2020-12-31，图截止 split_date=2020-12-31，
+#   故语义图构建所用新闻时间跨度为「数据起点～2020-12-31」，约 3 年（2018–2020）。
+# - 在半衰期定义 α^halflife=0.5 下，α=0.995 ⇒ 半衰期≈138 天（约 4.5 个月）：
+#   在约 3 年窗口内，1 年前新闻权重≈0.28、2 年前≈0.08，既满足「旧闻影响力随时间降低」，
+#   又保留 1–2 年内的有效边，避免语义图因衰减过猛仅剩最后几天边（α=0.9 时半衰期≈7 天会致此）。
+# - 与 2.1 节策略 B「过去 N 天收益率」（代码 N=30）同属「近期」量级，语义层略长以体现新闻影响持续性。
+TEMPORAL_DECAY_ALPHA = 0.995  # 依论文 2.1+3.3：半衰期≈138 天，3 年图窗内 1–2 年有效贡献
 USE_TEMPORAL_DECAY = True
 
 # 统计相关性图参数
@@ -293,8 +316,10 @@ def _extract_json_from_text(raw: str):
     raw = str(raw).strip()
     if not raw:
         return None
+    # 兜底：先去掉 markdown 标记（防止模型仍输出 ```json）
+    raw = raw.replace("```json", "").replace("```", "").strip()
 
-    # 去掉 markdown code fence
+    # 去掉 markdown code fence（兼容多种包裹方式）
     if "```" in raw:
         # 取第一个 fence 内的内容优先（常见：```json ... ```）
         parts = raw.split("```")
@@ -353,10 +378,26 @@ def _atomic_save_json(path: str, obj):
     os.replace(tmp, path)
 
 
-def _atomic_save_checkpoint_npz(path: str, adj: np.ndarray, meta: dict):
-    """原子写入 checkpoint（npz），同时保存 meta（json字符串）。"""
+def _atomic_save_checkpoint_npz(path: str, adj: np.ndarray, meta: dict, date_edge_weights: dict = None):
+    """原子写入 checkpoint（npz），同时保存 meta（json字符串）和 date_edge_weights。
+    
+    【修复】断点续跑时必须保存 date_edge_weights，否则 Step 2.5 时间衰减累积会丢失之前的边。
+    """
     tmp = path + ".tmp"
-    np.savez_compressed(tmp, adj=adj, meta=json.dumps(meta, ensure_ascii=False))
+    # 将 date_edge_weights 转换为可序列化的格式
+    # defaultdict(dict) -> {date_str: {(i,j): weight, ...}} -> JSON 字符串
+    dew_serializable = {}
+    if date_edge_weights:
+        for date_key, edges in date_edge_weights.items():
+            # 将 tuple key 转为字符串 key（JSON 不支持 tuple 作为 key）
+            dew_serializable[str(date_key)] = {f"{i},{j}": float(w) for (i, j), w in edges.items()}
+    
+    np.savez_compressed(
+        tmp, 
+        adj=adj, 
+        meta=json.dumps(meta, ensure_ascii=False),
+        date_edge_weights=json.dumps(dew_serializable, ensure_ascii=False)
+    )
     if not tmp.endswith(".npz"):
         tmp = tmp + ".npz"
     os.replace(tmp, path)
@@ -367,8 +408,11 @@ def _load_checkpoint_npz(path: str):
     读取断点续跑 checkpoint（npz）。
 
     Returns:
-        (adj, meta): adj 为邻接矩阵 np.ndarray；meta 为 dict。
-        失败时返回 (None, None)。
+        (adj, meta, date_edge_weights): 
+            adj 为邻接矩阵 np.ndarray；
+            meta 为 dict；
+            date_edge_weights 为 defaultdict(dict)，用于时间衰减累积。
+        失败时返回 (None, None, None)。
     """
     try:
         data = np.load(path, allow_pickle=True)
@@ -379,18 +423,34 @@ def _load_checkpoint_npz(path: str):
         # 完整性验证：检查邻接矩阵的基本属性
         if not isinstance(adj, np.ndarray):
             print(f"[WARN] Checkpoint 损坏：adj 不是 ndarray")
-            return None, None
+            return None, None, None
         if adj.ndim != 2 or adj.shape[0] != adj.shape[1]:
             print(f"[WARN] Checkpoint 损坏：adj 不是方阵，shape={adj.shape}")
-            return None, None
+            return None, None, None
         if not np.all(np.isfinite(adj)):
             print(f"[WARN] Checkpoint 损坏：adj 包含 NaN/Inf")
-            return None, None
+            return None, None, None
 
-        return adj, meta
+        # 【修复】恢复 date_edge_weights（如果存在）
+        date_edge_weights = defaultdict(dict)
+        if "date_edge_weights" in data:
+            try:
+                dew_raw = data["date_edge_weights"].item() if hasattr(data["date_edge_weights"], "item") else data["date_edge_weights"]
+                dew_dict = json.loads(dew_raw) if isinstance(dew_raw, (str, bytes)) else {}
+                for date_key, edges in dew_dict.items():
+                    for ij_str, w in edges.items():
+                        i, j = map(int, ij_str.split(","))
+                        date_edge_weights[date_key][(i, j)] = float(w)
+                print(f"    [Resume] 恢复 date_edge_weights：{len(date_edge_weights)} 天的边数据")
+            except Exception as e:
+                print(f"    [WARN] 恢复 date_edge_weights 失败: {e}，将从空开始（时间衰减可能不完整）")
+        else:
+            print(f"    [WARN] Checkpoint 中没有 date_edge_weights（旧版本格式），时间衰减将不完整")
+
+        return adj, meta, date_edge_weights
     except Exception as e:
         print(f"[WARN] 加载 checkpoint 失败: {e}")
-        return None, None
+        return None, None, None
 
 
 def _build_ticker_alias_map(tickers):
@@ -427,6 +487,15 @@ def _canonicalize_ticker(t, alias2canonical, ticker2idx=None):
     s = str(t).strip().upper()
     if not s:
         return None
+    # 【新增】1. 尝试公司名到代码的映射
+    if s in NAME_TO_TICKER:
+        s = NAME_TO_TICKER[s]
+    # 【新增】2. 简单规则清洗常见后缀（便于匹配）
+    for suffix in (" INC.", " INC", " CORP.", " CORP", " LTD.", " LTD", " CO.", " CO"):
+        if s.endswith(suffix):
+            s = s[: -len(suffix)].strip()
+    if s in NAME_TO_TICKER:
+        s = NAME_TO_TICKER[s]
     # 常见噪声：$AAPL、(AAPL)
     s = s.replace("$", "").strip()
     if s.startswith("(") and s.endswith(")") and len(s) > 2:
@@ -438,15 +507,6 @@ def _canonicalize_ticker(t, alias2canonical, ticker2idx=None):
     if ticker2idx is not None and c not in ticker2idx:
         return None
     return c
-
-
-def _normalize_date_key(value):
-    if value is None or (isinstance(value, float) and pd.isna(value)):
-        return None
-    ts = pd.to_datetime(value, errors="coerce")
-    if pd.isna(ts):
-        return None
-    return ts.strftime("%Y-%m-%d")
 
 
 def _normalize_sentiment_weight(sentiment, weight=None):
@@ -494,28 +554,6 @@ def _load_relations_table(path: str) -> pd.DataFrame:
             print(f"[WARN] 读取 Parquet 失败，回退 CSV: {e}")
             return pd.read_csv(csv_path, low_memory=False)
         raise RuntimeError(f"读取关系文件失败: {path}, err={e}") from e
-
-
-def _save_relations_table(df: pd.DataFrame, path: str, partition_cols=None) -> None:
-    """
-    保存离线关系文件（Parquet 优先）。失败时回退 CSV 并给出提示。
-    """
-    if df is None or df.empty:
-        print("[INFO] 关系记录为空，跳过保存。")
-        return
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    try:
-        df.to_parquet(path, index=False, partition_cols=partition_cols)
-        print(f"[OK] 关系已保存为 Parquet: {path}")
-        return
-    except Exception as e:
-        print(f"[WARN] 保存 Parquet 失败: {e}")
-        csv_path = path if path.lower().endswith(".csv") else path.replace(".parquet", ".csv")
-        try:
-            df.to_csv(csv_path, index=False)
-            print(f"[WARN] 已回退保存为 CSV: {csv_path}")
-        except Exception as e2:
-            raise RuntimeError(f"保存关系文件失败: {path}, err={e2}") from e2
 
 
 def extract_relations_with_llm_batch(
@@ -574,26 +612,26 @@ def extract_relations_with_llm_batch(
 - 评估事件对 Target 公司（dst）的情感影响分数
 - 范围：-1.0（极度利空）到 1.0（极度利好）
 - 0.0 表示中性或无明显情感倾向
-- 示例：
-  * "苹果因供应链问题股价下跌" → sentiment_score: -0.7（对苹果利空）
-  * "特斯拉获得大额订单，股价大涨" → sentiment_score: 0.8（对特斯拉利好）
-  * "微软与英伟达达成合作协议" → sentiment_score: 0.5（对双方利好）
 
 输出要求：
 1. 只提取**明确提到两家公司**且关系清晰的内容
-2. 股票代码必须是**美股代码**（如AAPL、TSLA、MSFT等）
+2. src/dst 必须优先使用**美股股票代码**（如 AAPL）；若无法确定代码，**必须保持公司英文原名**（如 Microsoft、Foxconn），不要翻译成中文。
 3. 如果新闻只提到一家公司，返回 []
 4. 如果关系不属于以上7类，返回 []
 5. **必须**为每条关系提供 sentiment_score（-1.0 到 1.0 之间的浮点数）
 
-严格按以下JSON格式输出（不要有任何其他文字）：
+【重要格式约束】
+1. 直接输出 JSON 数组，**不要使用 markdown 代码块（即不要用 ```json 包裹）**。
+2. 不要输出任何解释、分析或前言。
+
+严格按以下JSON格式输出：
 [{{"src": "公司A代码", "dst": "公司B代码", "relation": "关系类型", "sentiment_score": 0.5}}]
 
 示例：
-- "苹果与高通达成5年芯片供应协议" → [{{"src":"AAPL","dst":"QCOM","relation":"supply","sentiment_score":0.6}}]
-- "特斯拉与通用汽车竞争电动车市场" → [{{"src":"TSLA","dst":"GM","relation":"competition","sentiment_score":-0.3}}]
-- "微软完成对暴雪娱乐的收购" → [{{"src":"MSFT","dst":"ATVI","relation":"merger","sentiment_score":0.7}}]
-- "苹果发布新款iPhone" → []
+- "苹果与高通达成5年芯片供应协议" -> [{{"src":"AAPL","dst":"QCOM","relation":"supply","sentiment_score":0.6}}]
+- "特斯拉与通用汽车竞争电动车市场" -> [{{"src":"TSLA","dst":"GM","relation":"competition","sentiment_score":-0.2}}]
+- "微软完成对暴雪娱乐的收购" -> [{{"src":"MSFT","dst":"ATVI","relation":"merger","sentiment_score":0.8}}]
+- "苹果发布新款iPhone" -> []
 
 现在请分析上述新闻标题："""
             
@@ -665,13 +703,7 @@ def extract_relations_with_llm_batch(
     return results
 
 
-def extract_relations_with_llm(news_text, client=None, local_model=None, local_tokenizer=None):
-    """单条提取（保持向后兼容）"""
-    result = extract_relations_with_llm_batch([news_text], local_model, local_tokenizer, batch_size=1)
-    return result[0] if result else []
-
-
-def build_statistical_correlation_graph(df_price, ticker2idx, window=STAT_CORR_WINDOW, threshold=STAT_CORR_THRESHOLD):
+def build_statistical_correlation_graph(df_price, ticker2idx, window=STAT_CORR_WINDOW, threshold=STAT_CORR_THRESHOLD, split_date=None):
     """
     【核心创新点】构建统计相关性图（隐式层）
     
@@ -686,6 +718,7 @@ def build_statistical_correlation_graph(df_price, ticker2idx, window=STAT_CORR_W
         ticker2idx: 股票代码到索引的映射
         window: 计算相关系数的窗口大小（天数）
         threshold: 相关系数阈值，只保留 |ρ| > threshold 的边
+        split_date: 时间截断日期（防止未来信息泄露），None 表示不过滤
     
     返回:
         adj_stat: (N, N) 的统计相关性邻接矩阵，值为 0 或 1
@@ -694,6 +727,19 @@ def build_statistical_correlation_graph(df_price, ticker2idx, window=STAT_CORR_W
     
     num_nodes = len(ticker2idx)
     adj_stat = np.zeros((num_nodes, num_nodes), dtype=np.float32)
+    
+    # ==============================================================================
+    # [学术严谨性修正] 统计图防泄露截断
+    # 确保计算相关系数时，只能看到 split_date 之前的价格波动
+    # ==============================================================================
+    if split_date is not None:
+        try:
+            split_date_ts = pd.to_datetime(split_date)
+            before_filter = len(df_price)
+            df_price = df_price[df_price['Date'] < split_date_ts].copy()
+            print(f"    [防泄露] 统计图数据截断: {before_filter} -> {len(df_price)} 行（仅保留 < {split_date_ts.strftime('%Y-%m-%d')} 的数据）")
+        except Exception as e:
+            print(f"    ⚠️ 警告：split_date 解析失败 ({e})，将使用全量数据（存在泄露风险）")
     
     # 计算对数收益率
     df_price = df_price.copy()
@@ -733,25 +779,28 @@ def build_statistical_correlation_graph(df_price, ticker2idx, window=STAT_CORR_W
         print("    ⚠️ 警告：没有足够的收益率数据，返回零矩阵")
         return adj_stat
     
-    ret_matrix = np.array(ret_matrix)  # Shape: (N, window)
+    ret_matrix = np.array(ret_matrix)  # Shape: (n_valid, window)
     
-    # 计算皮尔逊相关系数矩阵
-    # 使用 numpy 的 corrcoef，返回 (N, N) 的相关系数矩阵
-    corr_matrix = np.corrcoef(ret_matrix)
+    # 计算皮尔逊相关系数矩阵（仅 valid_tickers 子集）
+    corr_matrix = np.corrcoef(ret_matrix)  # (n_valid, n_valid)
     
     # 保留强相关边（|ρ| > threshold）
-    # 注意：对角线元素（自相关）应该为 1，但我们不需要自环（已在语义图中处理）
-    mask = np.abs(corr_matrix) > threshold
-    np.fill_diagonal(mask, False)  # 移除自环
+    mask_small = np.abs(corr_matrix) > threshold
+    np.fill_diagonal(mask_small, False)  # 移除自环
+    adj_small = mask_small.astype(np.float32)
+    adj_small = (adj_small + adj_small.T) / 2  # 确保对称
     
-    # 构建无向图（对称矩阵）
-    adj_stat = mask.astype(np.float32)
-    adj_stat = (adj_stat + adj_stat.T) / 2  # 确保对称
+    # 【关键】将 (n_valid, n_valid) 映射回全图 (num_nodes, num_nodes)，与语义图维度一致
+    adj_stat = np.zeros((num_nodes, num_nodes), dtype=np.float32)
+    for i, ti in enumerate(valid_tickers):
+        for j, tj in enumerate(valid_tickers):
+            gi, gj = ticker2idx[ti], ticker2idx[tj]
+            adj_stat[gi, gj] = adj_small[i, j]
     
     # 统计信息
     num_edges = int(np.sum(adj_stat) / 2)  # 无向图，除以2
-    print(f"    ✅ 统计图构建完成：{num_edges} 条边（|ρ| > {threshold}）")
-    print(f"    平均相关系数（强相关边）: {np.mean(corr_matrix[mask]):.4f}")
+    print(f"    ✅ 统计图构建完成：{num_edges} 条边（|ρ| > {threshold}），有效股票数: {len(valid_tickers)}/{num_nodes}")
+    print(f"    平均相关系数（强相关边）: {np.mean(corr_matrix[mask_small]):.4f}")
     
     return adj_stat
 
@@ -898,7 +947,6 @@ def build_dynamic_graph(
     relation_type_counter = Counter()
     edge_counter = Counter()  # (src, dst) -> count
     failures = 0
-    relation_records = [] if save_relations else None
 
     # =========================== 防止"未来信息"数据泄露：强制 split_date ===========================
     # [FIXED] 不再自动计算 80% 切分，而是强制从外部参数传入
@@ -994,12 +1042,22 @@ def build_dynamic_graph(
             if rel:
                 relation_type_counter[str(rel).strip()] += 1
     else:
+        # 【默认使用过滤后的 S&P 500 新闻文件】
+        # 如果默认文件不存在，回退到全量文件并在内存中过滤
+        news_file_to_use = INPUT_NEWS
         if not os.path.exists(INPUT_NEWS):
-            print(f"[WARN] 未找到新闻文件 {INPUT_NEWS}，保存单位阵。")
-            _atomic_save_npy(OUTPUT_GRAPH, adj_matrix)
-            return
+            if os.path.exists(INPUT_NEWS_FULL):
+                news_file_to_use = INPUT_NEWS_FULL
+                print(f"    [回退] 未找到过滤后的新闻文件 {INPUT_NEWS}，使用全量文件 {INPUT_NEWS_FULL} 并在内存中过滤")
+            else:
+                print(f"[WARN] 未找到新闻文件 {INPUT_NEWS} 或 {INPUT_NEWS_FULL}，保存单位阵。")
+                print(f"    提示：请先运行预处理脚本生成新闻文件，或检查路径是否正确")
+                _atomic_save_npy(OUTPUT_GRAPH, adj_matrix)
+                return
+        else:
+            print(f"    [使用过滤后的新闻文件] {INPUT_NEWS}")
 
-        df_news = pd.read_csv(INPUT_NEWS, low_memory=False)
+        df_news = pd.read_csv(news_file_to_use, low_memory=False)
         print(f"    原始新闻总数: {len(df_news)}")
 
         # 统一新闻里的 ticker 格式，避免分层采样时因大小写/写法差异导致“同一只股票被拆成多个组”
@@ -1011,8 +1069,9 @@ def build_dynamic_graph(
                 .str.replace("-", ".", regex=False)
             )
     
-        # 如果使用 S&P 500 模式，过滤新闻数据
-        if use_sp500 and len(active_tickers) < len(all_tickers):
+        # 如果使用 S&P 500 模式，且读取的是全量文件，需要在内存中过滤
+        # （如果读取的是过滤后的文件，理论上已经过滤过了，但为了保险起见还是再过滤一次）
+        if use_sp500 and len(active_tickers) < len(all_tickers) and news_file_to_use == INPUT_NEWS_FULL:
             before_filter = len(df_news)
             df_news = df_news[df_news['Ticker'].isin(active_tickers)].copy()
             print(f"    [S&P 500 过滤] 保留新闻: {before_filter} -> {len(df_news)}")
@@ -1114,11 +1173,11 @@ def build_dynamic_graph(
         print(f"\n>>> [Step 2] 开始建图 (共 {len(df_news_sampled)} 条新闻)...")
         print("=" * 70)
         
-        # 进度保存配置
-        CHECKPOINT_INTERVAL = 10000
+        # 进度保存配置（与 batch 对齐，64 一批时每约 50 批保存一次，减少断点损失）
+        BATCH_SIZE = int(os.environ.get("LLM_BATCH_SIZE", str(LLM_BATCH_SIZE_DEFAULT)))
+        CHECKPOINT_INTERVAL = max(BATCH_SIZE * 50, 3200)  # 64*50=3200，每约 3200 条保存
         checkpoint_path = OUTPUT_GRAPH.replace('.npy', '_checkpoint.npz')
         sampled_path = OUTPUT_GRAPH.replace('.npy', '_news_sampled.csv')
-        BATCH_SIZE = int(os.environ.get("LLM_BATCH_SIZE", str(LLM_BATCH_SIZE_DEFAULT)))
         MAX_INPUT_TOKENS = int(os.environ.get("LLM_MAX_INPUT_TOKENS", str(LLM_MAX_INPUT_TOKENS_DEFAULT)))
         MAX_NEW_TOKENS = int(os.environ.get("LLM_MAX_NEW_TOKENS", str(LLM_MAX_NEW_TOKENS_DEFAULT)))
         DO_SAMPLE = os.environ.get("LLM_DO_SAMPLE", "1" if LLM_DO_SAMPLE_DEFAULT else "0") == "1"
@@ -1143,15 +1202,19 @@ def build_dynamic_graph(
             except Exception as e:
                 print(f"[WARN] 保存采样新闻失败（不影响运行，但无法稳定断点续跑）: {e}")
 
-        # 断点续跑：如果 checkpoint 存在，加载 adj + 进度
+        # 断点续跑：如果 checkpoint 存在，加载 adj + 进度 + date_edge_weights
         start_pos = 0
         if os.path.exists(checkpoint_path):
-            ck_adj, ck_meta = _load_checkpoint_npz(checkpoint_path)
+            ck_adj, ck_meta, ck_dew = _load_checkpoint_npz(checkpoint_path)
             if ck_adj is not None and ck_meta:
                 # 简单一致性校验：节点数必须一致
                 if isinstance(ck_adj, np.ndarray) and ck_adj.shape == adj_matrix.shape:
                     adj_matrix = ck_adj.astype(np.float32, copy=False)
                     start_pos = int(ck_meta.get("next_pos", 0))
+                    # 【修复】恢复 date_edge_weights，确保时间衰减累积完整
+                    if ck_dew:
+                        date_edge_weights.update(ck_dew)
+                        print(f"    [Resume] date_edge_weights 已恢复，包含 {len(date_edge_weights)} 天的边数据")
                     # 也可沿用上次已降过的 batch size
                     if "batch_size" in ck_meta:
                         try:
@@ -1170,18 +1233,30 @@ def build_dynamic_graph(
             pbar = tqdm(total=len(df_news_sampled), desc="Building Graph", initial=start_pos)
 
             for i in range(start_pos, len(df_news_sampled), BATCH_SIZE):
+                # 调试模式：只处理前 DEBUG_MAX_NEWS 条即停止并保存
+                if DEBUG_MAX_NEWS > 0 and (i - start_pos) >= DEBUG_MAX_NEWS:
+                    print(f"\n🛑 [DEBUG] 已达到测试上限 ({DEBUG_MAX_NEWS} 条)，提前结束循环以验证结果...")
+                    break
                 batch_df = df_news_sampled.iloc[i : i + BATCH_SIZE]
                 texts = batch_df[text_col].astype(str).fillna("").tolist()
                 tickers = batch_df["Ticker"].astype(str).fillna("").tolist()
                 dates = []
+                # 预处理阶段已用 pd.to_datetime(..., errors='coerce') 处理 Date 列，理论上不应有无效日期
+                # 但为防御性编程，仍做异常处理
                 for d in batch_df.get("Date", pd.Series([None] * len(batch_df))):
-                    if isinstance(d, pd.Timestamp):
+                    if pd.isna(d):
+                        dates.append(None)  # NaN 的情况
+                    elif isinstance(d, pd.Timestamp):
                         dates.append(d.strftime("%Y-%m-%d"))
                     else:
                         try:
-                            dates.append(pd.to_datetime(d).strftime("%Y-%m-%d"))
+                            parsed = pd.to_datetime(d)
+                            if pd.isna(parsed):
+                                dates.append(None)  # 解析后仍为 NaN
+                            else:
+                                dates.append(parsed.strftime("%Y-%m-%d"))
                         except Exception:
-                            dates.append(None)
+                            dates.append(None)  # 解析异常
 
                 try:
                     batch_relations = extract_relations_with_llm_batch(
@@ -1237,10 +1312,23 @@ def build_dynamic_graph(
                         adj_matrix[i_idx, j_idx] = max(adj_matrix[i_idx, j_idx], sentiment_weight)
                         adj_matrix[j_idx, i_idx] = adj_matrix[i_idx, j_idx]
 
-                        if use_temporal_decay and date_key:
-                            edge_key = (i_idx, j_idx) if i_idx <= j_idx else (j_idx, i_idx)
-                            prev = date_edge_weights[date_key].get(edge_key, 0.0)
-                            date_edge_weights[date_key][edge_key] = max(prev, float(sentiment_weight))
+                        # 【关键】无论是否启用时间衰减，都要记录到 date_edge_weights，否则 Step 2.5 重置 adj_matrix 后会丢失
+                        # 注意：理论上 date_key 不应为 None，因为：
+                        # 1. 预处理阶段已用 pd.to_datetime(..., errors='coerce') 处理 Date 列
+                        # 2. 采样后的 df_news_sampled 的 Date 列应该都是有效日期
+                        # 3. 如果 date_key 为 None，说明 Date 解析失败，应该跳过时间衰减记录
+                        if use_temporal_decay:
+                            if not date_key:
+                                # date_key 为 None 的情况（理论上不应出现）
+                                # 如果出现，说明 Date 列解析失败，记录警告并跳过这条边的时间衰减记录
+                                print(f"[WARN] 发现 date_key 为 None 的边 ({src_c} -> {dst_c})，跳过时间衰减记录（Date 解析失败）")
+                                # 注意：这条边在 Step 2 中已更新 adj_matrix，但 Step 2.5 重置后会丢失
+                                # 为安全起见，不记录到 date_edge_weights，避免使用错误的默认日期导致过度衰减
+                                # 如果希望保留，需要在预处理阶段确保 Date 列都能解析
+                            else:
+                                edge_key = (i_idx, j_idx) if i_idx <= j_idx else (j_idx, i_idx)
+                                prev = date_edge_weights[date_key].get(edge_key, 0.0)
+                                date_edge_weights[date_key][edge_key] = max(prev, float(sentiment_weight))
 
                         a, b = (src_c, dst_c) if src_c <= dst_c else (dst_c, src_c)
                         edge_counter[(a, b)] += 1
@@ -1260,7 +1348,8 @@ def build_dynamic_graph(
                         "active_tickers": sorted(list(active_set)) if (use_sp500 and active_set != set(all_tickers)) else None,
                         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
                     }
-                    _atomic_save_checkpoint_npz(checkpoint_path, adj_matrix, meta)
+                    # 【修复】同时保存 date_edge_weights，确保断点续跑后时间衰减累积完整
+                    _atomic_save_checkpoint_npz(checkpoint_path, adj_matrix, meta, date_edge_weights)
 
                 pbar.update(len(texts))
 
@@ -1268,66 +1357,8 @@ def build_dynamic_graph(
                 pbar.close()
             except Exception:
                 pass
-        # 规则模式（不变）
-        start_pos = 0
-        if os.path.exists(checkpoint_path):
-            ck_adj, ck_meta = _load_checkpoint_npz(checkpoint_path)
-            if ck_adj is not None and ck_meta and isinstance(ck_adj, np.ndarray) and ck_adj.shape == adj_matrix.shape:
-                adj_matrix = ck_adj.astype(np.float32, copy=False)
-                start_pos = int(ck_meta.get("next_pos", 0))
-                print(f"[Resume] (规则模式) 从 checkpoint 恢复：next_pos={start_pos}")
+        # 仅 LLM 模式建图，不再保留规则匹配回退
 
-        for pos in tqdm(range(start_pos, len(df_news_sampled)), total=len(df_news_sampled), initial=start_pos, desc="Building Graph"):
-            row = df_news_sampled.iloc[pos]
-            src_ticker = str(row.get('Ticker', '')).strip().upper()
-
-            content = row.get(text_col, "")
-            date_key = row.get('Date')
-            if isinstance(date_key, pd.Timestamp):
-                date_key = date_key.strftime("%Y-%m-%d")
-            date_key = str(date_key) if date_key is not None else None
-
-            ok = True
-            if not src_ticker:
-                ok = False
-            elif use_sp500 and (active_set != set(all_tickers)) and (src_ticker not in active_set):
-                ok = False
-            elif src_ticker not in ticker2idx:
-                ok = False
-            elif not content or (isinstance(content, float) and pd.isna(content)):
-                ok = False
-        
-            if ok:
-                content = str(content)
-                # 规则匹配
-                for t in active_tickers:
-                    if t != src_ticker and len(str(t)) >= 3 and str(t).upper() in content.upper():
-                        if use_sp500 and (active_set != set(all_tickers)) and (t not in active_set):
-                            continue
-                        if t in ticker2idx:
-                            i, j = ticker2idx[src_ticker], ticker2idx[t]
-                            if adj_matrix[i, j] == 0:
-                                edge_count += 1
-                            adj_matrix[i, j] = 1.0
-                            adj_matrix[j, i] = 1.0
-                            matched_tickers.add(src_ticker)
-                            matched_tickers.add(t)
-                            if use_temporal_decay and date_key:
-                                edge_key = (i, j) if i <= j else (j, i)
-                                date_edge_weights[date_key][edge_key] = 1.0
-
-            if (pos + 1) % CHECKPOINT_INTERVAL == 0:
-                meta = {
-                    "next_pos": pos + 1,
-                    "batch_size": None,
-                    "use_sp500": bool(use_sp500),
-                    "num_nodes": int(num_nodes),
-                    "active_tickers": sorted(list(active_set)) if (use_sp500 and active_set != set(all_tickers)) else None,
-                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                }
-                _atomic_save_checkpoint_npz(checkpoint_path, adj_matrix, meta)
-                print(f"\n[进度保存] 已处理 {pos+1}/{len(df_news_sampled)} 条 (边数: {int((adj_matrix.sum()-num_nodes)/2)})")
-        
         # =========================== 时间衰减累积（语义图）===========================
     if use_temporal_decay and date_edge_weights:
         print("\n>>> [Step 2.5] 应用时间衰减累积（语义图）...")
@@ -1352,12 +1383,13 @@ def build_dynamic_graph(
         # 只保留图中存在的股票
         df_price_for_stat = df_price_for_stat[df_price_for_stat['Ticker'].isin(graph_tickers)].copy()
         
-        # 构建统计相关性图
+        # 构建统计相关性图（传递 split_date 以确保无未来信息泄露）
         adj_stat = build_statistical_correlation_graph(
             df_price_for_stat, 
             ticker2idx, 
             window=STAT_CORR_WINDOW, 
-            threshold=STAT_CORR_THRESHOLD
+            threshold=STAT_CORR_THRESHOLD,
+            split_date=split_date  # 【关键】传递时间截断参数，防止统计图看到未来数据
         )
     except Exception as e:
         print(f"    ⚠️ 统计图构建失败: {e}，将使用零矩阵")
@@ -1379,8 +1411,12 @@ def build_dynamic_graph(
     # 在实际应用中，可以将情感分数作为边权重：adj_semantic[i, j] = sentiment_score
     
     # 归一化语义图（避免数值过大）
-    if adj_semantic.max() > 0:
-        adj_semantic = adj_semantic / adj_semantic.max()
+    # 【修复】排除自环后再归一化，避免自环 1.0 导致边权重被压缩
+    adj_semantic_no_diag = adj_semantic.copy()
+    np.fill_diagonal(adj_semantic_no_diag, 0.0)
+    if adj_semantic_no_diag.max() > 0:
+        adj_semantic = adj_semantic_no_diag / adj_semantic_no_diag.max()
+        np.fill_diagonal(adj_semantic, 1.0)  # 恢复自环
 
     # 消融用：去除情感权重（仅保留关系边）
     adj_semantic_nosent = (adj_matrix > 0).astype(np.float32)
@@ -1400,10 +1436,17 @@ def build_dynamic_graph(
     # 保留自环（单位阵）
     np.fill_diagonal(adj_final, 1.0)
     
-    # 统计信息
-    semantic_edges = int((adj_semantic.sum() - num_nodes) / 2)
-    stat_edges = int((adj_stat.sum() - num_nodes) / 2)
-    final_edges = int((adj_final.sum() - num_nodes) / 2)
+    # 统计信息（使用 count_nonzero 而非 sum，避免归一化后数值不准）
+    # 排除对角线（自环）
+    adj_semantic_nodiag = adj_semantic.copy()
+    adj_stat_nodiag = adj_stat.copy()
+    adj_final_nodiag = adj_final.copy()
+    np.fill_diagonal(adj_semantic_nodiag, 0)
+    np.fill_diagonal(adj_stat_nodiag, 0)
+    np.fill_diagonal(adj_final_nodiag, 0)
+    semantic_edges = int(np.count_nonzero(adj_semantic_nodiag) / 2)  # 无向图除以2
+    stat_edges = int(np.count_nonzero(adj_stat_nodiag) / 2)
+    final_edges = int(np.count_nonzero(adj_final_nodiag) / 2)
     
     print(f"    语义图边数: {semantic_edges}")
     print(f"    统计图边数: {stat_edges}")
@@ -1422,13 +1465,14 @@ def build_dynamic_graph(
     except Exception as e:
         print(f"[WARN] 保存消融图失败: {e}")
     
-    # 删除checkpoint文件
-    if os.path.exists(checkpoint_path):
-        os.remove(checkpoint_path)
+    # 删除checkpoint文件（若存在）
+    _ck = OUTPUT_GRAPH.replace(".npy", "_checkpoint.npz")
+    if os.path.exists(_ck):
+        os.remove(_ck)
         print(f"[清理] 已删除临时checkpoint文件")
     # 采样文件保留（便于复现/审计）；如需节省空间可手动删除
 
-    # 保存关系类型统计（LLM模式下更有论文价值；规则模式可能为空）
+    # 保存关系类型统计（供论文/消融分析）
     try:
         stats_path = OUTPUT_GRAPH.replace(".npy", "_relation_stats.json")
         _atomic_save_json(stats_path, {
@@ -1487,7 +1531,7 @@ if __name__ == "__main__":
     parser.add_argument('--max_per_ticker', type=int, default=MAX_NEWS_PER_TICKER, help='每个股票最多采样多少条新闻')
     parser.add_argument('--max_total', type=int, default=MAX_TOTAL_NEWS, help='总共最多处理多少条新闻')
     parser.add_argument('--all_stocks', action='store_true', help='使用全量股票（默认只用 S&P 500）')
-    parser.add_argument('--split_date', type=str, default='2020-12-31', 
+    parser.add_argument('--split_date', type=str, default='2020-06-30', 
                         help='图谱构建截止日期（必须与训练集结束日期严格一致，防泄露）')
     
     args = parser.parse_args()

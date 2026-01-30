@@ -5,8 +5,8 @@
 用途：
   为 `dataProcessed/align.py` 提供大盘指数特征（Market_Close, Market_Vol）。
 
-输出文件：
-  - `data/raw/FNSPID/SP500_Index.csv`，列为：
+输出文件（本仓库统一放在 paper/data/processed/ 下）：
+  - `paper/data/processed/SP500_Index.csv`，列为：
       Date, Market_Close, Market_Vol
 
 实现说明：
@@ -21,13 +21,13 @@ except ImportError as e:
         "[错误] 未安装 akshare，无法自动下载 S&P 500 指数。\n"
         "请先安装依赖：\n"
         "  pip install akshare\n"
-        "或手动准备 `data/raw/FNSPID/SP500_Index.csv`（列：Date,Market_Close,Market_Vol）。\n"
+    "或手动准备 `paper/data/processed/SP500_Index.csv`（列：Date,Market_Close,Market_Vol）。\n"
         f"原始错误: {e}"
     )
 import pandas as pd
 import os
 
-OUTPUT_PATH = './data/raw/FNSPID/SP500_Index.csv'
+OUTPUT_PATH = "./paper/data/processed/SP500_Index.csv"
 
 def download_sp500_fixed():
     """

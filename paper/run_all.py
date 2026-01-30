@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 
@@ -44,9 +45,9 @@ def main() -> None:
                 "python",
                 "4_evaluate.py",
                 "--checkpoint",
-                "./outputs/checkpoints/best_model.pth",
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs", "checkpoints", "best_model.pth"),
                 "--test_data",
-                "./data/processed/Final_Model_Data.csv",
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "processed", "Final_Model_Data.csv"),
             ],
             "模型评估",
         )

@@ -15,8 +15,8 @@ PyTorch Dataset：将 `Final_Model_Data.csv` 转换为可训练样本（Step 4�
      【关键】确保与 Graph_Tickers.json 中的节点顺序一致，避免索引错位
 
 输入：
-  - `data/processed/Final_Model_Data.csv`（来自 `dataProcessed/align.py`）
-  - `data/processed/Graph_Tickers.json`（来自 `dataProcessed/build_graph.py`，用于节点对齐）
+  - `paper/data/processed/Final_Model_Data.csv`（来自 `dataProcessed/align.py`）
+  - `paper/data/processed/Graph_Tickers.json`（来自 `dataProcessed/build_graph.py`，用于节点对齐）
 
 输出（每条样本，dict）：
   - `x`: (seq_len, input_dim) 过去若干天特征（输入 RWKV 时间编码器）
@@ -327,7 +327,7 @@ class FinancialDataset(Dataset):
 
 # ================= 测试代码 =================
 if __name__ == "__main__":
-    CSV_PATH = './data/processed/Final_Model_Data.csv'
+    CSV_PATH = "./paper/data/processed/Final_Model_Data.csv"
     
     # 1. 测试训练数据加载器
     print(">>> 正在初始化训练数据集...")

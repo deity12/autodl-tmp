@@ -21,9 +21,9 @@ import sys
 from utils.logging_utils import setup_logging
 
 # ================= 配置（可直接修改）=================
-DATA_CSV_PATH = "./data/processed/Final_Model_Data.csv"
-GRAPH_DIR = "./data/processed"
-GRAPH_TICKERS_PATH = "./data/processed/Graph_Tickers.json"
+DATA_CSV_PATH = "./paper/data/processed/Final_Model_Data.csv"
+GRAPH_DIR = "./paper/data/processed"
+GRAPH_TICKERS_PATH = "./paper/data/processed/Graph_Tickers.json"
 OUTPUT_DIR = "./outputs"
 
 MODEL_N_EMBD = 256
@@ -44,16 +44,26 @@ TEMPORAL_BACKEND = "rwkv"
 # ====================================================
 
 
-ABLATION_TYPES = ["w/o_graph", "w/o_semantic", "w/o_statistical", "w/o_sentiment", "lstm_hybrid", "gru_hybrid"]
+ABLATION_TYPES = [
+    "full",           # 完整模型（RWKV + 混合图 + RankIC Loss）
+    "w/o_graph",      # 无图：仅 RWKV 时序模型
+    "w/o_semantic",   # 无语义图：仅统计图
+    "w/o_statistical",# 无统计图：仅语义图
+    "w/o_sentiment",  # 无情感权重：仅关系边
+    "w/o_rankic",     # 无 RankIC 损失：仅 MSE
+    "lstm_backbone",  # LSTM + 混合图
+    "gru_backbone",   # GRU + 混合图
+]
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Graph-RWKV 消融实验训练")
+    parser = argparse.ArgumentParser(description="Graph-RWKV 消融实验训练（符合顶会标准）")
     parser.add_argument("--data", type=str, default=DATA_CSV_PATH, help="训练数据 CSV 路径")
     parser.add_argument("--graph_dir", type=str, default=GRAPH_DIR, help="图谱目录")
     parser.add_argument("--graph_tickers", type=str, default=GRAPH_TICKERS_PATH, help="图谱 tickers 路径")
     parser.add_argument("--output", type=str, default=OUTPUT_DIR, help="输出目录")
-    parser.add_argument("--ablation", type=str, default="all", help="消融类型: w/o_graph | w/o_semantic | w/o_statistical | w/o_sentiment | all")
+    parser.add_argument("--ablation", type=str, default="all", 
+                        help="消融类型: full | w/o_graph | w/o_semantic | w/o_statistical | w/o_sentiment | w/o_rankic | lstm_backbone | gru_backbone | all")
     parser.add_argument("--batch_size", type=int, default=TRAIN_BATCH_SIZE, help="批大小")
     parser.add_argument("--epochs", type=int, default=TRAIN_EPOCHS, help="训练轮数")
     parser.add_argument("--lr", type=float, default=TRAIN_LR, help="学习率")
@@ -72,32 +82,63 @@ def _graph_path(graph_dir: str, name: str) -> str:
 
 
 def _ablation_runs(graph_dir: str) -> dict[str, dict]:
+    """消融实验配置（对应论文 §5.3 消融设计）"""
     return {
+        # 完整模型（Graph-RWKV + 混合图 + RankIC Loss）
+        "full": {
+            "use_graph": True,
+            "graph_path": _graph_path(graph_dir, "Graph_Adjacency.npy"),
+            "temporal_backend": "rwkv",
+            "use_rank_loss": True,
+        },
+        # 消融 1: 无图（仅 RWKV 时序模型）
         "w/o_graph": {
             "use_graph": False,
             "graph_path": _graph_path(graph_dir, "Graph_Adjacency.npy"),
+            "temporal_backend": "rwkv",
+            "use_rank_loss": True,
         },
+        # 消融 2: 无语义图（仅统计相关性图）
         "w/o_semantic": {
             "use_graph": True,
             "graph_path": _graph_path(graph_dir, "Graph_Adjacency_stat.npy"),
+            "temporal_backend": "rwkv",
+            "use_rank_loss": True,
         },
+        # 消融 3: 无统计图（仅 LLM 语义图）
         "w/o_statistical": {
             "use_graph": True,
             "graph_path": _graph_path(graph_dir, "Graph_Adjacency_semantic.npy"),
+            "temporal_backend": "rwkv",
+            "use_rank_loss": True,
         },
+        # 消融 4: 无情感权重（仅关系边，二值图）
         "w/o_sentiment": {
             "use_graph": True,
             "graph_path": _graph_path(graph_dir, "Graph_Adjacency_semantic_nosent.npy"),
+            "temporal_backend": "rwkv",
+            "use_rank_loss": True,
         },
-        "lstm_hybrid": {
+        # 消融 5: 无 RankIC 损失（仅 MSE）
+        "w/o_rankic": {
+            "use_graph": True,
+            "graph_path": _graph_path(graph_dir, "Graph_Adjacency.npy"),
+            "temporal_backend": "rwkv",
+            "use_rank_loss": False,
+        },
+        # Baseline 1: LSTM + 混合图
+        "lstm_backbone": {
             "use_graph": True,
             "graph_path": _graph_path(graph_dir, "Graph_Adjacency.npy"),
             "temporal_backend": "lstm",
+            "use_rank_loss": True,
         },
-        "gru_hybrid": {
+        # Baseline 2: GRU + 混合图
+        "gru_backbone": {
             "use_graph": True,
             "graph_path": _graph_path(graph_dir, "Graph_Adjacency.npy"),
             "temporal_backend": "gru",
+            "use_rank_loss": True,
         },
     }
 
@@ -179,6 +220,7 @@ def main() -> None:
                 "checkpoint_name": f"best_model_ablation_{ablation}.pth",
                 "use_graph": bool(run_cfg["use_graph"]),
                 "temporal_backend": run_cfg.get("temporal_backend", args.temporal_backend),
+                "use_rank_loss": run_cfg.get("use_rank_loss", True),  # 消融 RankIC Loss
             }
 
             logger.info("开始消融训练: %s", ablation)
