@@ -359,7 +359,8 @@ class GraphRWKV_GNN_Model(nn.Module):
 
             # 将 uniq_nodes 映射到 sub_nodes 的位置（sub_nodes 已排序，映射稳定且更快）
             uniq_pos_in_sub = torch.searchsorted(sub_nodes, uniq_nodes)
-            sub_feats[uniq_pos_in_sub] = uniq_feats
+            # AMP 下 uniq_feats 可能为 float16，sub_feats 为 float32，需统一 dtype
+            sub_feats[uniq_pos_in_sub] = uniq_feats.to(sub_feats.dtype)
 
             # 注意：这里构造的是诱导子图的 dense 邻接；当图节点规模在几百（S&P500）时非常快
             sub_adj = adj.index_select(0, sub_nodes).index_select(1, sub_nodes)

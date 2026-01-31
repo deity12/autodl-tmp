@@ -9,7 +9,7 @@ Graph-RWKV 模型训练脚本（基于动态图谱与 Graph-RWKV 的时空解耦
 - **图谱输入**：使用 `Graph_Adjacency.npy` 与 `Graph_Tickers.json`（由 `2_build_graph.py` 生成），在训练前做节点数与 ticker 顺序的严格一致性校验，防止“静默错位”。
 - **损失函数**：
   - 基础回归损失：MSE 回归 `Log_Ret`。
-  - 排序损失：基于可微近似排序（soft-rank）的 **RankIC Loss**，默认权重由 `rank_loss_weight` 控制（在 `PAPER_CONFIG` 中为 1.0，经 `3_train.py` 覆盖后默认 0.1）。
+  - 排序损失：基于可微近似排序（soft-rank）的 **RankIC Loss**，默认权重 `rank_loss_weight=0.1`（RankIC 主导 + MSE 正则防数值崩塌）；纯排序可试 0.5~1.0。
 - **批采样策略**：默认启用 `DateGroupedBatchSampler`，即**按日期成批**，保证每个 batch 主要来自同一交易日，以便在该日截面上计算排序损失（RankIC / RankNet）。
 - **验证方式**：
   - 默认采用固定训练区间（2018-01-01 ~ 2020-12-31）与测试区间（2021-01-01 之后），配置见 `CONFIG`。
@@ -222,11 +222,11 @@ PAPER_CONFIG = {
     'persistent_workers': True,
     'use_date_grouped_batch': True,
     'use_rank_loss': True,
-    'rank_loss_weight': 1.0,
+    'rank_loss_weight': 0.1,  # RankIC 主导，MSE 起正则；纯排序可试 0.5~1.0
     'rank_loss_max_pairs': 4096,
     'rank_loss_type': 'rankic',  # pairwise | rankic
     'rankic_tau': 1.0,
-    'rankic_max_items': 256,
+    'rankic_max_items': 1024,  # 48GB 下用整 batch 算 RankIC，梯度更准
     'feature_columns_path': os.path.join(parent_dir, 'data', 'processed', 'feature_columns.json'),
     # 性能/可复现开关
     'enable_perf_flags': True,
@@ -562,36 +562,42 @@ def _train_once():
     persistent_workers = bool(CONFIG.get('persistent_workers', True)) and num_workers > 0
     prefetch_factor = int(CONFIG.get('prefetch_factor', 2)) if num_workers > 0 else None
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_sampler=(
-            DateGroupedBatchSampler(
+    # 【修复】使用 batch_sampler 时不能传 batch_size/shuffle/drop_last，否则 PyTorch 报错
+    use_date_grouped = bool(CONFIG.get('use_date_grouped_batch', True))
+    if use_date_grouped:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_sampler=DateGroupedBatchSampler(
                 target_dates=train_dataset.target_dates,
                 batch_size=CONFIG['batch_size'],
                 shuffle=True,
                 drop_last=False,
                 seed=42,
-            )
-            if CONFIG.get('use_date_grouped_batch', True)
-            else None
-        ),
-        batch_size=None if CONFIG.get('use_date_grouped_batch', True) else CONFIG['batch_size'],
-        shuffle=False if CONFIG.get('use_date_grouped_batch', True) else True,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        prefetch_factor=prefetch_factor,
-        persistent_workers=persistent_workers,
-    )
+            ),
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            prefetch_factor=prefetch_factor,
+            persistent_workers=persistent_workers,
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=CONFIG['batch_size'],
+            shuffle=True,
+            drop_last=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            prefetch_factor=prefetch_factor,
+            persistent_workers=persistent_workers,
+        )
     
-    # 验证集 DataLoader（用于早停）
+    # 验证集 DataLoader：num_workers=0 避免多进程+CUDA 死锁（仅 28 batch，主进程加载即可）
     val_loader = DataLoader(
         val_dataset,
         batch_size=CONFIG['batch_size'],
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=0,
         pin_memory=pin_memory,
-        prefetch_factor=prefetch_factor,
-        persistent_workers=persistent_workers,
     )
     
     # 测试集 DataLoader（仅用于最终评估）
@@ -665,7 +671,7 @@ def _train_once():
     )
     
     use_amp = CONFIG.get('use_amp', False)
-    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+    scaler = torch.amp.GradScaler('cuda') if use_amp else None
     if use_amp:
         print("   ✅ 已启用混合精度训练 (AMP)")
 
@@ -678,6 +684,27 @@ def _train_once():
 
     print("\n>>> Start Training (Graph-RWKV Model)...")
     print("=" * 60)
+
+    # torch.compile 下首次 eval 前向会触发编译，耗时数分钟；提前 warmup 避免验证阶段卡住
+    if CONFIG.get("use_compile", False) and str(CONFIG.get('device', '')).startswith('cuda'):
+        print(">>> Eval graph warmup (torch.compile 首次 eval 编译，约 2–5 分钟)...", flush=True)
+        model.eval()
+        with torch.no_grad():
+            warmup_batch = next(iter(val_loader))
+            x = warmup_batch['x'].to(CONFIG['device'], non_blocking=True)
+            vol = warmup_batch['vol'].to(CONFIG['device'], non_blocking=True)
+            node_indices = warmup_batch.get('node_indices')
+            if node_indices is not None:
+                node_indices = node_indices.to(CONFIG['device'], non_blocking=True)
+            if use_amp:
+                with torch.amp.autocast('cuda'):
+                    _ = model(x, vol, node_indices=node_indices)
+            else:
+                _ = model(x, vol, node_indices=node_indices)
+            if str(CONFIG.get('device', '')).startswith('cuda'):
+                torch.cuda.synchronize()
+        model.train()
+        print(">>> Eval graph warmup 完成。", flush=True)
 
     for epoch in range(CONFIG['epochs']):
         model.train()
@@ -697,7 +724,7 @@ def _train_once():
             optimizer.zero_grad(set_to_none=True)
             
             if use_amp:
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda'):
                     preds = model(x, vol, node_indices=node_indices)
                     loss = criterion(preds, y)
                     # 可选排序损失：仅在 batch 基本同一天时启用（按日期 batch 时成立）
@@ -761,8 +788,19 @@ def _train_once():
         all_targets = []
         all_dates = []
         
+        # 显式同步 GPU，避免训练阶段未完成的 kernel 导致验证第一个 batch 长时间阻塞
+        if str(CONFIG['device']).startswith('cuda'):
+            torch.cuda.synchronize()
+        
         with torch.no_grad():
-            for batch in val_loader:  # 使用验证集而非测试集
+            n_val = len(val_loader)
+            print(f"\n>>> Validating ({n_val} batches, first batch may take 10–30s)...", flush=True)
+            # 不用 tqdm 包装 val_loader，避免 nohup 重定向时 tqdm 在非 TTY 上阻塞
+            for batch_idx, batch in enumerate(val_loader):
+                if batch_idx == 0:
+                    print("  [Val] First batch loaded, running forward...", flush=True)
+                elif (batch_idx + 1) % 5 == 0 or batch_idx == n_val - 1:
+                    print(f"  [Val] batch {batch_idx + 1}/{n_val}", flush=True)
                 x = batch['x'].to(CONFIG['device'], non_blocking=True)
                 y = batch['y'].to(CONFIG['device'], non_blocking=True)
                 vol = batch['vol'].to(CONFIG['device'], non_blocking=True)
@@ -772,11 +810,13 @@ def _train_once():
                     node_indices = node_indices.to(CONFIG['device'], non_blocking=True)
                 
                 if use_amp:
-                    with torch.cuda.amp.autocast():
+                    with torch.amp.autocast('cuda'):
                         preds = model(x, vol, node_indices=node_indices)
                 else:
                     preds = model(x, vol, node_indices=node_indices)
                 
+                if batch_idx == 0:
+                    print("  [Val] First batch done.", flush=True)
                 epoch_val += criterion(preds, y).item()
                 all_preds.append(preds.cpu().numpy())
                 all_targets.append(y.cpu().numpy())
@@ -831,7 +871,7 @@ def _train_once():
             best_metrics = None
 
         cur_lr = optimizer.param_groups[0]['lr']
-        print(f"\nEpoch {epoch+1}/{CONFIG['epochs']}: Train={avg_train:.6f}, Val={avg_val:.6f}, lr={cur_lr:.2e}")
+        print(f"\nEpoch {epoch+1}/{CONFIG['epochs']}: Train={avg_train:.6f}, Val={avg_val:.6f}, lr={cur_lr:.2e}", flush=True)
 
         if avg_val < best_val_loss:
             best_val_loss = avg_val
@@ -839,10 +879,10 @@ def _train_once():
             save_path = os.path.join(checkpoint_dir, checkpoint_name)
             torch.save(model.state_dict(), save_path)
             if best_metrics:
-                print(f"  🌟 Best model saved!")
+                print(f"  🌟 Best model saved!", flush=True)
                 ic_str = f"{best_metrics['ic']:.4f}" if best_metrics['ic'] is not None else "N/A"
                 print(f"     R²={best_metrics['r2']:.4f}, MAE={best_metrics['mae']:.6f}, "
-                      f"DirAcc={best_metrics['directional_accuracy']:.2%}, IC={ic_str}")
+                      f"DirAcc={best_metrics['directional_accuracy']:.2%}, IC={ic_str}", flush=True)
             early_stop_counter = 0
         else:
             early_stop_counter += 1
@@ -850,7 +890,7 @@ def _train_once():
         if early_stop_counter >= early_stop_patience:
             print(f"\n🛑 Early stopping (best val loss: {best_val_loss:.6f})")
             break
-        print("-" * 60)
+        print("-" * 60, flush=True)
 
     # ================= 8. 测试集最终评估（论文报告此区间指标）=================
     print("\n>>> 加载最佳模型并在测试集上评估...")
@@ -874,7 +914,7 @@ def _train_once():
                 node_indices = node_indices.to(CONFIG['device'], non_blocking=True)
             
             if use_amp:
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda'):
                     preds = model(x, vol, node_indices=node_indices)
             else:
                 preds = model(x, vol, node_indices=node_indices)

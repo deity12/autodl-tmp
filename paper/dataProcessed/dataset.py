@@ -138,6 +138,8 @@ class FinancialDataset(Dataset):
             if feat_path and os.path.exists(feat_path):
                 try:
                     df_feat = pd.read_parquet(feat_path)
+                    # 【修复】确保两边的 Date 列类型一致
+                    self.df["Date"] = pd.to_datetime(self.df["Date"], errors="coerce")
                     df_feat["Date"] = pd.to_datetime(df_feat["Date"], errors="coerce")
                     df_feat["Ticker"] = (
                         df_feat["Ticker"]

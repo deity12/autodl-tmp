@@ -3,10 +3,13 @@
 """
 3_train.py - Graph-RWKV 全量模型训练脚本（可直接运行）
 
-用法：
-  方式1：直接运行（默认配置）
- 方式2：命令行覆盖参数
-    python 3_train.py --data ./paper/data/processed/Final_Model_Data.csv --graph ./paper/data/processed/Graph_Adjacency.npy --output ./outputs
+默认配置已对齐 new.md（训练 2018-01-01~2020-06-30，验证 2020-07-01~2020-12-31，测试 2021-01-01~2023-12-31）。
+直接运行即可，无需传参：
+
+  前台：  python 3_train.py
+  后台：  nohup python 3_train.py > train.log 2>&1 &
+
+需要改参数时再在命令行传入，例如：--batch_size 512 --epochs 20
 """
 
 from __future__ import annotations
@@ -17,20 +20,20 @@ import sys
 
 from utils.logging_utils import setup_logging
 
-# ================= 配置（可直接修改）=================
+# ================= 默认配置（对齐 new.md，可直接 python 3_train.py 运行）=================
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_CSV_PATH = os.path.join(_SCRIPT_DIR, "data", "processed", "Final_Model_Data.csv")
 GRAPH_PATH = os.path.join(_SCRIPT_DIR, "data", "processed", "Graph_Adjacency.npy")
 GRAPH_TICKERS_PATH = os.path.join(_SCRIPT_DIR, "data", "processed", "Graph_Tickers.json")
 OUTPUT_DIR = os.path.join(_SCRIPT_DIR, "outputs")
 
-# 模型配置
+# 模型
 MODEL_N_EMBD = 256
 MODEL_N_LAYERS = 3
 MODEL_GNN_EMBD = 64
 DROPOUT = 0.1
 
-# 训练配置（48GB GPU 默认）
+# 训练（主时间切分在 train_full.py PAPER_CONFIG：train_end=2020-06-30, val 2020-07~12, test 2021~2023）
 TRAIN_BATCH_SIZE = 1024
 TRAIN_EPOCHS = 30
 TRAIN_LR = 3e-4
@@ -39,17 +42,22 @@ TRAIN_PREFETCH_FACTOR = 4
 TRAIN_PIN_MEMORY = True
 TRAIN_PERSISTENT_WORKERS = True
 USE_AMP = True
-USE_COMPILE = True
+# 默认关闭 torch.compile，避免验证阶段首次 eval 编译卡顿 2–5 分钟；需要时可传 --use_compile
+USE_COMPILE = False
 TEMPORAL_BACKEND = "rwkv"
 USE_RANK_LOSS = True
-RANK_LOSS_WEIGHT = 1.0
+# 排序损失权重：0.1=RankIC 主导且 MSE 起正则防数值崩塌；纯排序可试 0.5~1.0
+RANK_LOSS_WEIGHT = 0.1
 RANK_LOSS_MAX_PAIRS = 4096
 RANK_LOSS_TYPE = "rankic"
 RANKIC_TAU = 1.0
-RANKIC_MAX_ITEMS = 256
+# 48GB 显存下可用整 batch 算 RankIC，梯度更准（1024×1024 float32≈4MB）
+RANKIC_MAX_ITEMS = 1024
+
+# 滚动窗口（默认关闭；若开启则与 new.md 一致：训练截止 2020-06-30）
 USE_WALK_FORWARD = False
 WALK_FORWARD_TRAIN_START = "2018-01-01"
-WALK_FORWARD_TRAIN_END = "2020-12-31"
+WALK_FORWARD_TRAIN_END = "2020-06-30"   # 与训练集结束一致，防泄露
 WALK_FORWARD_TEST_START = "2021-01-01"
 WALK_FORWARD_TEST_END = "2023-12-31"
 WALK_FORWARD_FREQ = "Q"

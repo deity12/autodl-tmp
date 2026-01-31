@@ -1,0 +1,1021 @@
+{
+  "relation_type_counts": {
+    "cooperation": 205,
+    "investment": 1033,
+    "competition": 417,
+    "merger": 180,
+    "co-event": 409,
+    "supply": 35,
+    "rumor": 2,
+    "co-operation": 17,
+    "lawsuit": 54,
+    "replacement": 1,
+    "purchase": 1,
+    "hiring": 1,
+    "rumor_of_interest": 1,
+    "preference": 2,
+    "lease": 1
+  },
+  "top_edges": [
+    {
+      "src": "DIS",
+      "dst": "FOX",
+      "count": 29
+    },
+    {
+      "src": "AMD",
+      "dst": "INTC",
+      "count": 22
+    },
+    {
+      "src": "AMD",
+      "dst": "NVDA",
+      "count": 16
+    },
+    {
+      "src": "DIS",
+      "dst": "NFLX",
+      "count": 16
+    },
+    {
+      "src": "NXPI",
+      "dst": "QCOM",
+      "count": 14
+    },
+    {
+      "src": "CMCSA",
+      "dst": "FOX",
+      "count": 13
+    },
+    {
+      "src": "MA",
+      "dst": "V",
+      "count": 12
+    },
+    {
+      "src": "DAL",
+      "dst": "UAL",
+      "count": 11
+    },
+    {
+      "src": "AVGO",
+      "dst": "QCOM",
+      "count": 11
+    },
+    {
+      "src": "INTC",
+      "dst": "NVDA",
+      "count": 10
+    },
+    {
+      "src": "HAS",
+      "dst": "MAT",
+      "count": 10
+    },
+    {
+      "src": "MO",
+      "dst": "PM",
+      "count": 10
+    },
+    {
+      "src": "AMZN",
+      "dst": "WMT",
+      "count": 10
+    },
+    {
+      "src": "AMZN",
+      "dst": "NFLX",
+      "count": 10
+    },
+    {
+      "src": "FDX",
+      "dst": "UPS",
+      "count": 9
+    },
+    {
+      "src": "HD",
+      "dst": "LOW",
+      "count": 9
+    },
+    {
+      "src": "GM",
+      "dst": "TSLA",
+      "count": 9
+    },
+    {
+      "src": "AMZN",
+      "dst": "FDX",
+      "count": 9
+    },
+    {
+      "src": "ABC",
+      "dst": "WBA",
+      "count": 9
+    },
+    {
+      "src": "C",
+      "dst": "JPM",
+      "count": 9
+    },
+    {
+      "src": "F",
+      "dst": "GM",
+      "count": 9
+    },
+    {
+      "src": "HSY",
+      "dst": "MDLZ",
+      "count": 8
+    },
+    {
+      "src": "AAPL",
+      "dst": "GOOGL",
+      "count": 8
+    },
+    {
+      "src": "C",
+      "dst": "WFC",
+      "count": 8
+    },
+    {
+      "src": "DIS",
+      "dst": "HAS",
+      "count": 8
+    },
+    {
+      "src": "CMCSA",
+      "dst": "DIS",
+      "count": 8
+    },
+    {
+      "src": "AAPL",
+      "dst": "AMZN",
+      "count": 8
+    },
+    {
+      "src": "GOOGL",
+      "dst": "ORCL",
+      "count": 8
+    },
+    {
+      "src": "JPM",
+      "dst": "WFC",
+      "count": 8
+    },
+    {
+      "src": "DIS",
+      "dst": "FOXA",
+      "count": 8
+    },
+    {
+      "src": "DG",
+      "dst": "DLTR",
+      "count": 8
+    },
+    {
+      "src": "F",
+      "dst": "TSLA",
+      "count": 8
+    },
+    {
+      "src": "AAPL",
+      "dst": "NFLX",
+      "count": 8
+    },
+    {
+      "src": "AMZN",
+      "dst": "GOOGL",
+      "count": 8
+    },
+    {
+      "src": "TGT",
+      "dst": "WMT",
+      "count": 8
+    },
+    {
+      "src": "C",
+      "dst": "LRCX",
+      "count": 7
+    },
+    {
+      "src": "KO",
+      "dst": "MNST",
+      "count": 7
+    },
+    {
+      "src": "AMZN",
+      "dst": "UPS",
+      "count": 7
+    },
+    {
+      "src": "BA",
+      "dst": "LMT",
+      "count": 7
+    },
+    {
+      "src": "BKR",
+      "dst": "GE",
+      "count": 7
+    },
+    {
+      "src": "BAC",
+      "dst": "JPM",
+      "count": 7
+    },
+    {
+      "src": "AMGN",
+      "dst": "REGN",
+      "count": 7
+    },
+    {
+      "src": "AAL",
+      "dst": "UAL",
+      "count": 6
+    },
+    {
+      "src": "AAPL",
+      "dst": "QCOM",
+      "count": 6
+    },
+    {
+      "src": "CMCSA",
+      "dst": "TMUS",
+      "count": 6
+    },
+    {
+      "src": "CHTR",
+      "dst": "TMUS",
+      "count": 6
+    },
+    {
+      "src": "AAPL",
+      "dst": "MSFT",
+      "count": 6
+    },
+    {
+      "src": "HD",
+      "dst": "WMT",
+      "count": 6
+    },
+    {
+      "src": "MRK",
+      "dst": "PFE",
+      "count": 6
+    },
+    {
+      "src": "EBAY",
+      "dst": "PYPL",
+      "count": 6
+    },
+    {
+      "src": "ABC",
+      "dst": "CAH",
+      "count": 6
+    },
+    {
+      "src": "C",
+      "dst": "K",
+      "count": 6
+    },
+    {
+      "src": "BKR",
+      "dst": "HAL",
+      "count": 6
+    },
+    {
+      "src": "BAC",
+      "dst": "C",
+      "count": 6
+    },
+    {
+      "src": "AMZN",
+      "dst": "EBAY",
+      "count": 6
+    },
+    {
+      "src": "AAPL",
+      "dst": "MS",
+      "count": 6
+    },
+    {
+      "src": "MS",
+      "dst": "SBAC",
+      "count": 6
+    },
+    {
+      "src": "AAPL",
+      "dst": "AVGO",
+      "count": 6
+    },
+    {
+      "src": "MS",
+      "dst": "TGT",
+      "count": 6
+    },
+    {
+      "src": "INTU",
+      "dst": "MS",
+      "count": 6
+    },
+    {
+      "src": "COST",
+      "dst": "TGT",
+      "count": 6
+    },
+    {
+      "src": "GPN",
+      "dst": "GS",
+      "count": 5
+    },
+    {
+      "src": "MCD",
+      "dst": "MS",
+      "count": 5
+    },
+    {
+      "src": "BKNG",
+      "dst": "EXPE",
+      "count": 5
+    },
+    {
+      "src": "EMR",
+      "dst": "ROK",
+      "count": 5
+    },
+    {
+      "src": "AZO",
+      "dst": "GS",
+      "count": 5
+    },
+    {
+      "src": "CAH",
+      "dst": "MCK",
+      "count": 5
+    },
+    {
+      "src": "CMCSA",
+      "dst": "FOXA",
+      "count": 5
+    },
+    {
+      "src": "FTNT",
+      "dst": "MS",
+      "count": 5
+    },
+    {
+      "src": "AVGO",
+      "dst": "INTC",
+      "count": 5
+    },
+    {
+      "src": "GS",
+      "dst": "HSY",
+      "count": 5
+    },
+    {
+      "src": "JPM",
+      "dst": "MS",
+      "count": 5
+    },
+    {
+      "src": "CSCO",
+      "dst": "PANW",
+      "count": 5
+    },
+    {
+      "src": "BAC",
+      "dst": "NVDA",
+      "count": 5
+    },
+    {
+      "src": "AMZN",
+      "dst": "MS",
+      "count": 5
+    },
+    {
+      "src": "KO",
+      "dst": "PEP",
+      "count": 5
+    },
+    {
+      "src": "MS",
+      "dst": "PG",
+      "count": 5
+    },
+    {
+      "src": "ABBV",
+      "dst": "JNJ",
+      "count": 5
+    },
+    {
+      "src": "BAC",
+      "dst": "PG",
+      "count": 5
+    },
+    {
+      "src": "AMZN",
+      "dst": "MSFT",
+      "count": 5
+    },
+    {
+      "src": "BA",
+      "dst": "UAL",
+      "count": 5
+    },
+    {
+      "src": "AAPL",
+      "dst": "TSLA",
+      "count": 5
+    },
+    {
+      "src": "MS",
+      "dst": "PH",
+      "count": 5
+    },
+    {
+      "src": "GS",
+      "dst": "MCHP",
+      "count": 4
+    },
+    {
+      "src": "AAL",
+      "dst": "DAL",
+      "count": 4
+    },
+    {
+      "src": "ABBV",
+      "dst": "GILD",
+      "count": 4
+    },
+    {
+      "src": "BA",
+      "dst": "GE",
+      "count": 4
+    },
+    {
+      "src": "C",
+      "dst": "FDX",
+      "count": 4
+    },
+    {
+      "src": "CL",
+      "dst": "MS",
+      "count": 4
+    },
+    {
+      "src": "DD",
+      "dst": "DOW",
+      "count": 4
+    },
+    {
+      "src": "MLM",
+      "dst": "VMC",
+      "count": 4
+    },
+    {
+      "src": "AXP",
+      "dst": "V",
+      "count": 4
+    },
+    {
+      "src": "AXP",
+      "dst": "MA",
+      "count": 4
+    },
+    {
+      "src": "GS",
+      "dst": "KMX",
+      "count": 4
+    },
+    {
+      "src": "AAPL",
+      "dst": "INTC",
+      "count": 4
+    },
+    {
+      "src": "AXP",
+      "dst": "COF",
+      "count": 4
+    },
+    {
+      "src": "AXP",
+      "dst": "DFS",
+      "count": 4
+    },
+    {
+      "src": "ABC",
+      "dst": "MCK",
+      "count": 4
+    },
+    {
+      "src": "DOV",
+      "dst": "MS",
+      "count": 4
+    },
+    {
+      "src": "ABBV",
+      "dst": "PFE",
+      "count": 4
+    },
+    {
+      "src": "AAPL",
+      "dst": "GS",
+      "count": 4
+    },
+    {
+      "src": "GM",
+      "dst": "UBER",
+      "count": 4
+    },
+    {
+      "src": "C",
+      "dst": "DD",
+      "count": 4
+    },
+    {
+      "src": "AAPL",
+      "dst": "PYPL",
+      "count": 4
+    },
+    {
+      "src": "CPB",
+      "dst": "GS",
+      "count": 4
+    },
+    {
+      "src": "ABC",
+      "dst": "GS",
+      "count": 4
+    },
+    {
+      "src": "GOOGL",
+      "dst": "MSFT",
+      "count": 4
+    },
+    {
+      "src": "BAC",
+      "dst": "WFC",
+      "count": 4
+    },
+    {
+      "src": "MS",
+      "dst": "VRTX",
+      "count": 4
+    },
+    {
+      "src": "C",
+      "dst": "CTAS",
+      "count": 4
+    },
+    {
+      "src": "CHD",
+      "dst": "JPM",
+      "count": 4
+    },
+    {
+      "src": "C",
+      "dst": "SBAC",
+      "count": 4
+    },
+    {
+      "src": "AMZN",
+      "dst": "TGT",
+      "count": 4
+    },
+    {
+      "src": "AVY",
+      "dst": "JPM",
+      "count": 4
+    },
+    {
+      "src": "MS",
+      "dst": "NXPI",
+      "count": 4
+    },
+    {
+      "src": "MU",
+      "dst": "NVDA",
+      "count": 4
+    },
+    {
+      "src": "KEY",
+      "dst": "LRCX",
+      "count": 4
+    },
+    {
+      "src": "GOOGL",
+      "dst": "MS",
+      "count": 4
+    },
+    {
+      "src": "BA",
+      "dst": "LUV",
+      "count": 4
+    },
+    {
+      "src": "MS",
+      "dst": "TSLA",
+      "count": 4
+    },
+    {
+      "src": "HLT",
+      "dst": "MAR",
+      "count": 3
+    },
+    {
+      "src": "CMCSA",
+      "dst": "T",
+      "count": 3
+    },
+    {
+      "src": "BAC",
+      "dst": "MO",
+      "count": 3
+    },
+    {
+      "src": "GS",
+      "dst": "MA",
+      "count": 3
+    },
+    {
+      "src": "CVX",
+      "dst": "XOM",
+      "count": 3
+    },
+    {
+      "src": "C",
+      "dst": "KMI",
+      "count": 3
+    },
+    {
+      "src": "BAC",
+      "dst": "BLK",
+      "count": 3
+    },
+    {
+      "src": "GS",
+      "dst": "LOW",
+      "count": 3
+    },
+    {
+      "src": "BMY",
+      "dst": "PFE",
+      "count": 3
+    },
+    {
+      "src": "GS",
+      "dst": "NCLH",
+      "count": 3
+    },
+    {
+      "src": "HSY",
+      "dst": "KHC",
+      "count": 3
+    },
+    {
+      "src": "ATVI",
+      "dst": "MS",
+      "count": 3
+    },
+    {
+      "src": "INTC",
+      "dst": "KLAC",
+      "count": 3
+    },
+    {
+      "src": "AMAT",
+      "dst": "LRCX",
+      "count": 3
+    },
+    {
+      "src": "AXP",
+      "dst": "COST",
+      "count": 3
+    },
+    {
+      "src": "BAC",
+      "dst": "JNJ",
+      "count": 3
+    },
+    {
+      "src": "HAL",
+      "dst": "SLB",
+      "count": 3
+    },
+    {
+      "src": "DFS",
+      "dst": "JPM",
+      "count": 3
+    },
+    {
+      "src": "ADSK",
+      "dst": "MS",
+      "count": 3
+    },
+    {
+      "src": "BAX",
+      "dst": "GS",
+      "count": 3
+    },
+    {
+      "src": "DD",
+      "dst": "FMC",
+      "count": 3
+    },
+    {
+      "src": "ABC",
+      "dst": "MS",
+      "count": 3
+    },
+    {
+      "src": "GS",
+      "dst": "YUM",
+      "count": 3
+    },
+    {
+      "src": "COF",
+      "dst": "DFS",
+      "count": 3
+    },
+    {
+      "src": "LUV",
+      "dst": "UAL",
+      "count": 3
+    },
+    {
+      "src": "DAL",
+      "dst": "LUV",
+      "count": 3
+    },
+    {
+      "src": "DOW",
+      "dst": "MRK",
+      "count": 3
+    },
+    {
+      "src": "MS",
+      "dst": "NVDA",
+      "count": 3
+    },
+    {
+      "src": "F",
+      "dst": "GE",
+      "count": 3
+    },
+    {
+      "src": "TSLA",
+      "dst": "WMT",
+      "count": 3
+    },
+    {
+      "src": "C",
+      "dst": "MNST",
+      "count": 3
+    },
+    {
+      "src": "EXPD",
+      "dst": "GS",
+      "count": 3
+    },
+    {
+      "src": "BAC",
+      "dst": "JBHT",
+      "count": 3
+    },
+    {
+      "src": "CHTR",
+      "dst": "CMCSA",
+      "count": 3
+    },
+    {
+      "src": "GOOGL",
+      "dst": "NVDA",
+      "count": 3
+    },
+    {
+      "src": "C",
+      "dst": "FTNT",
+      "count": 3
+    },
+    {
+      "src": "PPG",
+      "dst": "SHW",
+      "count": 3
+    },
+    {
+      "src": "BMY",
+      "dst": "MS",
+      "count": 3
+    },
+    {
+      "src": "C",
+      "dst": "NSC",
+      "count": 3
+    },
+    {
+      "src": "GNRC",
+      "dst": "GS",
+      "count": 3
+    },
+    {
+      "src": "AMD",
+      "dst": "BAC",
+      "count": 3
+    },
+    {
+      "src": "MS",
+      "dst": "ORCL",
+      "count": 3
+    },
+    {
+      "src": "IBM",
+      "dst": "WFC",
+      "count": 3
+    },
+    {
+      "src": "GOOGL",
+      "dst": "NFLX",
+      "count": 3
+    },
+    {
+      "src": "C",
+      "dst": "DG",
+      "count": 3
+    },
+    {
+      "src": "ACN",
+      "dst": "C",
+      "count": 3
+    },
+    {
+      "src": "BAC",
+      "dst": "MCK",
+      "count": 3
+    },
+    {
+      "src": "CLX",
+      "dst": "GS",
+      "count": 3
+    },
+    {
+      "src": "ADBE",
+      "dst": "BAC",
+      "count": 3
+    },
+    {
+      "src": "CMG",
+      "dst": "MCD",
+      "count": 3
+    },
+    {
+      "src": "JPM",
+      "dst": "PAYX",
+      "count": 3
+    },
+    {
+      "src": "CSCO",
+      "dst": "WFC",
+      "count": 3
+    },
+    {
+      "src": "ATVI",
+      "dst": "EA",
+      "count": 3
+    },
+    {
+      "src": "AVY",
+      "dst": "C",
+      "count": 3
+    },
+    {
+      "src": "BAC",
+      "dst": "GNRC",
+      "count": 3
+    },
+    {
+      "src": "KMI",
+      "dst": "WFC",
+      "count": 3
+    },
+    {
+      "src": "KEY",
+      "dst": "LEN",
+      "count": 3
+    },
+    {
+      "src": "C",
+      "dst": "MOS",
+      "count": 3
+    },
+    {
+      "src": "ALB",
+      "dst": "GS",
+      "count": 3
+    },
+    {
+      "src": "LVS",
+      "dst": "MGM",
+      "count": 3
+    },
+    {
+      "src": "AMZN",
+      "dst": "COST",
+      "count": 3
+    },
+    {
+      "src": "BLK",
+      "dst": "PNC",
+      "count": 3
+    },
+    {
+      "src": "C",
+      "dst": "JNJ",
+      "count": 3
+    },
+    {
+      "src": "C",
+      "dst": "GOOGL",
+      "count": 3
+    },
+    {
+      "src": "BAC",
+      "dst": "LYB",
+      "count": 3
+    },
+    {
+      "src": "FISV",
+      "dst": "GS",
+      "count": 3
+    },
+    {
+      "src": "ABC",
+      "dst": "BAC",
+      "count": 3
+    },
+    {
+      "src": "JPM",
+      "dst": "XEL",
+      "count": 3
+    },
+    {
+      "src": "AXP",
+      "dst": "MS",
+      "count": 3
+    },
+    {
+      "src": "ROST",
+      "dst": "TJX",
+      "count": 3
+    },
+    {
+      "src": "C",
+      "dst": "MCD",
+      "count": 3
+    },
+    {
+      "src": "BAC",
+      "dst": "MS",
+      "count": 3
+    },
+    {
+      "src": "INTC",
+      "dst": "MU",
+      "count": 3
+    },
+    {
+      "src": "AAPL",
+      "dst": "NXPI",
+      "count": 3
+    },
+    {
+      "src": "JPM",
+      "dst": "SBAC",
+      "count": 3
+    },
+    {
+      "src": "MCK",
+      "dst": "MS",
+      "count": 3
+    },
+    {
+      "src": "CTAS",
+      "dst": "MS",
+      "count": 3
+    },
+    {
+      "src": "C",
+      "dst": "LMT",
+      "count": 3
+    },
+    {
+      "src": "DOW",
+      "dst": "XOM",
+      "count": 3
+    },
+    {
+      "src": "AMZN",
+      "dst": "DLTR",
+      "count": 3
+    }
+  ]
+}

@@ -1487,24 +1487,33 @@ def build_dynamic_graph(
     
     # =========================== 输出统计信息 ===========================
     print("\n" + "=" * 70)
-    print(">>> 图谱统计信息")
+    print(">>> 图谱统计信息（最终混合图）")
     print("=" * 70)
     
-    # 计算图谱统计
-    total_edges = (adj_matrix.sum() - num_nodes) / 2  # 减去自环，除以2（无向图）
+    # 【修复】使用最终混合图 adj_final 而不是中间的 adj_matrix
+    # 计算图谱统计（使用 count_nonzero 而非 sum，避免归一化后数值问题）
+    adj_final_nodiag_stat = adj_final.copy()
+    np.fill_diagonal(adj_final_nodiag_stat, 0)
+    total_edges = int(np.count_nonzero(adj_final_nodiag_stat) / 2)  # 无向图除以2
     density = total_edges / (num_nodes * (num_nodes - 1) / 2) if num_nodes > 1 else 0
     
-    # 计算每个节点的度
-    degrees = adj_matrix.sum(axis=1) - 1  # 减去自环
+    # 计算每个节点的度（使用阈值避免浮点误差）
+    degrees = np.sum(adj_final > 1e-6, axis=1) - 1  # 减去自环
     non_isolated = np.sum(degrees > 0)
     
     print(f"    节点数 (股票数): {num_nodes}")
-    print(f"    边数 (股票关系): {int(total_edges)}")
+    print(f"    边数 (股票关系): {total_edges}")
     print(f"    图密度: {density:.6f}")
     print(f"    有连接的股票数: {non_isolated} / {num_nodes} ({non_isolated/num_nodes*100:.1f}%)")
     print(f"    平均度: {degrees.mean():.2f}")
     print(f"    最大度: {int(degrees.max())}")
     print(f"    孤立节点数: {num_nodes - non_isolated}")
+    
+    # 分层统计
+    print(f"\n    [分层统计]")
+    print(f"    - 语义图贡献边数: {semantic_edges}")
+    print(f"    - 统计图贡献边数: {stat_edges}")
+    print(f"    - 混合后总边数: {final_edges}")
     
     if non_isolated < num_nodes * 0.5:
         print("\n⚠️ 警告：超过一半的股票是孤立节点！")
@@ -1513,10 +1522,10 @@ def build_dynamic_graph(
         print("   2. 使用 LLM 模式 (use_llm=True) 提取更多关系")
         print("   3. 检查新闻数据质量")
     
-    print(f"\n[OK] 已保存至 {OUTPUT_GRAPH}，形状: {adj_matrix.shape}")
+    print(f"\n[OK] 已保存至 {OUTPUT_GRAPH}，形状: {adj_final.shape}")
     print("=" * 70)
     
-    return adj_matrix
+    return adj_final
 
 
 if __name__ == "__main__":
