@@ -20,26 +20,35 @@ import sys
 
 from utils.logging_utils import setup_logging
 
-# ================= 配置（可直接修改）=================
-DATA_CSV_PATH = "./paper/data/processed/Final_Model_Data.csv"
-GRAPH_DIR = "./paper/data/processed"
-GRAPH_TICKERS_PATH = "./paper/data/processed/Graph_Tickers.json"
-OUTPUT_DIR = "./outputs"
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-MODEL_N_EMBD = 256
-MODEL_N_LAYERS = 3
-MODEL_GNN_EMBD = 64
-DROPOUT = 0.1
+# ================= 配置（与 3_train.py 顶会配置一致，保证消融对比公平）=================
+# 路径基于脚本目录，从 paper/ 或项目根目录运行均可
+DATA_CSV_PATH = os.path.join(_SCRIPT_DIR, "data", "processed", "Final_Model_Data.csv")
+GRAPH_DIR = os.path.join(_SCRIPT_DIR, "data", "processed")
+GRAPH_TICKERS_PATH = os.path.join(_SCRIPT_DIR, "data", "processed", "Graph_Tickers.json")
+OUTPUT_DIR = os.path.join(_SCRIPT_DIR, "outputs")
 
+# 窄而浅 + 强正则（与 3_train.py 一致）
+MODEL_N_EMBD = 64
+MODEL_N_LAYERS = 2
+MODEL_GNN_EMBD = 32
+DROPOUT = 0.3
+
+SEQ_LEN = 60
 TRAIN_BATCH_SIZE = 1024
 TRAIN_EPOCHS = 30
-TRAIN_LR = 3e-4
+TRAIN_LR = 1e-3
+WEIGHT_DECAY = 1e-3
+EARLY_STOP_PATIENCE = 5
+RANK_LOSS_WEIGHT = 1.0
+
 TRAIN_NUM_WORKERS = 10
 TRAIN_PREFETCH_FACTOR = 4
 TRAIN_PIN_MEMORY = True
 TRAIN_PERSISTENT_WORKERS = True
 USE_AMP = True
-USE_COMPILE = True
+USE_COMPILE = False
 TEMPORAL_BACKEND = "rwkv"
 # ====================================================
 
@@ -79,6 +88,11 @@ def _parse_args() -> argparse.Namespace:
 
 def _graph_path(graph_dir: str, name: str) -> str:
     return os.path.join(graph_dir, name)
+
+
+def _ablation_safe_name(ablation: str) -> str:
+    """消融名中 / 会破坏路径，文件/目录名用下划线替代。"""
+    return ablation.replace("/", "_")
 
 
 def _ablation_runs(graph_dir: str) -> dict[str, dict]:
@@ -204,6 +218,10 @@ def main() -> None:
                 "n_layers": MODEL_N_LAYERS,
                 "gnn_embd": MODEL_GNN_EMBD,
                 "dropout": DROPOUT,
+                "seq_len": SEQ_LEN,
+                "weight_decay": WEIGHT_DECAY,
+                "early_stop_patience": EARLY_STOP_PATIENCE,
+                "rank_loss_weight": RANK_LOSS_WEIGHT,
                 "batch_size": args.batch_size,
                 "epochs": args.epochs,
                 "lr": args.lr,
@@ -216,11 +234,11 @@ def main() -> None:
                 "output_dir": args.output,
                 "graph_path": graph_path,
                 "graph_tickers_path": args.graph_tickers,
-                "experiment_name": f"ablation_{ablation}",
-                "checkpoint_name": f"best_model_ablation_{ablation}.pth",
+                "experiment_name": f"ablation_{_ablation_safe_name(ablation)}",
+                "checkpoint_name": f"best_model_ablation_{_ablation_safe_name(ablation)}.pth",
                 "use_graph": bool(run_cfg["use_graph"]),
                 "temporal_backend": run_cfg.get("temporal_backend", args.temporal_backend),
-                "use_rank_loss": run_cfg.get("use_rank_loss", True),  # 消融 RankIC Loss
+                "use_rank_loss": run_cfg.get("use_rank_loss", True),
             }
 
             logger.info("开始消融训练: %s", ablation)

@@ -721,12 +721,21 @@ def _train_once():
             if node_indices is not None:
                 node_indices = node_indices.to(CONFIG['device'], non_blocking=True)
 
+            # [关键] Target 截面标准化 (Batch-wise Z-Score)：放大微小收益率差异，避免 Rank Loss 梯度消失
+            if y.numel() > 1:
+                y_flat = y.view(-1)
+                y_std, y_mean = torch.std_mean(y_flat, unbiased=False)
+                y_target = (y_flat - y_mean) / (y_std + 1e-6).clamp(min=1e-6)
+                y_target = y_target.view_as(y)
+            else:
+                y_target = y
+
             optimizer.zero_grad(set_to_none=True)
             
             if use_amp:
                 with torch.amp.autocast('cuda'):
                     preds = model(x, vol, node_indices=node_indices)
-                    loss = criterion(preds, y)
+                    loss = criterion(preds, y_target)
                     # 可选排序损失：仅在 batch 基本同一天时启用（按日期 batch 时成立）
                     if CONFIG.get('use_rank_loss', False) and batch_dates is not None:
                         # 性能优化：避免对整个 list 做 set()（O(B) 且分配多）；只比较首尾即可
@@ -734,13 +743,13 @@ def _train_once():
                             if CONFIG.get('rank_loss_type', 'pairwise') == 'rankic':
                                 rank_loss = rankic_soft_loss(
                                     preds,
-                                    y,
+                                    y_target,
                                     tau=float(CONFIG.get('rankic_tau', 1.0)),
                                     max_items=int(CONFIG.get('rankic_max_items', 256)),
                                 )
                             else:
                                 rank_loss = ranknet_pairwise_loss(
-                                    preds, y, max_pairs=CONFIG.get('rank_loss_max_pairs', 4096)
+                                    preds, y_target, max_pairs=CONFIG.get('rank_loss_max_pairs', 4096)
                                 )
                             loss = loss + float(CONFIG.get('rank_loss_weight', 0.1)) * rank_loss
                 scaler.scale(loss).backward()
@@ -750,19 +759,19 @@ def _train_once():
                 scaler.update()
             else:
                 preds = model(x, vol, node_indices=node_indices)
-                loss = criterion(preds, y)
+                loss = criterion(preds, y_target)
                 if CONFIG.get('use_rank_loss', False) and batch_dates is not None:
                     if isinstance(batch_dates, list) and (len(batch_dates) <= 1 or batch_dates[0] == batch_dates[-1]):
                         if CONFIG.get('rank_loss_type', 'pairwise') == 'rankic':
                             rank_loss = rankic_soft_loss(
                                 preds,
-                                y,
+                                y_target,
                                 tau=float(CONFIG.get('rankic_tau', 1.0)),
                                 max_items=int(CONFIG.get('rankic_max_items', 256)),
                             )
                         else:
                             rank_loss = ranknet_pairwise_loss(
-                                preds, y, max_pairs=CONFIG.get('rank_loss_max_pairs', 4096)
+                                preds, y_target, max_pairs=CONFIG.get('rank_loss_max_pairs', 4096)
                             )
                         loss = loss + float(CONFIG.get('rank_loss_weight', 0.1)) * rank_loss
                 loss.backward()

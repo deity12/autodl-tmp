@@ -314,10 +314,11 @@ class GraphRWKV_Model(nn.Module):
         self.pre_head_dropout = nn.Dropout(dropout)
         self.head = nn.Linear(n_embd, 1)
 
-    def forward(self, x: torch.Tensor, vol: torch.Tensor = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, vol: torch.Tensor = None, node_indices=None) -> torch.Tensor:
         """
         x: (B, T, F) 输入序列
         vol: (B, 1) 波动率（保留以兼容接口，但新方向中不使用）
+        node_indices: 无图模式下忽略，仅与 GNN 版接口一致
         """
         # 输入投影
         h = self.embedding(x)

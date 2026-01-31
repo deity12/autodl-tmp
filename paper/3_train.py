@@ -24,26 +24,27 @@ warnings.filterwarnings("ignore", message=".*An issue occurred while importing.*
 
 from utils.logging_utils import setup_logging
 
-# ================= 默认配置（48GB 满血 + new.md 时间切分，可直接 python 3_train.py 运行）=================
+# ================= 默认配置（参考顶会 KDD/AAAI：窄而浅 + 强正则，new.md 时间切分）=================
+# Rationale: 金融信噪比低，顶会（MASTER/HIST/StemGNN 等）常用「小隐维 + 高 Dropout + 强 L2」防过拟合。
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_CSV_PATH = os.path.join(_SCRIPT_DIR, "data", "processed", "Final_Model_Data.csv")
 GRAPH_PATH = os.path.join(_SCRIPT_DIR, "data", "processed", "Graph_Adjacency.npy")
 GRAPH_TICKERS_PATH = os.path.join(_SCRIPT_DIR, "data", "processed", "Graph_Tickers.json")
 OUTPUT_DIR = os.path.join(_SCRIPT_DIR, "outputs")
 
-# [Upgrade] 48GB 显存优化：更大容量与深度
-MODEL_N_EMBD = 384       # 原 256 -> 384
-MODEL_N_LAYERS = 4       # 原 3 -> 4
-MODEL_GNN_EMBD = 96      # 原 64 -> 96
-DROPOUT = 0.08           # 略降正则，利于拟合排序信号（原 0.1）
+# [Model] 窄而浅，防止记忆噪声（顶会常用 64/128 维、2~3 层）
+MODEL_N_EMBD = 64        # 384->64，金融特征 <200 维不宜过大隐空间
+MODEL_N_LAYERS = 2       # 4->2，浅层泛化更好，避免 over-smoothing
+MODEL_GNN_EMBD = 32      # 96->32，图特征不必过大
+DROPOUT = 0.3            # 0.08->0.3，强正则强迫学习鲁棒特征
 
-# [Opt] 提升 IC/RankIC 的调参：更长序列、略低学习率、更强排序损失、更长早停
-SEQ_LEN = 60             # 30->60，RWKV 长程更好，金融趋势更稳
-TRAIN_BATCH_SIZE = 1024  # 按日分组时有效 batch≈375
-TRAIN_EPOCHS = 40       # 30->40，配合早停给足收敛空间
-TRAIN_LR = 2e-4          # 3e-4->2e-4，更稳、少震荡
-WEIGHT_DECAY = 5e-6      # 略降 L2，减轻过正则（原 1e-5）
-EARLY_STOP_PATIENCE = 12 # 多等几轮再停，避免过早停
+# [Training] 小模型需稍大学习率 + 强 L2，配合 Scheduler 下降
+SEQ_LEN = 60             # 保持 60，长序列利于 RWKV
+TRAIN_BATCH_SIZE = 1024  # 保持
+TRAIN_EPOCHS = 50        # 小模型收敛快，略增轮次微调
+TRAIN_LR = 1e-3          # 2e-4->1e-3，配合 CosineAnnealing 下降
+WEIGHT_DECAY = 1e-3      # 5e-6->1e-3，强 L2 过滤噪声
+EARLY_STOP_PATIENCE = 15 # 给足耐心
 
 TRAIN_NUM_WORKERS = 10
 TRAIN_PREFETCH_FACTOR = 4
@@ -53,7 +54,8 @@ USE_AMP = True
 USE_COMPILE = False
 TEMPORAL_BACKEND = "rwkv"
 USE_RANK_LOSS = True
-RANK_LOSS_WEIGHT = 0.2   # 0.1->0.2，加强截面排序信号
+# [Loss] 选股目标对齐：排序为主、MSE 为辅（顶会 Rank-LSTM 等常用 1.0）
+RANK_LOSS_WEIGHT = 1.0   # 0.2->1.0，优化目标对齐 IC/RankIC
 RANK_LOSS_MAX_PAIRS = 8192
 RANK_LOSS_TYPE = "rankic"
 RANKIC_TAU = 1.0
