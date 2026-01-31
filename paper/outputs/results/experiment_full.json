@@ -1,0 +1,51 @@
+{
+  "timestamp": "2026-01-31 21:38:33",
+  "experiment_name": "full",
+  "checkpoint_path": "/root/autodl-tmp/paper/outputs/checkpoints/best_model.pth",
+  "artifacts_dir": "/root/autodl-tmp/paper/outputs/results/artifacts_full",
+  "best_val_loss": 0.000580872867431026,
+  "best_epoch": 33,
+  "val_metrics": {
+    "mse": 0.0005640806048177183,
+    "mae": 0.01626514457166195,
+    "rmse": 0.023750381150998784,
+    "r2": -0.0014617443084716797,
+    "directional_accuracy": 0.5292591084876858,
+    "ic": 0.020611817610382388,
+    "rank_ic": 0.018709502337463865
+  },
+  "test_metrics": {
+    "mse": 0.0004277951375115663,
+    "mae": 0.014670438133180141,
+    "rmse": 0.020683209071891293,
+    "r2": -0.06323671340942383,
+    "directional_accuracy": 0.5072204332259935,
+    "ic": 0.0008081565271060359,
+    "rank_ic": 0.0005237550173214023,
+    "icir": 0.003987675094606242,
+    "rank_icir": 0.0023032182008717525,
+    "n_test_samples": 199988,
+    "n_test_days": 692
+  },
+  "config": {
+    "batch_size": 1024,
+    "lr": 0.0002,
+    "epochs": 40,
+    "n_embd": 384,
+    "n_layers": 4,
+    "gnn_embd": 96,
+    "seq_len": 60,
+    "train_start": "2018-01-01",
+    "train_end": "2020-06-30",
+    "val_start": "2020-07-01",
+    "val_end": "2020-12-31",
+    "test_start": "2021-01-01",
+    "test_end": "2023-12-31",
+    "profile": "paper",
+    "output_dir": "/root/autodl-tmp/paper/outputs",
+    "checkpoint_name": "best_model.pth",
+    "use_graph": true,
+    "temporal_backend": "rwkv"
+  },
+  "loss_log": "/root/autodl-tmp/paper/outputs/logs/training_losses_full.json"
+}

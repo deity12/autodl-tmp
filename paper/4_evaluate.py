@@ -15,7 +15,11 @@ import argparse
 import json
 import os
 import sys
+import warnings
 from typing import Optional
+
+# 抑制 PyG 可选扩展库加载失败警告（不影响主流程，仅部分算子回退到 PyTorch）
+warnings.filterwarnings("ignore", message=".*An issue occurred while importing.*", category=UserWarning)
 
 import numpy as np
 import torch
@@ -36,6 +40,12 @@ USE_GRAPH = True
 TOP_K = 30  # 与论文一致：Top-30 Long-Short
 ANNUALIZATION = 252
 
+# 与 train_full 一致：scaler 用训练期，测试集用 2021-01-01~2023-12-31（论文报告区间）
+TRAIN_START = "2018-01-01"
+TRAIN_END = "2020-06-30"
+TEST_START = "2021-01-01"
+TEST_END = "2023-12-31"
+
 MODEL_N_EMBD = 256
 MODEL_N_LAYERS = 3
 MODEL_GNN_EMBD = 64
@@ -53,6 +63,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--use_graph", action=argparse.BooleanOptionalAction, default=USE_GRAPH, help="是否使用图模型")
     parser.add_argument("--top_k", type=int, default=TOP_K, help="Top-K Long-Short 的 K")
     parser.add_argument("--annualization", type=int, default=ANNUALIZATION, help="年化系数（交易日）")
+    parser.add_argument("--train_start", type=str, default=TRAIN_START, help="训练期起始（用于 fit scaler）")
+    parser.add_argument("--train_end", type=str, default=TRAIN_END, help="训练期结束")
+    parser.add_argument("--test_start", type=str, default=TEST_START, help="测试集起始（论文报告区间）")
+    parser.add_argument("--test_end", type=str, default=TEST_END, help="测试集结束")
     return parser.parse_args()
 
 
@@ -245,13 +259,21 @@ def main() -> None:
         gnn_embd = int(cfg_override.get("gnn_embd") or MODEL_GNN_EMBD)
         seq_len = int(cfg_override.get("seq_len") or SEQ_LEN)
 
-        train_dataset = FinancialDataset(args.test_data, seq_len=seq_len, mode="train")
+        train_dataset = FinancialDataset(
+            args.test_data,
+            seq_len=seq_len,
+            mode="train",
+            start_date=args.train_start,
+            end_date=args.train_end,
+        )
         test_dataset = FinancialDataset(
             args.test_data,
             seq_len=seq_len,
             mode="test",
             scaler=train_dataset.scaler,
             vol_stats=getattr(train_dataset, "vol_stats", None),
+            start_date=args.test_start,
+            end_date=args.test_end,
         )
         input_dim = len(train_dataset.feature_cols)
 
@@ -327,6 +349,7 @@ def main() -> None:
         # 格式化输出（符合顶会论文表格格式）
         print("\n" + "=" * 60)
         print("📊 Graph-RWKV 模型评估结果（测试集）")
+        print(f"   测试集区间: {args.test_start} ~ {args.test_end}（与 train_full 一致）")
         print("=" * 60)
         print(f"\n【预测能力指标】")
         print(f"  IC (每日均值):        {metrics.get('daily_ic', 'N/A'):.4f}" if metrics.get('daily_ic') else "  IC (每日均值):        N/A")

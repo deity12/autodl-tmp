@@ -17,41 +17,46 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import warnings
+
+# 抑制 PyG 可选扩展库加载失败警告（不影响训练）
+warnings.filterwarnings("ignore", message=".*An issue occurred while importing.*", category=UserWarning)
 
 from utils.logging_utils import setup_logging
 
-# ================= 默认配置（对齐 new.md，可直接 python 3_train.py 运行）=================
+# ================= 默认配置（48GB 满血 + new.md 时间切分，可直接 python 3_train.py 运行）=================
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_CSV_PATH = os.path.join(_SCRIPT_DIR, "data", "processed", "Final_Model_Data.csv")
 GRAPH_PATH = os.path.join(_SCRIPT_DIR, "data", "processed", "Graph_Adjacency.npy")
 GRAPH_TICKERS_PATH = os.path.join(_SCRIPT_DIR, "data", "processed", "Graph_Tickers.json")
 OUTPUT_DIR = os.path.join(_SCRIPT_DIR, "outputs")
 
-# 模型
-MODEL_N_EMBD = 256
-MODEL_N_LAYERS = 3
-MODEL_GNN_EMBD = 64
-DROPOUT = 0.1
+# [Upgrade] 48GB 显存优化：更大容量与深度
+MODEL_N_EMBD = 384       # 原 256 -> 384
+MODEL_N_LAYERS = 4       # 原 3 -> 4
+MODEL_GNN_EMBD = 96      # 原 64 -> 96
+DROPOUT = 0.08           # 略降正则，利于拟合排序信号（原 0.1）
 
-# 训练（主时间切分在 train_full.py PAPER_CONFIG：train_end=2020-06-30, val 2020-07~12, test 2021~2023）
-TRAIN_BATCH_SIZE = 1024
-TRAIN_EPOCHS = 30
-TRAIN_LR = 3e-4
+# [Opt] 提升 IC/RankIC 的调参：更长序列、略低学习率、更强排序损失、更长早停
+SEQ_LEN = 60             # 30->60，RWKV 长程更好，金融趋势更稳
+TRAIN_BATCH_SIZE = 1024  # 按日分组时有效 batch≈375
+TRAIN_EPOCHS = 40       # 30->40，配合早停给足收敛空间
+TRAIN_LR = 2e-4          # 3e-4->2e-4，更稳、少震荡
+WEIGHT_DECAY = 5e-6      # 略降 L2，减轻过正则（原 1e-5）
+EARLY_STOP_PATIENCE = 12 # 多等几轮再停，避免过早停
+
 TRAIN_NUM_WORKERS = 10
 TRAIN_PREFETCH_FACTOR = 4
 TRAIN_PIN_MEMORY = True
 TRAIN_PERSISTENT_WORKERS = True
 USE_AMP = True
-# 默认关闭 torch.compile，避免验证阶段首次 eval 编译卡顿 2–5 分钟；需要时可传 --use_compile
 USE_COMPILE = False
 TEMPORAL_BACKEND = "rwkv"
 USE_RANK_LOSS = True
-# 排序损失权重：0.1=RankIC 主导且 MSE 起正则防数值崩塌；纯排序可试 0.5~1.0
-RANK_LOSS_WEIGHT = 0.1
-RANK_LOSS_MAX_PAIRS = 4096
+RANK_LOSS_WEIGHT = 0.2   # 0.1->0.2，加强截面排序信号
+RANK_LOSS_MAX_PAIRS = 8192
 RANK_LOSS_TYPE = "rankic"
 RANKIC_TAU = 1.0
-# 48GB 显存下可用整 batch 算 RankIC，梯度更准（1024×1024 float32≈4MB）
 RANKIC_MAX_ITEMS = 1024
 
 # 滚动窗口（默认关闭；若开启则与 new.md 一致：训练截止 2020-06-30）
@@ -73,6 +78,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int, default=TRAIN_BATCH_SIZE, help="批大小")
     parser.add_argument("--epochs", type=int, default=TRAIN_EPOCHS, help="训练轮数")
     parser.add_argument("--lr", type=float, default=TRAIN_LR, help="学习率")
+    parser.add_argument("--seq_len", type=int, default=SEQ_LEN, help="输入序列长度（日）")
+    parser.add_argument("--weight_decay", type=float, default=WEIGHT_DECAY, help="AdamW 权重衰减")
+    parser.add_argument("--early_stop_patience", type=int, default=EARLY_STOP_PATIENCE, help="早停耐心（epoch）")
     parser.add_argument("--num_workers", type=int, default=TRAIN_NUM_WORKERS, help="DataLoader 进程数")
     parser.add_argument("--prefetch_factor", type=int, default=TRAIN_PREFETCH_FACTOR, help="DataLoader 预取因子")
     parser.add_argument("--pin_memory", action=argparse.BooleanOptionalAction, default=TRAIN_PIN_MEMORY, help="是否 pin_memory")
@@ -113,6 +121,9 @@ def main() -> None:
             "batch_size": args.batch_size,
             "epochs": args.epochs,
             "lr": args.lr,
+            "seq_len": args.seq_len,
+            "weight_decay": args.weight_decay,
+            "early_stop_patience": args.early_stop_patience,
             "num_workers": args.num_workers,
             "prefetch_factor": args.prefetch_factor,
             "pin_memory": bool(args.pin_memory),

@@ -212,7 +212,7 @@ PAPER_CONFIG = {
     # 'quantum_lr_ratio', 'use_differential_lr', 'q_threshold'
     'dropout': 0.1,  # 【优化】降低dropout从0.15到0.1，减少正则化
     'weight_decay': 1e-5,
-    'early_stop_patience': 8,  # 【优化】增加早停耐心值
+    'early_stop_patience': 10,  # 【优化】增加早停耐心值
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
     'num_workers': 4,
     'prefetch_factor': 2,
@@ -982,8 +982,12 @@ def _train_once():
     print(f"   MSE: {test_mse:.6f}, RMSE: {test_rmse:.6f}")
     print(f"   R²: {test_r2:.4f}, MAE: {test_mae:.6f}")
     print(f"   方向准确率: {test_dir_acc:.2%}")
-    print(f"   IC: {test_ic:.4f if test_ic else 'N/A'}, ICIR: {test_icir:.4f if test_icir else 'N/A'}")
-    print(f"   RankIC: {test_rank_ic:.4f if test_rank_ic else 'N/A'}, RankICIR: {test_rankicir:.4f if test_rankicir else 'N/A'}")
+    _ic_s = f"{test_ic:.4f}" if test_ic is not None else "N/A"
+    _icir_s = f"{test_icir:.4f}" if test_icir is not None else "N/A"
+    _ric_s = f"{test_rank_ic:.4f}" if test_rank_ic is not None else "N/A"
+    _ricir_s = f"{test_rankicir:.4f}" if test_rankicir is not None else "N/A"
+    print(f"   IC: {_ic_s}, ICIR: {_icir_s}")
+    print(f"   RankIC: {_ric_s}, RankICIR: {_ricir_s}")
 
     # ================= 9. 保存结果 =================
     curve_path = os.path.join(figure_dir, f"training_curve_{experiment_name}.png")
