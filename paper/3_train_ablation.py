@@ -38,7 +38,7 @@ DROPOUT = 0.3
 SEQ_LEN = 60
 TRAIN_BATCH_SIZE = 1024
 TRAIN_EPOCHS = 30
-TRAIN_LR = 1e-3
+TRAIN_LR = 5e-3
 WEIGHT_DECAY = 1e-3
 EARLY_STOP_PATIENCE = 5
 RANK_LOSS_WEIGHT = 1.0
@@ -109,7 +109,7 @@ def _ablation_runs(graph_dir: str) -> dict[str, dict]:
         "w/o_graph": {
             "use_graph": False,
             "graph_path": _graph_path(graph_dir, "Graph_Adjacency.npy"),
-            "temporal_backend": "rwkv",
+            "temporal_backend": "lstm",
             "use_rank_loss": True,
         },
         # 消融 2: 无语义图（仅统计相关性图）

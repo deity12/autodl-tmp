@@ -122,6 +122,9 @@ class FinancialDataset(Dataset):
                     self.feature_cols = default_feature_cols
             else:
                 self.feature_cols = default_feature_cols
+        # [DEBUG] 强制锁定为基础特征，排除 Alpha158 干扰
+        self.feature_cols = ['Open', 'Close', 'High', 'Low', 'Volume']
+        print(f"⚠️ [DEBUG] 底线测试：已强制锁定特征为 {self.feature_cols}")
         self.target_col = 'Log_Ret'
 
         # 如果特征列不在主 CSV 中，则尝试从外部特征文件（Parquet）合并进来。

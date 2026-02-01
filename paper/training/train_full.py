@@ -678,6 +678,7 @@ def _train_once():
     # ================= 7. 训练循环 =================
     train_losses, val_losses = [], []
     best_val_loss = float('inf')
+    best_val_rankic = -float('inf')
     best_metrics_epoch = None
     early_stop_counter = 0
     early_stop_patience = CONFIG['early_stop_patience']
@@ -834,70 +835,77 @@ def _train_once():
         
         avg_val = epoch_val / len(val_loader)
         val_losses.append(avg_val)
-        
-        # 计算评估指标
-        if avg_val < best_val_loss:
-            all_preds_np = np.concatenate(all_preds, axis=0)
-            all_targets_np = np.concatenate(all_targets, axis=0)
-            
-            y_true = all_targets_np.flatten()
-            y_pred = all_preds_np.flatten()
-            
-            mse = mean_squared_error(y_true, y_pred)
-            mae = mean_absolute_error(y_true, y_pred)
-            rmse = np.sqrt(mse)
-            r2 = r2_score(y_true, y_pred)
-            
-            true_direction = np.sign(y_true)
-            pred_direction = np.sign(y_pred)
-            directional_accuracy = np.mean(true_direction == pred_direction)
-            
-            # 顶会/量化更常见：按日期截面计算 IC/RankIC，再对天平均
-            if all_dates:
-                ic, rank_ic = daily_ic_rankic(y_true, y_pred, all_dates)
-            else:
-                try:
-                    ic, _ = pearsonr(y_pred, y_true)
-                    ic = float(ic)
-                except Exception:
-                    ic = None
-                try:
-                    rank_ic, _ = spearmanr(y_pred, y_true)
-                    rank_ic = float(rank_ic)
-                except Exception:
-                    rank_ic = None
-            
-            best_metrics = {
-                'mse': float(mse),
-                'mae': float(mae),
-                'rmse': float(rmse),
-                'r2': float(r2),
-                'directional_accuracy': float(directional_accuracy),
-                'ic': ic,
-                'rank_ic': rank_ic,
-            }
-        else:
-            best_metrics = None
-
-        cur_lr = optimizer.param_groups[0]['lr']
-        print(f"\nEpoch {epoch+1}/{CONFIG['epochs']}: Train={avg_train:.6f}, Val={avg_val:.6f}, lr={cur_lr:.2e}", flush=True)
 
         if avg_val < best_val_loss:
             best_val_loss = avg_val
-            best_metrics_epoch = best_metrics
+
+        # compute metrics every epoch (RankIC early stop)
+        all_preds_np = np.concatenate(all_preds, axis=0)
+        all_targets_np = np.concatenate(all_targets, axis=0)
+
+        y_true = all_targets_np.flatten()
+        y_pred = all_preds_np.flatten()
+
+        mse = mean_squared_error(y_true, y_pred)
+        mae = mean_absolute_error(y_true, y_pred)
+        rmse = np.sqrt(mse)
+        r2 = r2_score(y_true, y_pred)
+
+        true_direction = np.sign(y_true)
+        pred_direction = np.sign(y_pred)
+        directional_accuracy = np.mean(true_direction == pred_direction)
+
+        # compute daily IC/RankIC if dates are available
+        if all_dates:
+            ic, rank_ic = daily_ic_rankic(y_true, y_pred, all_dates)
+        else:
+            try:
+                ic, _ = pearsonr(y_pred, y_true)
+                ic = float(ic)
+            except Exception:
+                ic = None
+            try:
+                rank_ic, _ = spearmanr(y_pred, y_true)
+                rank_ic = float(rank_ic)
+            except Exception:
+                rank_ic = None
+
+        current_metrics = {
+            'mse': float(mse),
+            'mae': float(mae),
+            'rmse': float(rmse),
+            'r2': float(r2),
+            'directional_accuracy': float(directional_accuracy),
+            'ic': ic,
+            'rank_ic': rank_ic,
+        }
+        current_rankic = float(rank_ic) if rank_ic is not None else -999.0
+        cur_lr = optimizer.param_groups[0]['lr']
+        print(
+            f"\nEpoch {epoch+1}/{CONFIG['epochs']}: "
+            f"Train={avg_train:.6f}, Val={avg_val:.6f}, "
+            f"ValRankIC={current_rankic:.4f}, lr={cur_lr:.2e}",
+            flush=True,
+        )
+
+        if current_rankic > best_val_rankic:
+            best_val_rankic = current_rankic
+            best_metrics_epoch = current_metrics
             save_path = os.path.join(checkpoint_dir, checkpoint_name)
             torch.save(model.state_dict(), save_path)
-            if best_metrics:
-                print(f"  🌟 Best model saved!", flush=True)
-                ic_str = f"{best_metrics['ic']:.4f}" if best_metrics['ic'] is not None else "N/A"
-                print(f"     R²={best_metrics['r2']:.4f}, MAE={best_metrics['mae']:.6f}, "
-                      f"DirAcc={best_metrics['directional_accuracy']:.2%}, IC={ic_str}", flush=True)
+            print(f"  Best model saved! (RankIC: {best_val_rankic:.4f})", flush=True)
+            ic_str = f"{current_metrics['ic']:.4f}" if current_metrics['ic'] is not None else "N/A"
+            print(
+                f"     R2={current_metrics['r2']:.4f}, MAE={current_metrics['mae']:.6f}, "
+                f"DirAcc={current_metrics['directional_accuracy']:.2%}, IC={ic_str}",
+                flush=True,
+            )
             early_stop_counter = 0
         else:
             early_stop_counter += 1
 
         if early_stop_counter >= early_stop_patience:
-            print(f"\n🛑 Early stopping (best val loss: {best_val_loss:.6f})")
+            print(f"\nEarly stopping (best val RankIC: {best_val_rankic:.4f})")
             break
         print("-" * 60, flush=True)
 
