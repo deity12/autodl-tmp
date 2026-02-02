@@ -127,8 +127,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--split_date",
         type=str,
-        default="2020-12-31",
-        help="Graph cut-off date (YYYY-MM-DD). News/relations with timestamp >= split_date will be excluded.",
+        default="2021-12-31",
+        help="Graph cut-off date (YYYY-MM-DD). 与训练集结束日一致防泄露。Clean Run 方案: 2021-12-31。",
     )
     return parser.parse_args()
 
@@ -185,6 +185,7 @@ def main() -> None:
             max_per_ticker=int(args.max_per_ticker),
             max_total=int(args.max_total),
             use_sp500=not bool(args.all_stocks),
+            split_date=split_date_str,
         )
     except Exception as exc:
         logger.exception("建图失败: %s", exc)

@@ -50,7 +50,7 @@
 * **关系类型**：限定 7 类——supply（供应链）、competition（竞争）、cooperation（合作）、merger（并购）、lawsuit（诉讼）、investment（投资）、co-event（共同事件），便于复现与消融。
 * **处理流程**：
 1. **抽取**：从新闻 Headline/Content 中提取三元组 `{Source, Target, Relation, Sentiment}`，仅保留 src/dst 均在图节点（S&P 500 成分股）内的边。
-2. **截断 (Strict Cutoff)**：设置 `--split_date 2020-06-30`（与训练集结束日期一致）。构图**仅使用此日期前的历史新闻**，严禁使用验证集/测试集期间的信息构建图结构，彻底杜绝 Look-ahead Bias。
+2. **截断 (Strict Cutoff)**：设置 `--split_date 2021-12-31`（与训练集结束日期一致，见 3.3 节）。构图**仅使用此日期前的历史新闻**，严禁使用验证集/测试集期间的信息构建图结构，彻底杜绝 Look-ahead Bias。
 3. **时序衰减**：采用指数衰减因子（本实现 α=0.995，半衰期约 138 天），按日累积边权，确保旧闻的影响力随时间降低；取值依据见本文 3.3 节时间切分与 2.1 节「旧闻影响力随时间降低」。
 
 
@@ -61,7 +61,7 @@
 
 **最终产物**：
 
-* 邻接矩阵：`Graph_Adjacency.npy`（使用 `split_date=2020-06-30` 前数据一次性构建的累积混合图，训练/验证/测试阶段**静态使用**，无未来信息）。
+* 邻接矩阵：`Graph_Adjacency.npy`（使用 `split_date=2021-12-31` 前数据一次性构建的累积混合图，训练/验证/测试阶段**静态使用**，无未来信息）。
 * 节点映射：`Graph_Tickers.json`（与 dataset 的 ticker2idx 顺序严格一致，防止索引错位）。
 * 消融用图：`Graph_Adjacency_semantic.npy`（仅语义图）、`Graph_Adjacency_stat.npy`（仅统计图）。
 
@@ -74,7 +74,7 @@
 
 **2. 时间维：RWKV-TimeSeries Encoder**
 
-* 每个股票 i 的 158 维特征序列独立进入 RWKV 模块。
+* 每个股票 i 的**精选 26 维特征序列**（基于 Alpha158-like 因子池筛选与去噪）独立进入 RWKV 模块。
 * 利用线性 Attention 机制捕捉长程依赖，输出时间嵌入。
 
 **3. 空间维：广播优化版图注意力 (Broadcast GAT)**
@@ -101,10 +101,15 @@
 3. **特征工程 (Feature Engineering)**：
 * **脚本**：`feature_engineering.py`
 * **方法**：基于纯 Pandas 实现（fallback 机制）或 Pandas-TA。
-* **维度**：**158 维 (Alpha158-like)**。涵盖动量 (Momentum)、波动率 (Volatility)、量价趋势 (Price-Volume)、重叠指标 (Overlap) 等。
-* **关键处理**：
-* **截面标准化 (Cross-sectional Rank)**：执行 `groupby('Date').rank(pct=True) - 0.5`，将所有特征归一化至 **[-0.5, 0.5]** 区间，消除量纲差异，加速模型收敛。
-* **存储**：`sp500_alpha158_features.parquet`。
+* **初始池**：基于 Alpha158-like 因子库生成 **158 维**量价因子（Momentum / Volatility / Price-Volume / Overlap 等）。
+* **特征筛选 (Refined Feature Set)**：考虑金融数据低信噪比特性，全量特征噪声大且不利于收敛；最终通过特征筛选与去噪，构建**26 维精选特征集**（以 1d/5D 窗口为主），覆盖动量、波动率、量价趋势、强弱指标等维度，例如：
+  - **动量/收益**：`ret_1d`, `log_ret_1d`, `roc_5`, `mom_5`, `oc_ret`
+  - **趋势/均线**：`close_sma_5`, `close_ema_5`, `close_sma_ratio_5`, `close_ema_ratio_5`
+  - **波动率**：`hl_range`, `ret_std_5`, `atr_5`, `bb_width_5`, `bb_percent_5`
+  - **量价/资金**：`vol_mean_5`, `vol_std_5`, `vwap_5`, `mfi_5`, `cmf_5`
+  - **强弱/趋势强度**：`rsi_5`, `cci_5`, `willr_5`, `di_plus_5`, `di_minus_5`, `adx_5`
+* **预处理**：对特征进行截面标准化（Rank-based），执行 `groupby('Date').rank(pct=True) - 0.5`，将特征映射至 **[-0.5, 0.5]**，降低量纲差异与异常值影响。
+* **存储**：全量特征存为 `sp500_alpha158_features.parquet`；最终实验通过 `input_dim=26` 使用上述精选子集。
 
 
 
@@ -114,7 +119,7 @@
 
 * **存储解耦**：
 * 基础数据（OHLCV + Text + Label）存为 CSV。
-* 高维特征（158 Alpha）存为 Parquet。
+* Alpha158-like 特征池（158 维）存为 Parquet；训练/评估阶段通过 `input_dim=26` 选择 26 维精选特征。
 
 
 * **动态缝合**：
@@ -125,21 +130,31 @@
 
 ### 3.3 科学时间切分策略 (Train/Valid/Test Split)
 
-为确保实验的严谨性并符合顶会论文标准（参考 AAAI 2024 MDGNN、Qlib Alpha158 基准），采用严格的时间顺序切分。**关键原则**：
+为确保实验的严谨性并符合顶会论文标准（参考 AAAI 2024 MDGNN、Qlib Alpha158 基准），采用**抗周期切分法（4:1:1）**。**关键原则**：
 
-1. **图谱仅使用验证集截止日期前的数据构建**（`split_date = 2020-06-30`），训练/验证/测试阶段**共用同一静态图**，从源头杜绝未来信息泄露。
+1. **图谱仅使用训练集截止日期前的数据构建**（`split_date = 2021-12-31`），训练/验证/测试阶段**共用同一静态图**，从源头杜绝未来信息泄露。
 2. **验证集独立于测试集**：验证集仅用于早停和超参调优，**不参与最终指标报告**；最终论文只报告测试集指标。
+3. **验证集选用 2022 年熊市**：在最难行情里选模型，保证选出的模型具备抗跌能力，而非“只会做多”。
 
 | 数据集划分 | 时间范围 | 样本量 | 用途 |
 | --- | --- | --- | --- |
-| **训练集 (Train)** | **2018-01-01 至 2020-06-30** | ~2.5 年 | 模型参数更新、梯度下降 |
-| **验证集 (Valid)** | **2020-07-01 至 2020-12-31** | ~6 个月 | 超参搜索、早停监控、最佳 checkpoint 保存 |
-| **测试集 (Test)** | **2021-01-01 至 2023-12-31** | ~3 年 | **最终性能评估**（论文报告此区间指标） |
+| **训练集 (Train)** | **2018-01-01 至 2021-12-31** | 4 年 | 模型参数更新、梯度下降；涵盖 2018 震荡、2019 慢牛、2020 熔断反转、2021 牛市 |
+| **验证集 (Valid)** | **2022-01-01 至 2022-12-31** | 1 年 | 超参搜索、早停监控、最佳 checkpoint 保存；2022 熊市，用于挑选抗跌模型 |
+| **测试集 (Test)** | **2023-01-01 至 2023-12-31** | 1 年 | **最终性能评估**（论文报告此区间指标）；OOD 区间，检验模型适应新风格能力 |
 
-**图谱截止日期**：`2020-06-30`（与训练集结束日期一致，确保图谱不包含验证/测试期信息）
+**图谱截止日期**：`2021-12-31`（与训练集结束日期一致）。建图命令：`python 2_build_graph.py --split_date 2021-12-31`。
 
 
 ## 4. 实验设计与评估 (Experimental Design)
+
+**实验配置（Clean Run v1，更新：2026-02）**
+- **数据切分**：4:1:1 抗周期切分（Train 2018–2021.12，Val 2022，Test 2023），图谱 `split_date=2021-12-31`
+- **特征**：基于 Alpha158-like 生成 158 维因子，并筛选为 **26 维精选特征集**用于最终实验
+- **序列长度**：`seq_len=60`
+- **训练**：`epochs=50`, `batch_size=1024`, `lr=1e-3`, `optimizer=AdamW`, `dropout=0.3`, `early_stop=10`
+- **模型**：`n_embd=64`, `n_layers=2`, `gnn_embd=32`；启用 RankIC Loss，`rank_loss_weight=1.0`
+- **实验脚本**：统一入口 `run_experiment.py`（`--model rwkv|lstm|gru`，`--use_graph`），一键队列 `run_all_final.sh`；结果输出至 `outputs/final_run/<exp_name>/`，汇总表 `outputs/final_run/summary.csv`
+
 
 ### 4.1 评估指标 (Evaluation Metrics)
 
@@ -216,6 +231,39 @@ ICIR = mean(ic_list) / std(ic_list)
 
 ---
 
+
+### 4.4 主实验结果 (Main Results)
+
+实验采用 **Clean Run** 统一配置：4:1:1 切分（Train 2018–2021.12，Val 2022，Test 2023），`seq_len=60`, `lr=1e-3`, `dropout=0.3`, `rank_loss_weight=1.0`, `epochs=50`，**26 维精选特征集**。跑完 `run_all_final.sh` 后，从 `outputs/final_run/summary.csv` 取数填入下表，作为论文 **Table 1**。
+
+**表 1：不同模型在 S&P 500 数据集上的性能对比（Clean Run v1，Val=2022 熊市，Test=2023）**
+
+| 模型 | Graph | Backbone | 特征数 | Val RankIC (2022) | Test RankIC (2023) | Test IC |
+| --- | --- | --- | --- | --- | --- | --- |
+| **Graph-RWKV (Ours)** | **✓** | **RWKV** | **26** | （待填） | （待填） | （待填） |
+| RWKV w/o Graph | ✗ | RWKV | 26 | （待填） | （待填） | （待填） |
+| Graph-LSTM | ✓ | LSTM | 26 | （待填） | （待填） | （待填） |
+| Graph-GRU | ✓ | GRU | 26 | （待填） | （待填） | （待填） |
+
+**预期与解读**：
+1. **图结构的有效性**：Graph-RWKV 相对 RWKV w/o Graph 在 Val（2022 熊市）与 Test（2023）上应有明显提升，说明动态图谱能捕捉股票间隐式关联。
+2. **抗周期设计**：在 2022 熊市上选出的最佳模型，在 2023 OOD 测试上可检验是否具备抗跌与适应新风格能力。
+3. **基线对比**：Graph-LSTM / Graph-GRU 作为对比基线，与 Graph-RWKV 使用完全相同的配置与数据切分，仅时间编码器不同。
+
+### 4.5 讨论 (Discussion)
+
+Clean Run 采用 2022 熊市作验证集，选出的模型应更抗跌；2023 作为完全独立的测试集，用于报告最终 RankIC/IC。若 Graph-RWKV 在 Val 与 Test 上均优于无图基线与 LSTM/GRU 基线，可支撑“图结构 + RWKV”的有效性；若在 Test 上存在基线略高的情况，可在 Discussion 中从稳健性、容量与过拟合角度进行讨论。
+
+### 4.6 实验流程与可视化 (Clean Run & Visualization)
+
+**论文 v1 实验流程（Clean Run）**：
+1. 建图：`python 2_build_graph.py --split_date 2021-12-31`
+2. 一键跑 4 个实验：`bash run_all_final.sh`（或依次执行 `run_experiment.py --model rwkv --use_graph` 等）
+3. 汇总：从 `outputs/final_run/summary.csv` 取 Val/Test RankIC 填入表 1
+
+**可视化**：
+1. **训练曲线**：从 `outputs/final_run/<exp_name>/` 下各实验的日志或 JSON 绘制 Val RankIC 随 Epoch 变化，对比四条曲线。
+2. **结果对比图**：用 Test RankIC / Test IC 做柱状图；若需回测，可补充轻量 `backtest.py` 形成累计收益曲线。
 ## 5. 参考文献 (References)
 
 **Category A: Transformer & RWKV (时序编码器)**
@@ -252,8 +300,8 @@ ICIR = mean(ic_list) / std(ic_list)
    - 设计 **LLM 增强的混合动态图**（语义层 + 统计层），解决纯新闻图的稀疏性问题
 
 2. **实验严谨性 (Rigor)**：
-   - 采用严格的 **Train/Valid/Test 三阶段切分**（2018-2020.06 / 2020.07-2020.12 / 2021-2023）
-   - 图谱仅使用训练集截止日期前的数据构建，从数据源头杜绝 Look-ahead Bias
+   - 采用 **抗周期切分法（4:1:1）**：Train 2018–2021.12、Val 2022 熊市、Test 2023 OOD；在最难行情中选模型，保证抗跌与可复现
+   - 图谱仅使用训练集截止日期（`split_date=2021-12-31`）前的数据构建，从数据源头杜绝 Look-ahead Bias
    - 提出 **"Conservative T+1 Shift"** 策略处理新闻时间戳不确定性
 
 3. **评估全面性 (Comprehensive Evaluation)**：
@@ -262,5 +310,5 @@ ICIR = mean(ic_list) / std(ic_list)
    - 设计 6 组消融实验验证各模块有效性
 
 4. **可复现性 (Reproducibility)**：
-   - 完整开源实现（数据清洗、LLM 建图、训练、评估脚本）
-   - 超参数与代码一一对应，可直接复现论文结果
+   - 完整开源实现：数据清洗（`1_preprocess_data.py`）、LLM 建图（`2_build_graph.py --split_date 2021-12-31`）、统一实验（`run_experiment.py` + `run_all_final.sh`）、评估脚本（`4_evaluate.py`）
+   - 论文 v1 封板采用 Clean Run 流程，超参与数据切分与代码一一对应，可直接复现论文结果
