@@ -122,9 +122,42 @@ class FinancialDataset(Dataset):
                     self.feature_cols = default_feature_cols
             else:
                 self.feature_cols = default_feature_cols
-        # [DEBUG] 强制锁定为基础特征，排除 Alpha158 干扰
-        self.feature_cols = ['Open', 'Close', 'High', 'Low', 'Volume']
-        print(f"⚠️ [DEBUG] 底线测试：已强制锁定特征为 {self.feature_cols}")
+ # [DEBUG] 决战模式：精选特征集（先声明，合并特征后再过滤）
+        target_feature_list = [
+            # 1. 核心收益与动量
+            "ret_1d",
+            "log_ret_1d",
+            "roc_5",
+            "roc_10",
+            "roc_20",
+            "roc_60",
+            "mom_10",
+            "mom_20",
+            # 2. 强弱指标 (RSI)
+            "rsi_5",
+            "rsi_10",
+            "rsi_20",
+            # 3. 趋势与均线
+            "close_sma_ratio_20",
+            "close_ema_ratio_20",
+            "close_sma_ratio_60",
+            "close_ema_ratio_60",
+            "cci_20",
+            # 4. 波动率与风险
+            "ret_std_20",
+            "vol_std_20",
+            "bb_width_20",
+            "bb_percent_20",
+            "atr_20",
+            # 5. 量价资金
+            "mfi_20",
+            "cmf_20",
+            "vwap_20",
+            "willr_20",
+            "hl_range",
+        ]
+        self.feature_cols = list(target_feature_list)
+        print(f"[DEBUG] 决战模式：请求 {len(self.feature_cols)} 个特征（将于合并后过滤）")
         self.target_col = 'Log_Ret'
 
         # 如果特征列不在主 CSV 中，则尝试从外部特征文件（Parquet）合并进来。
@@ -158,7 +191,14 @@ class FinancialDataset(Dataset):
                 missing_cols = [c for c in self.feature_cols if c not in self.df.columns]
 
             if missing_cols:
-                raise ValueError(f"特征列不存在: {missing_cols}")
+                kept_cols = [c for c in self.feature_cols if c in self.df.columns]
+                dropped_cols = [c for c in self.feature_cols if c not in self.df.columns]
+                self.feature_cols = kept_cols
+                if not self.feature_cols:
+                    raise ValueError(
+                        f"特征列全部失效，后续无法训练: {dropped_cols}"
+                    )
+                print(f"[DEBUG] 自动过滤掉不存在的特征: {dropped_cols}")
         
         # =======================================================
         # 🛡️ 【改进】鲁棒性数据清洗防火墙

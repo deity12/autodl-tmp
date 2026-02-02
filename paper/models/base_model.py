@@ -394,7 +394,13 @@ class RNN_Model(nn.Module):
         )
         self.head = nn.Linear(n_embd, 1)
 
-    def forward(self, x: torch.Tensor, vol: torch.Tensor = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        vol: torch.Tensor = None,
+        node_indices=None,
+        **kwargs,
+    ) -> torch.Tensor:
         h = self.encoder(x, vol)
         return self.head(h)
 

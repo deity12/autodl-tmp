@@ -42,7 +42,7 @@ DROPOUT = 0.3            # 0.08->0.3，强正则强迫学习鲁棒特征
 SEQ_LEN = 60             # 保持 60，长序列利于 RWKV
 TRAIN_BATCH_SIZE = 1024  # 保持
 TRAIN_EPOCHS = 50        # 小模型收敛快，略增轮次微调
-TRAIN_LR = 1e-3          # 2e-4->1e-3，配合 CosineAnnealing 下降
+TRAIN_LR = 5e-3          # 
 WEIGHT_DECAY = 1e-3      # 5e-6->1e-3，强 L2 过滤噪声
 EARLY_STOP_PATIENCE = 15 # 给足耐心
 
