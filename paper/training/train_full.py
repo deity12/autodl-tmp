@@ -12,7 +12,7 @@ Graph-RWKV 模型训练脚本（基于动态图谱与 Graph-RWKV 的时空解耦
   - 排序损失：基于可微近似排序（soft-rank）的 **RankIC Loss**，默认权重 `rank_loss_weight=0.1`（RankIC 主导 + MSE 正则防数值崩塌）；纯排序可试 0.5~1.0。
 - **批采样策略**：默认启用 `DateGroupedBatchSampler`，即**按日期成批**，保证每个 batch 主要来自同一交易日，以便在该日截面上计算排序损失（RankIC / RankNet）。
 - **验证方式**：
-  - 默认采用固定训练区间（2018-01-01 ~ 2020-12-31）与测试区间（2021-01-01 之后），配置见 `CONFIG`。
+  - 默认采用固定三阶段切分（Train 2018-01-01~2021-12-31，Val 2022，Test 2023），配置见 `CONFIG`。
   - 可选启用滚动窗口验证（Walk-Forward Validation）：由 `CONFIG['use_walk_forward']` 控制，入口在 `main()` 中。
 
 说明：
@@ -199,20 +199,21 @@ except ImportError as e:
 #         export QL_PROFILE=48gb
 PAPER_CONFIG = {
     'csv_path': os.path.join(parent_dir, 'data', 'processed', 'Final_Model_Data.csv'),
-    'input_dim': 8,
-    'n_embd': 256,
-    'n_layers': 3,
-    'n_qubits': 8,  # 【优化】增强量子容量：8量子比特
-    'gnn_embd': 64,
-    'seq_len': 30,
-    'batch_size': 512,
-    'epochs': 30,  # 【优化】增加训练轮数，给复杂模型更多收敛时间
-    'lr': 3e-4,
+    # input_dim 会在加载 dataset 后被自动覆盖；这里仅作占位（new.md Clean Run: 26）
+    'input_dim': 26,
+    # new.md Clean Run v1：小模型 + 强正则，更贴近顶会常用配置
+    'n_embd': 64,
+    'n_layers': 2,
+    'gnn_embd': 32,
+    'seq_len': 60,
+    'batch_size': 1024,
+    'epochs': 50,
+    'lr': 1e-3,
     # 【注意】新方向不使用以下参数，已移除：
     # 'quantum_lr_ratio', 'use_differential_lr', 'q_threshold'
-    'dropout': 0.1,  # 【优化】降低dropout从0.15到0.1，减少正则化
+    'dropout': 0.3,
     'weight_decay': 1e-5,
-    'early_stop_patience': 10,  # 【优化】增加早停耐心值
+    'early_stop_patience': 10,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
     'num_workers': 4,
     'prefetch_factor': 2,
@@ -222,7 +223,8 @@ PAPER_CONFIG = {
     'persistent_workers': True,
     'use_date_grouped_batch': True,
     'use_rank_loss': True,
-    'rank_loss_weight': 0.1,  # RankIC 主导，MSE 起正则；纯排序可试 0.5~1.0
+    # new.md：RankIC Loss 为主目标（对齐选股），MSE 为辅
+    'rank_loss_weight': 1.0,
     'rank_loss_max_pairs': 4096,
     'rank_loss_type': 'rankic',  # pairwise | rankic
     'rankic_tau': 1.0,
@@ -233,7 +235,8 @@ PAPER_CONFIG = {
     # 运行配置
     'output_dir': OUTPUT_DIR,
     'graph_path': GRAPH_PATH,
-    'graph_split_date': '2020-06-30',  # 与训练集结束日期一致，防泄露
+    # new.md：图谱截止日期必须与训练集结束日一致（严格防泄露）
+    'graph_split_date': '2021-12-31',
     'graph_tickers_path': GRAPH_TICKERS_PATH,
     'use_graph': True,
     'experiment_name': 'full',
@@ -241,17 +244,17 @@ PAPER_CONFIG = {
     # Walk-forward 配置
     'use_walk_forward': False,
     'walk_forward_train_start': '2018-01-01',
-    'walk_forward_train_end': '2020-06-30',
-    'walk_forward_test_start': '2021-01-01',
+    'walk_forward_train_end': '2021-12-31',
+    'walk_forward_test_start': '2023-01-01',
     'walk_forward_test_end': '2023-12-31',
     'walk_forward_freq': 'Q',
     # 训练/验证/测试日期范围（符合顶会标准的三阶段切分）
     'train_start': '2018-01-01',
-    'train_end': '2020-06-30',      # 训练集：~2.5年
-    'val_start': '2020-07-01',      # 验证集：用于早停和超参调优
-    'val_end': '2020-12-31',        # 验证集：~6个月
-    'test_start': '2021-01-01',     # 测试集：最终评估
-    'test_end': '2023-12-31',       # 测试集：~3年
+    'train_end': '2021-12-31',      # Train (4y): 2018-01-01 ~ 2021-12-31
+    'val_start': '2022-01-01',      # Val (1y): 2022 熊市（早停/选模）
+    'val_end': '2022-12-31',
+    'test_start': '2023-01-01',     # Test (1y): 2023（论文报告）
+    'test_end': '2023-12-31',
     'use_date_split': True,
     # 时间编码器类型
     'temporal_backend': 'rwkv',  # rwkv | lstm | gru

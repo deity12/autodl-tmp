@@ -1,0 +1,16 @@
+{
+  "timestamp": "2026-02-03 09:04:59",
+  "overrides": {
+    "csv_path": "/root/autodl-tmp/paper/data/processed/Final_Model_Data.csv",
+    "graph_path": "/root/autodl-tmp/paper/data/processed/Graph_Adjacency.npy",
+    "graph_tickers_path": "/root/autodl-tmp/paper/data/processed/Graph_Tickers.json",
+    "feature_columns_path": "/root/autodl-tmp/paper/data/processed/feature_columns.json",
+    "features_path": "/root/autodl-tmp/paper/data/processed/sp500_alpha158_features.parquet",
+    "output_dir": "/root/autodl-tmp/paper/outputs/final_run/ablation_gru_backbone",
+    "experiment_name": "ablation_gru_backbone",
+    "checkpoint_name": "best_model.pth",
+    "use_graph": true,
+    "temporal_backend": "gru",
+    "use_date_split": true
+  }
+}

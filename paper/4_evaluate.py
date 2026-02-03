@@ -40,10 +40,10 @@ USE_GRAPH = True
 TOP_K = 30  # 与论文一致：Top-30 Long-Short
 ANNUALIZATION = 252
 
-# 与 train_full 一致：scaler 用训练期，测试集用 2021-01-01~2023-12-31（论文报告区间）
+# 与 train_full/new.md 一致：scaler 用训练期，测试集用 2023-01-01~2023-12-31（论文报告区间）
 TRAIN_START = "2018-01-01"
-TRAIN_END = "2020-06-30"
-TEST_START = "2021-01-01"
+TRAIN_END = "2021-12-31"
+TEST_START = "2023-01-01"
 TEST_END = "2023-12-31"
 
 MODEL_N_EMBD = 256

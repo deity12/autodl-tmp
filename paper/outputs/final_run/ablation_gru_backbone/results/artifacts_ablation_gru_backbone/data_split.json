@@ -1,0 +1,9 @@
+{
+  "mode": "train",
+  "start_date": "2018-01-01",
+  "end_date": "2021-12-31",
+  "split_date": null,
+  "csv_path": "/root/autodl-tmp/paper/data/processed/Final_Model_Data.csv",
+  "features_path": "/root/autodl-tmp/paper/data/processed/sp500_alpha158_features.parquet",
+  "feature_columns_path": "/root/autodl-tmp/paper/data/processed/feature_columns.json"
+}

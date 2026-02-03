@@ -1,9 +1,0 @@
-{
-  "mode": "train",
-  "start_date": "2018-01-01",
-  "end_date": "2020-06-30",
-  "split_date": null,
-  "csv_path": "/root/autodl-tmp/paper/data/processed/Final_Model_Data.csv",
-  "features_path": null,
-  "feature_columns_path": "/root/autodl-tmp/paper/data/processed/feature_columns.json"
-}

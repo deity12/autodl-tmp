@@ -1,0 +1,51 @@
+{
+  "timestamp": "2026-02-03 09:10:03",
+  "experiment_name": "ablation_gru_backbone",
+  "checkpoint_path": "/root/autodl-tmp/paper/outputs/final_run/ablation_gru_backbone/checkpoints/best_model.pth",
+  "artifacts_dir": "/root/autodl-tmp/paper/outputs/final_run/ablation_gru_backbone/results/artifacts_ablation_gru_backbone",
+  "best_val_loss": 0.0008943255325667215,
+  "best_epoch": 4,
+  "val_metrics": {
+    "mse": 0.001959115033969283,
+    "mae": 0.03452441841363907,
+    "rmse": 0.044261891441388757,
+    "r2": -2.51792573928833,
+    "directional_accuracy": 0.49807061722132645,
+    "ic": 0.0005985741163004938,
+    "rank_ic": 0.0037798224238975832
+  },
+  "test_metrics": {
+    "mse": 0.001610195729881525,
+    "mae": 0.031807996332645416,
+    "rmse": 0.04012724423482785,
+    "r2": -4.267151355743408,
+    "directional_accuracy": 0.5087786748686403,
+    "ic": 0.017154742761899468,
+    "rank_ic": 0.025741645248172337,
+    "icir": 0.11905744235840529,
+    "rank_icir": 0.1630694338378749,
+    "n_test_samples": 54621,
+    "n_test_days": 189
+  },
+  "config": {
+    "batch_size": 1024,
+    "lr": 0.001,
+    "epochs": 50,
+    "n_embd": 64,
+    "n_layers": 2,
+    "gnn_embd": 32,
+    "seq_len": 60,
+    "train_start": "2018-01-01",
+    "train_end": "2021-12-31",
+    "val_start": "2022-01-01",
+    "val_end": "2022-12-31",
+    "test_start": "2023-01-01",
+    "test_end": "2023-12-31",
+    "profile": "paper",
+    "output_dir": "/root/autodl-tmp/paper/outputs/final_run/ablation_gru_backbone",
+    "checkpoint_name": "best_model.pth",
+    "use_graph": true,
+    "temporal_backend": "gru"
+  },
+  "loss_log": "/root/autodl-tmp/paper/outputs/final_run/ablation_gru_backbone/logs/training_losses_ablation_gru_backbone.json"
+}

@@ -38,6 +38,56 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler, RobustScaler
 import os
 
+DEFAULT_SELECTED_FEATURES_26 = [
+    # 动量/收益（1d/5d 窗口为主）
+    "ret_1d",
+    "log_ret_1d",
+    "roc_5",
+    "mom_5",
+    "oc_ret",
+    # 趋势/均线
+    "close_sma_5",
+    "close_ema_5",
+    "close_sma_ratio_5",
+    "close_ema_ratio_5",
+    # 波动率/风险
+    "hl_range",
+    "ret_mean_5",   # new.md 里 rank 标准化后用于补足到 26 维
+    "ret_std_5",
+    "atr_5",
+    "bb_width_5",
+    "bb_percent_5",
+    # 量价/资金
+    "vol_mean_5",
+    "vol_std_5",
+    "vwap_5",
+    "mfi_5",
+    "cmf_5",
+    # 强弱/趋势强度
+    "rsi_5",
+    "cci_5",
+    "willr_5",
+    "di_plus_5",
+    "di_minus_5",
+    "adx_5",
+]
+
+
+def _try_load_feature_columns_json(path: str):
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        import json
+
+        with open(path, "r", encoding="utf-8") as f:
+            cols = json.load(f)
+        if isinstance(cols, list) and all(isinstance(x, str) for x in cols):
+            return cols
+    except Exception:
+        return None
+    return None
+
+
 class FinancialDataset(Dataset):
     """
     金融数据集类，改进点：
@@ -50,6 +100,7 @@ class FinancialDataset(Dataset):
         self,
         csv_path,
         features_path=None,
+        input_dim=26,
         seq_len=30,
         pred_len=1,
         mode='train',
@@ -61,6 +112,7 @@ class FinancialDataset(Dataset):
         use_date_split=True,
         feature_cols=None,
         feature_columns_path=None,
+        apply_scaler=None,
     ):
         """
         参数说明:
@@ -101,63 +153,40 @@ class FinancialDataset(Dataset):
             # 清理异常 ticker（极少数情况下会出现 NaN -> "NAN"）
             self.df = self.df[self.df['Ticker'] != 'NAN'].copy()
         
-        # 定义特征列和目标列
+        # ========== 特征列选择（对齐 new.md：Alpha158-like 池 + 26 维精选子集）==========
         default_feature_cols = [
             'Open', 'Close', 'High', 'Low', 'Volume',
             'Market_Close', 'Market_Vol', 'Volatility_20d',
         ]
+
+        if feature_columns_path is None:
+            feature_columns_path = os.path.join(os.path.dirname(csv_path), 'feature_columns.json')
+        self.feature_columns_path = feature_columns_path
+
         if feature_cols is not None:
             self.feature_cols = list(feature_cols)
+            self.feature_cols_source = "explicit"
         else:
-            if feature_columns_path is None:
-                feature_columns_path = os.path.join(os.path.dirname(csv_path), 'feature_columns.json')
-            if os.path.exists(feature_columns_path):
-                try:
-                    import json
-                    with open(feature_columns_path, 'r', encoding='utf-8') as f:
-                        self.feature_cols = json.load(f)
-                    print(f"    [特征] 从 {feature_columns_path} 读取特征列，共 {len(self.feature_cols)} 维")
-                except Exception as e:
-                    print(f"    [WARN] 读取特征列失败: {e}，回退默认 8 维特征")
-                    self.feature_cols = default_feature_cols
+            # 默认走 new.md 的 26 维精选特征；若 input_dim != 26 则尝试从 feature_columns.json 取前 N 维
+            try:
+                input_dim_int = int(input_dim) if input_dim is not None else 26
+            except Exception:
+                input_dim_int = 26
+
+            if input_dim_int == 26:
+                self.feature_cols = list(DEFAULT_SELECTED_FEATURES_26)
+                self.feature_cols_source = "selected26"
             else:
-                self.feature_cols = default_feature_cols
- # [DEBUG] 决战模式：精选特征集（先声明，合并特征后再过滤）
-        target_feature_list = [
-            # 1. 核心收益与动量
-            "ret_1d",
-            "log_ret_1d",
-            "roc_5",
-            "roc_10",
-            "roc_20",
-            "roc_60",
-            "mom_10",
-            "mom_20",
-            # 2. 强弱指标 (RSI)
-            "rsi_5",
-            "rsi_10",
-            "rsi_20",
-            # 3. 趋势与均线
-            "close_sma_ratio_20",
-            "close_ema_ratio_20",
-            "close_sma_ratio_60",
-            "close_ema_ratio_60",
-            "cci_20",
-            # 4. 波动率与风险
-            "ret_std_20",
-            "vol_std_20",
-            "bb_width_20",
-            "bb_percent_20",
-            "atr_20",
-            # 5. 量价资金
-            "mfi_20",
-            "cmf_20",
-            "vwap_20",
-            "willr_20",
-            "hl_range",
-        ]
-        self.feature_cols = list(target_feature_list)
-        print(f"[DEBUG] 决战模式：请求 {len(self.feature_cols)} 个特征（将于合并后过滤）")
+                cols_from_json = _try_load_feature_columns_json(feature_columns_path)
+                if cols_from_json:
+                    self.feature_cols = cols_from_json[:input_dim_int]
+                    self.feature_cols_source = f"feature_columns_json_first_{input_dim_int}"
+                else:
+                    # 兜底：维持旧的 8 维基础特征，保证不会因为缺文件直接挂掉
+                    self.feature_cols = default_feature_cols
+                    self.feature_cols_source = "default8_fallback"
+
+        print(f"    [特征] 选择特征列 {len(self.feature_cols)} 维 (source={getattr(self, 'feature_cols_source', 'unknown')})")
         self.target_col = 'Log_Ret'
 
         # 如果特征列不在主 CSV 中，则尝试从外部特征文件（Parquet）合并进来。
@@ -185,6 +214,8 @@ class FinancialDataset(Dataset):
                     )
                     # 左连接：保留主数据的交易日与样本定义
                     self.df = self.df.merge(df_feat, on=["Date", "Ticker"], how="left")
+                    self.features_path = feat_path
+                    self._merged_features = True
                 except Exception as e:
                     raise ValueError(f"特征列缺失且外部特征文件读取/合并失败: {feat_path}, err={e}") from e
 
@@ -198,7 +229,7 @@ class FinancialDataset(Dataset):
                     raise ValueError(
                         f"特征列全部失效，后续无法训练: {dropped_cols}"
                     )
-                print(f"[DEBUG] 自动过滤掉不存在的特征: {dropped_cols}")
+                print(f"    [WARN] 自动过滤掉不存在的特征({len(dropped_cols)}): {dropped_cols[:10]}{'...' if len(dropped_cols) > 10 else ''}")
         
         # =======================================================
         # 🛡️ 【改进】鲁棒性数据清洗防火墙
@@ -212,11 +243,10 @@ class FinancialDataset(Dataset):
         # 2. 处理无穷大值：将 Inf 和 -Inf 替换为 NaN
         self.df = self.df.replace([np.inf, -np.inf], np.nan)
         
-        # 3. 填充/删除缺失值
-        numeric_cols = self.feature_cols + [self.target_col]
-        
-        # 使用前向填充修复缺失的价格数据
-        self.df[numeric_cols] = self.df[numeric_cols].ffill()
+        # 3. 填充/删除缺失值（必须按 Ticker 分组，严禁跨股票 forward-fill）
+        numeric_cols = [c for c in (self.feature_cols + [self.target_col]) if c in self.df.columns]
+        if numeric_cols:
+            self.df[numeric_cols] = self.df.groupby("Ticker", sort=False)[numeric_cols].ffill()
         
         # 删除仍有缺失值的行
         before_len = len(self.df)
@@ -226,9 +256,13 @@ class FinancialDataset(Dataset):
         if before_len != after_len:
             print(f"⚠️ 已清理并删除 {before_len - after_len} 行包含无效数据（NaN）的记录")
 
-        # 4. 波动率修正：使用更合理的范围
+        # 4. 波动率列（vol）兜底：新方向模型不使用 vol，但接口保留
         if 'Volatility_20d' in self.df.columns:
-             self.df['Volatility_20d'] = self.df['Volatility_20d'].fillna(0).clip(0, 2.0)
+            self.df['Volatility_20d'] = (
+                pd.to_numeric(self.df['Volatility_20d'], errors="coerce")
+                .fillna(0.0)
+                .clip(0.0, 2.0)
+            )
 
         print("✅ 数据清洗完成：无无穷值、无缺失值、极端值已裁剪。")
         # =======================================================
@@ -285,25 +319,38 @@ class FinancialDataset(Dataset):
         self.df = self.df.reset_index(drop=True)
             
         # 3. 标准化
-        if mode == 'train':
-            if use_robust_scaler:
-                # RobustScaler 对异常值更鲁棒
-                self.scaler = RobustScaler(quantile_range=(10, 90))
+        # new.md：特征工程阶段已做截面 rank 标准化到 [-0.5, 0.5]；训练阶段默认不再做 StandardScaler。
+        # 为兼容旧流程（8维原始特征），若未从 parquet 合并特征，则默认启用 scaler。
+        if apply_scaler is None:
+            apply_scaler = not bool(getattr(self, "_merged_features", False))
+        self.apply_scaler = bool(apply_scaler)
+
+        if self.apply_scaler:
+            if mode == 'train':
+                if use_robust_scaler:
+                    self.scaler = RobustScaler(quantile_range=(10, 90))
+                else:
+                    self.scaler = StandardScaler()
+                feature_array = self.df[self.feature_cols].values
+                self.df[self.feature_cols] = self.scaler.fit_transform(feature_array)
             else:
-                self.scaler = StandardScaler()
-            feature_array = self.df[self.feature_cols].values
-            self.df[self.feature_cols] = self.scaler.fit_transform(feature_array)
+                if scaler is None:
+                    raise ValueError("测试模式下必须提供已拟合的标准化器（scaler），或设置 apply_scaler=False。")
+                self.scaler = scaler
+                feature_array = self.df[self.feature_cols].values
+                self.df[self.feature_cols] = self.scaler.transform(feature_array)
         else:
-            if scaler is None:
-                raise ValueError("测试模式下必须提供已拟合的标准化器（scaler）。")
-            self.scaler = scaler
-            feature_array = self.df[self.feature_cols].values
-            self.df[self.feature_cols] = self.scaler.transform(feature_array)
+            # 不做 scaler：保持 rank 标准化后的数值区间
+            self.scaler = scaler if mode != 'train' else None
         
         # 【性能优化】转换为 Numpy float32 类型（节省内存，加速训练）
         self.data_x = self.df[self.feature_cols].values.astype(np.float32)
         self.data_y = self.df[self.target_col].values.astype(np.float32)
-        self.data_vol = self.df['Volatility_20d'].values.astype(np.float32)
+        if 'Volatility_20d' in self.df.columns:
+            self.data_vol = self.df['Volatility_20d'].values.astype(np.float32)
+        else:
+            # vol 不是新方向的有效输入，兜底全 0
+            self.data_vol = np.zeros((len(self.df),), dtype=np.float32)
         
         # =======================================================
         # 【注意】新方向不使用量子门控，vol_stats 计算已注释

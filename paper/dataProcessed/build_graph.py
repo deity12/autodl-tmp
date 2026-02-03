@@ -1176,8 +1176,18 @@ def build_dynamic_graph(
         # 进度保存配置（与 batch 对齐，64 一批时每约 50 批保存一次，减少断点损失）
         BATCH_SIZE = int(os.environ.get("LLM_BATCH_SIZE", str(LLM_BATCH_SIZE_DEFAULT)))
         CHECKPOINT_INTERVAL = max(BATCH_SIZE * 50, 3200)  # 64*50=3200，每约 3200 条保存
-        checkpoint_path = OUTPUT_GRAPH.replace('.npy', '_checkpoint.npz')
-        sampled_path = OUTPUT_GRAPH.replace('.npy', '_news_sampled.csv')
+        # 为避免不同 split_date/不同配置误复用旧采样，这里把 split_date 写进文件名
+        # 例如：Graph_Adjacency_news_sampled.before_20211231.csv
+        split_tag = None
+        try:
+            if split_date is not None:
+                split_tag = pd.to_datetime(split_date).strftime("%Y%m%d")
+        except Exception:
+            split_tag = None
+        tag_suffix = f".before_{split_tag}" if split_tag else ""
+
+        checkpoint_path = OUTPUT_GRAPH.replace('.npy', f'_checkpoint{tag_suffix}.npz')
+        sampled_path = OUTPUT_GRAPH.replace('.npy', f'_news_sampled{tag_suffix}.csv')
         MAX_INPUT_TOKENS = int(os.environ.get("LLM_MAX_INPUT_TOKENS", str(LLM_MAX_INPUT_TOKENS_DEFAULT)))
         MAX_NEW_TOKENS = int(os.environ.get("LLM_MAX_NEW_TOKENS", str(LLM_MAX_NEW_TOKENS_DEFAULT)))
         DO_SAMPLE = os.environ.get("LLM_DO_SAMPLE", "1" if LLM_DO_SAMPLE_DEFAULT else "0") == "1"

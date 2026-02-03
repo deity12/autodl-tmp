@@ -1,0 +1,51 @@
+{
+  "timestamp": "2026-02-03 09:04:54",
+  "experiment_name": "ablation_lstm_backbone",
+  "checkpoint_path": "/root/autodl-tmp/paper/outputs/final_run/ablation_lstm_backbone/checkpoints/best_model.pth",
+  "artifacts_dir": "/root/autodl-tmp/paper/outputs/final_run/ablation_lstm_backbone/results/artifacts_ablation_lstm_backbone",
+  "best_val_loss": 0.0013268716995500857,
+  "best_epoch": 14,
+  "val_metrics": {
+    "mse": 0.0013789894292131066,
+    "mae": 0.030141493305563927,
+    "rmse": 0.03713474692539464,
+    "r2": -1.4762110710144043,
+    "directional_accuracy": 0.49375894490842226,
+    "ic": 0.010345322828131727,
+    "rank_ic": 0.009159420770957601
+  },
+  "test_metrics": {
+    "mse": 0.0010699853301048279,
+    "mae": 0.02748323790729046,
+    "rmse": 0.032710630230933,
+    "r2": -2.5000555515289307,
+    "directional_accuracy": 0.5193240694970799,
+    "ic": 0.00664779698140015,
+    "rank_ic": 0.013950951215162214,
+    "icir": 0.0454406192681272,
+    "rank_icir": 0.08596676482713107,
+    "n_test_samples": 54621,
+    "n_test_days": 189
+  },
+  "config": {
+    "batch_size": 1024,
+    "lr": 0.001,
+    "epochs": 50,
+    "n_embd": 64,
+    "n_layers": 2,
+    "gnn_embd": 32,
+    "seq_len": 60,
+    "train_start": "2018-01-01",
+    "train_end": "2021-12-31",
+    "val_start": "2022-01-01",
+    "val_end": "2022-12-31",
+    "test_start": "2023-01-01",
+    "test_end": "2023-12-31",
+    "profile": "paper",
+    "output_dir": "/root/autodl-tmp/paper/outputs/final_run/ablation_lstm_backbone",
+    "checkpoint_name": "best_model.pth",
+    "use_graph": true,
+    "temporal_backend": "lstm"
+  },
+  "loss_log": "/root/autodl-tmp/paper/outputs/final_run/ablation_lstm_backbone/logs/training_losses_ablation_lstm_backbone.json"
+}
